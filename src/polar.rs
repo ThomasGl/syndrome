@@ -367,7 +367,7 @@ impl PolarDecoder {
     /// * `k`         - Information bits.
     /// * `list_size` - SCL list size $L$ (1 = plain SC).
     /// * `crc_kind`  - Optional CRC kind for CA-SCL (e.g. [`CrcKind::Crc11`]
-    ///                 for DCI, [`CrcKind::Crc6`] for small UCI).
+    ///   for DCI, [`CrcKind::Crc6`] for small UCI).
     ///
     /// # Errors
     ///
@@ -402,7 +402,7 @@ impl PolarDecoder {
     /// # Arguments
     ///
     /// * `llr` - Channel LLRs (positive = likely 0, negative = likely 1),
-    ///           length must equal `n`.
+    ///   length must equal `n`.
     /// * `out` - Output buffer of length `k` (info bits only).
     ///
     /// # Errors

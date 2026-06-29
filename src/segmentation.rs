@@ -172,7 +172,7 @@ pub fn compute_segmentation(a: usize, target_rate: f32) -> Result<SegmentationPa
     let (c, l) = if b <= k_cb {
         (1usize, 0usize)
     } else {
-        let c = (b + (k_cb - 24) - 1) / (k_cb - 24); // ceil(B / (Kcb-24))
+        let c = b.div_ceil(k_cb - 24); // ceil(B / (Kcb-24))
         (c, 24usize)
     };
 

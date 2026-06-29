@@ -16,6 +16,13 @@ pub struct SpscRing<T: Copy, const N: usize> {
 
 unsafe impl<T: Copy, const N: usize> Sync for SpscRing<T, N> {}
 
+impl<T: Copy, const N: usize> Default for SpscRing<T, N> {
+    /// Equivalent to [`SpscRing::new`]; panics if `N` is not a power of two.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Copy, const N: usize> SpscRing<T, N> {
     /// Creates a new ring with capacity `N`. `N` must be a power of two.
     pub fn new() -> Self {

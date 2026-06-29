@@ -110,7 +110,7 @@ impl HarqBuffer {
     /// * `rv`    - Redundancy version used for this transmission (0..=3).
     /// * `qm`    - Modulation order ($Q_m$).
     /// * `n_filler_override` - Pass 0 to use the filler count set at construction,
-    ///             or a non-zero value to override (useful for first-time setup).
+    ///   or a non-zero value to override (useful for first-time setup).
     ///
     /// # Errors
     ///

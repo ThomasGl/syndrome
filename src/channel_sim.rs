@@ -51,7 +51,7 @@ impl AwgnChannel {
     /// * `ebno_db`    — $E_b/N_0$ in decibels.
     /// * `code_rate`  — Code rate $R \in (0, 1]$ (e.g. `0.5` for rate-1/2).
     /// * `seed`       — PRNG seed; the value `0` is mapped to `1` to prevent
-    ///                  the degenerate all-zero xorshift state.
+    ///   the degenerate all-zero xorshift state.
     ///
     /// # Returns
     ///

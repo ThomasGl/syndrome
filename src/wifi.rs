@@ -599,7 +599,7 @@ mod tests {
     fn select_params_exact_boundary() {
         // K for Z=27, rate=1/2: 24*27*1/2 = 324 bits = 40 bytes (floor 40.5)
         // 324/8 = 40 bytes exactly.
-        let k_27_half = 24_usize * 27 * 1 / 2; // = 324 bits
+        let k_27_half = (24_usize * 27) / 2; // = 324 bits
         let bytes = k_27_half / 8; // = 40
         let p = select_wifi_ldpc(bytes, WifiStandard::WiFi6, 0.5);
         assert_eq!(p.z, 27, "Should select Z=27 when payload exactly fits");

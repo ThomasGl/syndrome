@@ -108,7 +108,7 @@ impl DlSchEncoder {
     /// * `target_rate`  - Code rate (used for BG selection).
     /// * `qm`           - Modulation order ($Q_m$).
     /// * `g`            - Total coded bits available for this TB across all CBs.
-    ///                    Must be divisible by `qm`.
+    ///   Must be divisible by `qm`.
     ///
     /// # Returns
     ///

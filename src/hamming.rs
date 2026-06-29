@@ -27,7 +27,7 @@ impl Hamming74 {
     pub fn encode(nibble: u8) -> u8 {
         let d = nibble & 0x0F;
         // data bits d3 d2 d1 d0 map to positions 3,5,6,7 (1-based)
-        let d0 = (d >> 0) & 1;
+        let d0 = d & 1;
         let d1 = (d >> 1) & 1;
         let d2 = (d >> 2) & 1;
         let d3 = (d >> 3) & 1;
@@ -41,7 +41,7 @@ impl Hamming74 {
 
         // assemble bits into positions 1..7 (LSB is position 1)
         let mut code = 0u8;
-        code |= (p1 & 1) << 0; // pos1
+        code |= p1 & 1; // pos1
         code |= (p2 & 1) << 1; // pos2
         code |= (d3 & 1) << 2; // pos3 (data bit d3)
         code |= (p4 & 1) << 3; // pos4
@@ -83,7 +83,7 @@ impl Hamming74 {
         let mut corrected = r;
         if syndrome != 0 {
             let pos = syndrome; // 1-based position to flip
-            if pos >= 1 && pos <= 7 {
+            if (1..=7).contains(&pos) {
                 corrected ^= 1 << (pos - 1);
             }
         }

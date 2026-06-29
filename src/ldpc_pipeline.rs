@@ -105,7 +105,12 @@ impl LdpcFrame {
 ///
 /// See [module-level documentation](self) for the frame lifecycle.
 pub struct LdpcPipeline {
-    /// Pre-allocated slot pool; never reallocated after construction.
+    /// Pre-allocated slot pool; never reallocated after construction. Each slot
+    /// is individually boxed so its address is stable even if the outer `Vec`
+    /// were ever resized — the workers hold raw `*mut FrameSlot` into these
+    /// allocations, so per-element address stability is a safety requirement
+    /// (hence `clippy::vec_box` is intentional here, not a missed simplification).
+    #[allow(clippy::vec_box)]
     pool: Vec<Box<FrameSlot>>,
     /// Slot indices available to the caller (main-thread-only, no concurrency).
     free_list: Vec<usize>,
@@ -143,7 +148,7 @@ impl LdpcPipeline {
     /// * `iterations` - LOMS iteration count per frame.
     /// * `n_workers`  - Number of parallel worker threads (clamped to 1..=8).
     pub fn with_workers(decoder: QcLdpcDecoder, iterations: usize, n_workers: usize) -> Self {
-        let n_workers = n_workers.max(1).min(POOL_SIZE / 2);
+        let n_workers = n_workers.clamp(1, POOL_SIZE / 2);
         let n = decoder.variable_node_count();
         let n_edge = decoder.required_edge_buffer();
         let n_scr = decoder.required_layer_buffer();
@@ -182,13 +187,8 @@ impl LdpcPipeline {
             let stop = Arc::clone(&stop_flag);
             let ptrs = pool_ptrs.clone();
             // Each worker gets its own decoder clone so there is no data sharing
-            // on the (mutable) decode scratch; worker 0 takes ownership of the
-            // original to avoid an unnecessary clone.
-            let dec: QcLdpcDecoder = if wi == 0 {
-                decoder.clone()
-            } else {
-                decoder.clone()
-            };
+            // on the (mutable) decode scratch.
+            let dec: QcLdpcDecoder = decoder.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("ldpc-worker-{wi}"))
@@ -261,9 +261,10 @@ impl LdpcPipeline {
     ///
     /// The frame is consumed: the caller must not use it after this call.
     pub fn submit(&mut self, frame: LdpcFrame) -> bool {
+        // The frame is consumed here; ownership of its slot passes to the ring.
+        // `LdpcFrame` has no `Drop` impl, so letting it fall out of scope releases
+        // nothing — we only need its slot index.
         let idx = frame.slot_idx;
-        // Prevent the destructor from running — the slot is now owned by the ring.
-        std::mem::forget(frame);
         let wi = self.next_submit % self.n_workers;
         self.next_submit = self.next_submit.wrapping_add(1);
         self.work_rings[wi].try_push(idx).is_ok()
@@ -286,8 +287,8 @@ impl LdpcPipeline {
     ///
     /// The frame is consumed: the caller must not use it after this call.
     pub fn release(&mut self, frame: LdpcFrame) {
+        // Consumes the frame; `LdpcFrame` has no `Drop`, so dropping it is a no-op.
         let idx = frame.slot_idx;
-        std::mem::forget(frame);
         self.free_list.push(idx);
     }
 }

@@ -16,6 +16,12 @@ pub struct GfTables {
     log: Box<[u8; 256]>,
 }
 
+impl Default for GfTables {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GfTables {
     pub fn new() -> Self {
         // Build exp and log tables with primitive polynomial 0x11D
@@ -28,7 +34,7 @@ impl GfTables {
             log[x as usize] = i as u8;
             // multiply by primitive (x *= 2)
             let hi = (x & 0x80) != 0;
-            x = x << 1;
+            x <<= 1;
             if hi {
                 x ^= 0x1D;
             }
@@ -84,8 +90,9 @@ pub struct ReedSolomon {
     // encoding coefficients: parity_shards x data_shards, row-major
     coeffs: Vec<u8>,
     tables: GfTables,
-    // optional multiplication tables indexed by coefficient value
-    mul_tables: Option<Vec<Box<[u8; 256]>>>,
+    // optional multiplication tables indexed by coefficient value; stored as a
+    // flat, contiguous Vec of fixed-size LUTs (no per-table heap indirection)
+    mul_tables: Option<Vec<[u8; 256]>>,
 }
 
 impl ReedSolomon {
@@ -96,9 +103,9 @@ impl ReedSolomon {
         if self.mul_tables.is_some() {
             return;
         }
-        let mut tables: Vec<Box<[u8; 256]>> = Vec::with_capacity(256);
+        let mut tables: Vec<[u8; 256]> = Vec::with_capacity(256);
         for coef in 0u8..=255u8 {
-            let mut tbl = Box::new([0u8; 256]);
+            let mut tbl = [0u8; 256];
             if coef == 0 {
                 // all zeros
             } else {

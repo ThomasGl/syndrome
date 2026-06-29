@@ -438,10 +438,10 @@ impl QcLdpcDecoder {
     /// # Arguments
     ///
     /// * `llr`       - Channel LLR buffer of length $N = n_b \cdot Z$.
-    ///                 The caller must have filled positions $[2Z .. K']$ and
-    ///                 $[K .. N]$ with received channel LLRs, and left
-    ///                 positions $[0 .. 2Z]$ at 0.0 (punctured erasure).
-    ///                 This function fills $[K' .. K]$ with the filler-bit LLR.
+    ///   The caller must have filled positions $[2Z .. K']$ and
+    ///   $[K .. N]$ with received channel LLRs, and left
+    ///   positions $[0 .. 2Z]$ at 0.0 (punctured erasure).
+    ///   This function fills $[K' .. K]$ with the filler-bit LLR.
     /// * `n_filler`  - Number of filler bits ($K - K'$).
     /// * `edge_r`    - Caller-owned C→V buffer (length ≥ [`required_edge_buffer()`]).
     /// * `scratch`   - Caller-owned per-layer scratch (length ≥ [`required_layer_buffer()`]).
@@ -514,13 +514,13 @@ impl QcLdpcDecoder {
     /// # Arguments
     ///
     /// * `llr`           - Channel LLR input; overwritten with a-posteriori values.
-    ///                     Length must equal [`variable_node_count()`].
+    ///   Length must equal [`variable_node_count()`].
     /// * `edge_r`        - Preallocated flat C→V extrinsic buffer.
-    ///                     Minimum length: [`required_edge_buffer()`].
+    ///   Minimum length: [`required_edge_buffer()`].
     /// * `layer_scratch` - Per-layer V→C scratch buffer.
-    ///                     Minimum length: [`required_layer_buffer()`].
+    ///   Minimum length: [`required_layer_buffer()`].
     /// * `hard_output`   - Bit-wise hard-decision output.
-    ///                     Length must equal [`variable_node_count()`].
+    ///   Length must equal [`variable_node_count()`].
     /// * `iterations`    - Number of full layered passes.
     ///
     /// # Errors
@@ -830,7 +830,7 @@ impl ParityGenerator {
         let k = k_b * z;
 
         let aug_bits = m + k;
-        let aug_words = (aug_bits + 63) / 64;
+        let aug_words = aug_bits.div_ceil(64);
         let mut aug: Vec<GfRow> = vec![vec![0u64; aug_words]; m];
 
         // Populate the augmented matrix [Hp | Hs].
@@ -872,7 +872,7 @@ impl ParityGenerator {
         }
 
         // Extract the Hs block (bits m..m+k) into packed K-bit rows.
-        let words_per_row = (k + 63) / 64;
+        let words_per_row = k.div_ceil(64);
         let rows: Vec<GfRow> = aug
             .into_iter()
             .map(|full_row| {

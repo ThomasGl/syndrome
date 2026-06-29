@@ -75,7 +75,7 @@ fn rv_k0(bg: BaseGraph, rv: usize, z: usize) -> usize {
 ///
 /// * `e`  - Selected bits (length `E`), modified in-place.
 /// * `qm` - Modulation order (1=BPSK, 2=QPSK, 4=16QAM, 6=64QAM, 8=256QAM).
-fn interleave(e: &mut Vec<u8>, qm: usize) {
+fn interleave(e: &mut [u8], qm: usize) {
     debug_assert_eq!(e.len() % qm, 0, "E must be divisible by Qm");
     let rows = e.len() / qm;
     let mut out = vec![0u8; e.len()];
@@ -89,7 +89,7 @@ fn interleave(e: &mut Vec<u8>, qm: usize) {
 }
 
 /// Invert the §5.4.2.2 bit interleaver on soft values.
-fn deinterleave_f32(e: &mut Vec<f32>, qm: usize) {
+fn deinterleave_f32(e: &mut [f32], qm: usize) {
     debug_assert_eq!(e.len() % qm, 0, "E must be divisible by Qm");
     let rows = e.len() / qm;
     let mut out = vec![0.0f32; e.len()];
@@ -114,16 +114,16 @@ fn deinterleave_f32(e: &mut Vec<f32>, qm: usize) {
 /// # Arguments
 ///
 /// * `codeword`  - Full encoded codeword of length $N = n_b \cdot Z$
-///                 (bits 0/1, systematic then parity).
+///   (bits 0/1, systematic then parity).
 /// * `e_out`     - Output buffer of length `e_bits`.  Filled with the
-///                 rate-matched, interleaved bits.
+///   rate-matched, interleaved bits.
 /// * `rv`        - Redundancy version (0..=3).
 /// * `qm`        - Modulation order ($Q_m$); `e_bits` must be divisible by `qm`.
 /// * `bg`        - Base graph.
 /// * `z`         - Lifting size.
 /// * `n_filler`  - Number of filler bits ($K - K'$) at positions
-///                 $(K' .. K)$ of the systematic section. These positions are
-///                 skipped (treated as `<NULL>`) during selection.
+///   $(K' .. K)$ of the systematic section. These positions are
+///   skipped (treated as `<NULL>`) during selection.
 ///
 /// # Errors
 ///
@@ -194,12 +194,10 @@ pub fn rate_match(
             j += 1;
             continue;
         }
-        // Map circular buffer position back to the full codeword (adding 2Z back).
-        let cw_pos = if pos < k.saturating_sub(two_z) {
-            pos + two_z // systematic portion
-        } else {
-            pos + two_z // parity portion (same shift since we excluded 2Z at start)
-        };
+        // Map circular buffer position back to the full codeword. Both the
+        // systematic and parity portions shift by the same 2Z that was excluded
+        // at the start of the buffer, so the mapping is uniform.
+        let cw_pos = pos + two_z;
         e_out[k_sel] = if cw_pos < codeword.len() {
             codeword[cw_pos]
         } else {
@@ -236,8 +234,8 @@ pub fn rate_match(
 ///
 /// * `e_llr`     - Received soft LLRs (length `E`), one per coded bit.
 /// * `cb_llr`    - Circular-buffer LLR accumulator of length $N_{cb}$.
-///                 Updated (add) by this call — zero-initialise for first
-///                 transmission, leave non-zero for HARQ combining.
+///   Updated (add) by this call — zero-initialise for first
+///   transmission, leave non-zero for HARQ combining.
 /// * `rv`        - Redundancy version (0..=3).
 /// * `qm`        - Modulation order.
 /// * `bg`        - Base graph.
