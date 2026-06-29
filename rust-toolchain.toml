@@ -1,0 +1,7 @@
+# Pin contributors and CI to the stable toolchain with the components this
+# project lints with. The crate's minimum supported Rust version (MSRV) is
+# declared separately as `rust-version = "1.85"` in Cargo.toml and enforced by
+# the dedicated MSRV job in .github/workflows/ci.yml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
