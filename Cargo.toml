@@ -38,33 +38,20 @@ hotpath = "0.16"
 name = "fec_bench"
 harness = false
 
-# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`, so every lint
-# allowed below is a deliberate, documented decision rather than ambient noise.
+# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`. Only three
+# lints are allowed, each for a concrete reason; everything else is fixed in the
+# source rather than suppressed.
 [lints.clippy]
 # Performance-intentional. CLAUDE.md mandates index-based, branch-free hot loops
-# with explicit arithmetic (SoA + SIMD friendliness). These lints would rewrite
-# the validated numeric kernels into iterator / std-helper forms we avoid on
-# purpose, so they are allowed crate-wide.
+# (SoA + SIMD friendliness) in the LDPC/RS/Viterbi kernels. Rewriting these into
+# iterator form is exactly what that constraint forbids, so the lint is allowed.
 needless_range_loop = "allow"
-manual_clamp = "allow"
-manual_div_ceil = "allow"
-manual_is_multiple_of = "allow"
-manual_range_contains = "allow"
-identity_op = "allow"
-assign_op_pattern = "allow"
 
-# API ergonomics. The FEC chain functions legitimately take many spec-defined
-# parameters (lifting size Z, base graph, redundancy version, ...); slice-vs-Vec
-# signatures and `new()`-without-`Default` are intentional for these owning APIs.
+# The SIMD kernels in simd_avx2.rs take many flat pointer/length parameters by
+# design; bundling them into a struct would add indirection on the hot path.
 too_many_arguments = "allow"
-ptr_arg = "allow"
-new_without_default = "allow"
-vec_box = "allow"
 
-# Intentional placeholders kept for clarity / future wiring (Phase 2 rate
-# matching and pipeline ownership hand-off). Logic is deliberately explicit.
-if_same_then_else = "allow"
-forget_non_drop = "allow"
-
-# Cosmetic doc-rendering nit across the long ///-doc blocks; not worth churning.
-doc_overindented_list_items = "allow"
+# `<integer>::is_multiple_of` was stabilized in Rust 1.87, but our MSRV is 1.85
+# (see rust-version in [package]). The manual `% n == 0` form is required to
+# build on the declared minimum toolchain.
+manual_is_multiple_of = "allow"
