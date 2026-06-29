@@ -1,0 +1,11 @@
+{
+  "lang": "rust",
+  "impl": "loms_pipeline_spsc",
+  "backend": "avx2_if_available",
+  "n_variable_nodes": 26112,
+  "n_iters": 10,
+  "n_frames": 500,
+  "ns_per_frame": 2419587.99,
+  "frames_per_s": 413.2935045689328,
+  "melem_per_s": 107.91919991303973
+}

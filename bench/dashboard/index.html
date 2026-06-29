@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>glezer-rsv — Reed-Solomon Encode Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      margin: 0;
+      padding: 24px;
+    }
+    h1 { margin: 0 0 4px; font-size: 1.5rem; }
+    .subtitle { color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }
+    .chart-container {
+      background: #1e2130;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    .meta-box {
+      background: #1e2130;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-bottom: 24px;
+      line-height: 1.8;
+    }
+    .note {
+      font-size: 0.78rem;
+      color: #64748b;
+      margin-top: 8px;
+    }
+    .error { color: #f87171; }
+    a { color: #60a5fa; }
+  </style>
+  <!-- Highcharts via CDN — used under Highcharts non-commercial license.
+       Attribution credits label is intentionally kept visible.
+       Commercial forks must obtain a separate Highcharts license. -->
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+</head>
+<body>
+  <h1>glezer-rsv — Reed-Solomon Encode Throughput</h1>
+  <p class="subtitle">
+    Real measured numbers from <code>bench/run_all.sh</code>.
+    Rust vs same-algorithm C++ (byte-identical) vs Python (two variants).
+  </p>
+
+  <div class="meta-box" id="meta-box">Loading benchmark metadata…</div>
+
+  <div class="chart-container">
+    <div id="chart-grouped" style="height:420px;"></div>
+  </div>
+
+  <div class="chart-container">
+    <div id="chart-line" style="height:380px;"></div>
+  </div>
+
+  <div class="chart-container">
+    <h2 style="color:#e2e8f0;font-size:1rem;margin:0 0 12px">Latency vs Payload Size</h2>
+    <div id="chart-latency" style="height:400px;"></div>
+    <p class="note" style="margin-top:8px">
+      μs per encode/decode call (log-log). RS lines follow O(n) slope;
+      LDPC diamonds are fixed-block decode (N = 26 112 bits ≈ 3 264 bytes).
+    </p>
+  </div>
+
+  <div class="chart-container">
+    <h2 style="color:#e2e8f0;font-size:1rem;margin:0 0 12px">5G NR LDPC Decode</h2>
+    <div id="chart-ldpc" style="height:380px;"></div>
+    <p class="note" style="margin-top:8px">
+      Run <code>bash bench/run_all.sh</code> to populate.
+    </p>
+  </div>
+
+  <div class="chart-container">
+    <h2 style="color:#e2e8f0;font-size:1rem;margin:0 0 12px">BER Waterfall — QC-LDPC BG1 Z=384</h2>
+    <div id="chart-ber" style="height:420px;"></div>
+    <p class="note" style="margin-top:8px">
+      Run <code>cargo run --release --bin ber_sim</code> to generate
+      <code>bench/results/ber_rust.json</code>, then reload this page.
+    </p>
+  </div>
+
+  <p class="note">
+    Charts use <a href="https://www.highcharts.com/" target="_blank">Highcharts</a>
+    under its non-commercial use terms. Credits label is visible above.
+    python_reedsolo uses a different algorithm (generator-polynomial RS) and is
+    included as an ecosystem reference only — its parity output does NOT match
+    the other three implementations.
+  </p>
+
+  <script src="app.js"></script>
+</body>
+</html>

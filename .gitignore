@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+
+# Editor / IDE
+/.vscode/
+*.swp
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Claude Code session state
+/.claude/
+
+# Large 3GPP spec source archive (downloaded reference, not redistributed)
+/38212-gf0.zip
+
+# Raw spec-extracted CSV tables — intermediate inputs to tools/gen_bg_tables.py.
+# The committed artifact is data/bg_tables.json; the CSVs are large and derived
+# from the copyrighted 3GPP specification, so they stay local.
+/data/*.csv
+
+# Compiled C++ benchmark binaries (built by bench/cpp/Makefile)
+/bench/cpp/loms_decode
+/bench/cpp/rs_encode

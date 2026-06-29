@@ -1,0 +1,6 @@
+[
+  {"lang":"cpp","impl":"encode_into","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":8010.1,"mib_per_s":304.8},
+  {"lang":"cpp","impl":"encode_into","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":17257.2,"mib_per_s":565.9},
+  {"lang":"cpp","impl":"encode_into","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":98986.7,"mib_per_s":394.6},
+  {"lang":"cpp","impl":"encode_into","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":261025.4,"mib_per_s":598.6}
+]

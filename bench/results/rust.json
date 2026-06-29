@@ -1,0 +1,14 @@
+[
+  {"lang":"rust","impl":"encode_into","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":4132.9,"mib_per_s":590.7},
+  {"lang":"rust","impl":"encode_with_tables_chunked","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":3300.9,"mib_per_s":739.6},
+  {"lang":"rust","impl":"encode_with_avx2","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":482.0,"mib_per_s":5065.2},
+  {"lang":"rust","impl":"encode_into","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":14861.1,"mib_per_s":657.1},
+  {"lang":"rust","impl":"encode_with_tables_chunked","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":12067.9,"mib_per_s":809.2},
+  {"lang":"rust","impl":"encode_with_avx2","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":982.5,"mib_per_s":9939.9},
+  {"lang":"rust","impl":"encode_into","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":56496.4,"mib_per_s":691.4},
+  {"lang":"rust","impl":"encode_with_tables_chunked","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":50670.5,"mib_per_s":770.9},
+  {"lang":"rust","impl":"encode_with_avx2","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":4586.8,"mib_per_s":8516.3},
+  {"lang":"rust","impl":"encode_into","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":272938.4,"mib_per_s":572.5},
+  {"lang":"rust","impl":"encode_with_tables_chunked","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":210439.1,"mib_per_s":742.5},
+  {"lang":"rust","impl":"encode_with_avx2","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":15583.1,"mib_per_s":10026.9}
+]

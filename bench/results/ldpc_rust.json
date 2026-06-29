@@ -1,0 +1,3 @@
+[
+  {"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":2201771.0,"mib_per_s":0,"melem_per_s":118.60,"n_variable_nodes":26112,"n_iters":10}
+]

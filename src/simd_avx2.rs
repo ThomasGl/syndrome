@@ -1,0 +1,356 @@
+//! AVX2-accelerated LOMS layer kernel for x86-64.
+//!
+//! This module provides [`decode_layer_passes_avx2`], which replaces the two
+//! scalar pass loops (min-tracking and R-update) in
+//! [`QcLdpcDecoder::decode_layered_offset_min_sum`] when AVX2 is detected at
+//! runtime. The Q-build loop is kept scalar in the caller because it is a
+//! gather-style LLR read that benefits less from vectorisation.
+//!
+//! The kernel processes 8 z-positions per SIMD iteration (256-bit / f32x8).
+//! Z values that are not a multiple of 8 are handled by a scalar tail.
+
+#![cfg(target_arch = "x86_64")]
+
+use std::arch::x86_64::*;
+
+/// Process passes 1 and 2 of one LOMS layer using AVX2 (8-wide f32 registers).
+///
+/// # Safety
+///
+/// Caller must verify AVX2 support at runtime, e.g. with
+/// `is_x86_feature_detected!("avx2")`. `min1`, `min2`, and `sxor` must each
+/// have length `≥ z`. `q_row` must have length `≥ row_degree * z`. `edge_r`
+/// must cover `(layer_begin + row_degree - 1) * z + z` elements.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn decode_layer_passes_avx2(
+    z: usize,
+    row_degree: usize,
+    offset_beta: f32,
+    q_row: &[f32],
+    edge_r: &mut [f32],
+    layer_begin: usize,
+    submatrix_cols: &[usize],
+    submatrix_shifts: &[i16],
+    llr: &mut [f32],
+    min1: &mut [f32],
+    min2: &mut [f32],
+    sxor: &mut [u32],
+) {
+    // Rust 2024: unsafe operations inside an `unsafe fn` still require an
+    // explicit `unsafe {}` block. Wrap the entire body since all work here
+    // requires the AVX2 target feature verified by the caller.
+    unsafe {
+        decode_layer_passes_avx2_body(
+            z,
+            row_degree,
+            offset_beta,
+            q_row,
+            edge_r,
+            layer_begin,
+            submatrix_cols,
+            submatrix_shifts,
+            llr,
+            min1,
+            min2,
+            sxor,
+        )
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn decode_layer_passes_avx2_body(
+    z: usize,
+    row_degree: usize,
+    offset_beta: f32,
+    q_row: &[f32],
+    edge_r: &mut [f32],
+    layer_begin: usize,
+    submatrix_cols: &[usize],
+    submatrix_shifts: &[i16],
+    llr: &mut [f32],
+    min1: &mut [f32],
+    min2: &mut [f32],
+    sxor: &mut [u32],
+) {
+    // Rust 2024: explicit unsafe block required even inside `unsafe fn`.
+    unsafe {
+        // Constants hoisted outside all loops.
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFFi32));
+        let sign_mask = _mm256_set1_epi32(0x8000_0000u32 as i32);
+        let beta_v = _mm256_set1_ps(offset_beta);
+        let zero_v = _mm256_setzero_ps();
+
+        // Number of z positions covered by full 8-wide chunks (tail ≤ 7 handled scalarly).
+        let full = z & !7;
+
+        // ── Pass 1: init scratch, then accumulate min1 / min2 / sign-XOR ───────
+        for i in (0..full).step_by(8) {
+            _mm256_storeu_ps(min1.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
+            _mm256_storeu_ps(min2.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
+            _mm256_storeu_si256(
+                sxor[i..].as_mut_ptr() as *mut __m256i,
+                _mm256_setzero_si256(),
+            );
+        }
+        for i in full..z {
+            min1[i] = f32::MAX;
+            min2[i] = f32::MAX;
+            sxor[i] = 0;
+        }
+
+        for edge in 0..row_degree {
+            let q_ptr = q_row[edge * z..].as_ptr();
+            let m1_ptr = min1.as_mut_ptr();
+            let m2_ptr = min2.as_mut_ptr();
+
+            // AVX2 chunks (8 z-positions per iteration).
+            for chunk in (0..full).step_by(8) {
+                let q_v = _mm256_loadu_ps(q_ptr.add(chunk));
+                let abs_v = _mm256_and_ps(q_v, abs_mask);
+                let sign_v = _mm256_and_si256(_mm256_castps_si256(q_v), sign_mask);
+
+                // XOR each lane's sign bit into the running accumulator.
+                let sx_ptr = sxor[chunk..].as_mut_ptr() as *mut __m256i;
+                _mm256_storeu_si256(
+                    sx_ptr,
+                    _mm256_xor_si256(_mm256_loadu_si256(sx_ptr as *const __m256i), sign_v),
+                );
+
+                // Branchless min1 / min2 update using blendv:
+                //   case 1 (abs ≤ m1): push m1→m2, set m1=abs
+                //   case 2 (m1 < abs < m2): set m2=abs
+                let m1_v = _mm256_loadu_ps(m1_ptr.add(chunk));
+                let m2_v = _mm256_loadu_ps(m2_ptr.add(chunk));
+
+                let le = _mm256_cmp_ps(abs_v, m1_v, _CMP_LE_OQ);
+                let new_m2 = _mm256_blendv_ps(m2_v, m1_v, le); // case 1: m2 ← old m1
+                let new_m1 = _mm256_blendv_ps(m1_v, abs_v, le); // case 1: m1 ← abs
+
+                // case 2: abs < original m2, but NOT already handled by case 1
+                let lt2_only = _mm256_andnot_ps(le, _mm256_cmp_ps(abs_v, m2_v, _CMP_LT_OQ));
+                let new_m2 = _mm256_blendv_ps(new_m2, abs_v, lt2_only);
+
+                _mm256_storeu_ps(m1_ptr.add(chunk), new_m1);
+                _mm256_storeu_ps(m2_ptr.add(chunk), new_m2);
+            }
+            // Scalar tail (at most 7 elements).
+            for i in full..z {
+                let bits = q_row[edge * z + i].to_bits();
+                let abs_q = f32::from_bits(bits & 0x7FFF_FFFF);
+                sxor[i] ^= bits & 0x8000_0000;
+                let m1 = min1[i];
+                if abs_q <= m1 {
+                    min2[i] = m1;
+                    min1[i] = abs_q;
+                } else if abs_q < min2[i] {
+                    min2[i] = abs_q;
+                }
+            }
+        }
+
+        // Clamp MAX sentinels (triggered only when row_degree == 0 or all Q = ±inf).
+        for i in 0..z {
+            if min1[i] == f32::MAX {
+                min1[i] = 0.0;
+            }
+            if min2[i] == f32::MAX {
+                min2[i] = min1[i];
+            }
+        }
+
+        // ── Pass 2: compute new R and delta-update LLR ──────────────────────────
+        for edge in 0..row_degree {
+            let col_block = submatrix_cols[layer_begin + edge];
+            let shift = submatrix_shifts[layer_begin + edge] as usize;
+            let base_edge = (layer_begin + edge) * z;
+            let q_ptr = q_row[edge * z..].as_ptr();
+            let er_ptr = edge_r[base_edge..].as_mut_ptr();
+            let m1_ptr = min1.as_ptr();
+            let m2_ptr = min2.as_ptr();
+            let var_base = col_block * z;
+
+            for chunk in (0..full).step_by(8) {
+                let q_v = _mm256_loadu_ps(q_ptr.add(chunk));
+                let q_int = _mm256_castps_si256(q_v);
+                let abs_v = _mm256_and_ps(q_v, abs_mask);
+
+                // Exclusive sign: XOR of all edges' signs, with this edge removed.
+                let sx_v = _mm256_loadu_si256(sxor[chunk..].as_ptr() as *const __m256i);
+                let excl_sign =
+                    _mm256_castsi256_ps(_mm256_xor_si256(sx_v, _mm256_and_si256(q_int, sign_mask)));
+
+                // Exclusive min: use min2 where abs equals min1 (float equality is
+                // exact — value was stored directly from this q_row slot in pass 1).
+                let m1_v = _mm256_loadu_ps(m1_ptr.add(chunk));
+                let m2_v = _mm256_loadu_ps(m2_ptr.add(chunk));
+                let eq_m1 = _mm256_cmp_ps(abs_v, m1_v, _CMP_EQ_OQ);
+                let min_excl = _mm256_blendv_ps(m1_v, m2_v, eq_m1);
+
+                // Magnitude after offset correction, clamped to ≥ 0.
+                let mag_v = _mm256_max_ps(_mm256_sub_ps(min_excl, beta_v), zero_v);
+
+                // Apply sign via bitwise OR (mag ≥ 0, so its sign bit is already 0).
+                let new_r_v = _mm256_or_ps(mag_v, excl_sign);
+
+                // Update edge_r and scatter-add delta into LLR.
+                let old_r_v = _mm256_loadu_ps(er_ptr.add(chunk));
+                _mm256_storeu_ps(er_ptr.add(chunk), new_r_v);
+
+                // The 8 var_idx values may not be contiguous when the shift wraps
+                // around the block boundary, so we scatter scalarly. For z=384 and
+                // typical shifts, this touches a contiguous run in most chunks.
+                let mut delta = [0f32; 8];
+                _mm256_storeu_ps(delta.as_mut_ptr(), _mm256_sub_ps(new_r_v, old_r_v));
+                for i in 0..8 {
+                    let s = chunk + i + shift;
+                    // SAFETY: col_block < num_col_blocks (from BG entries), s % z < z,
+                    // so var_idx < num_col_blocks * z == llr.len().
+                    let var_idx = var_base + if s >= z { s - z } else { s };
+                    *llr.get_unchecked_mut(var_idx) += delta[i];
+                }
+            }
+            // Scalar tail.
+            for i in full..z {
+                let q_bits = q_row[edge * z + i].to_bits();
+                let abs_q = f32::from_bits(q_bits & 0x7FFF_FFFF);
+                let sign_excl = sxor[i] ^ (q_bits & 0x8000_0000);
+                let min_excl = if abs_q == min1[i] { min2[i] } else { min1[i] };
+                let mag = (min_excl - offset_beta).max(0.0);
+                let new_r = f32::from_bits(mag.to_bits() | sign_excl);
+                let old_r = edge_r[base_edge + i];
+                edge_r[base_edge + i] = new_r;
+                let s = i + shift;
+                let var_idx = var_base + if s >= z { s - z } else { s };
+                llr[var_idx] += new_r - old_r;
+            }
+        }
+    } // end unsafe block
+}
+
+// ---------------------------------------------------------------------------
+// GF(256) multiply-XOR using AVX2 VPSHUFB — 32 bytes per cycle
+// ---------------------------------------------------------------------------
+
+/// GF(256) multiply-accumulate: `parity[i] ^= GF_mul(coef, data[i])` for all i.
+///
+/// Uses nibble decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`.
+/// Processes 32 bytes per SIMD iteration via VPSHUFB; scalar tail handles the rest.
+///
+/// # Arguments
+///
+/// * `data`       — input bytes.
+/// * `parity`     — accumulator (XOR'd in-place); must have the same length as `data`.
+/// * `lo_tbl`     — 16-byte table: `lo_tbl[i] = GF_mul(coef, i)` for i in 0..16.
+/// * `hi_tbl`     — 16-byte table: `hi_tbl[i] = GF_mul(coef, i << 4)` for i in 0..16.
+/// * `full_table` — 256-byte table for the scalar tail: `full_table[v] = GF_mul(coef, v)`.
+///
+/// # Safety
+///
+/// Caller must have verified AVX2 availability with `is_x86_feature_detected!("avx2")`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn gf256_muladd_avx2(
+    data: &[u8],
+    parity: &mut [u8],
+    lo_tbl: &[u8; 16],
+    hi_tbl: &[u8; 16],
+    full_table: &[u8; 256],
+) {
+    unsafe {
+        let len = data.len().min(parity.len());
+        let full = len & !31; // floor to multiple of 32
+
+        let lo_tbl_v =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(lo_tbl.as_ptr() as *const __m128i));
+        let hi_tbl_v =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(hi_tbl.as_ptr() as *const __m128i));
+        let lo_mask = _mm256_set1_epi8(0x0Fu8 as i8);
+
+        let mut i = 0usize;
+        while i < full {
+            let data_v = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
+
+            // Low nibble index: mask off high nibble.
+            let lo_idx = _mm256_and_si256(data_v, lo_mask);
+            // High nibble: srli_epi16 shifts 16-bit lanes right by 4, then mask.
+            // After shift: each byte's high nibble lands in the low nibble position.
+            let hi_idx = _mm256_and_si256(_mm256_srli_epi16(data_v, 4), lo_mask);
+
+            let lo_val = _mm256_shuffle_epi8(lo_tbl_v, lo_idx);
+            let hi_val = _mm256_shuffle_epi8(hi_tbl_v, hi_idx);
+            let prod = _mm256_xor_si256(lo_val, hi_val);
+
+            let par_v = _mm256_loadu_si256(parity.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(
+                parity.as_mut_ptr().add(i) as *mut __m256i,
+                _mm256_xor_si256(par_v, prod),
+            );
+            i += 32;
+        }
+
+        // Scalar tail.
+        for j in i..len {
+            parity[j] ^= full_table[data[j] as usize];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AVX2 Q-build: assemble V→C messages for one edge via contiguous LLR spans
+// ---------------------------------------------------------------------------
+
+/// AVX2 Q-build for one LOMS edge: `q_row[q_base..q_base+z] = llr[...] - edge_r[...]`.
+///
+/// The cyclic shift `shift` splits the z LLR reads into two contiguous spans:
+/// - Span 1 (len = z − shift): `llr[var_base+shift .. var_base+z]`
+/// - Span 2 (len = shift):     `llr[var_base .. var_base+shift]`
+///
+/// Each span is contiguous, so it is vectorized with 8-wide f32 loads without scatter.
+///
+/// # Safety
+///
+/// Caller must have verified AVX2 availability. All index ranges must be in-bounds.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn q_build_edge_avx2(
+    z: usize,
+    shift: usize,
+    var_base: usize,
+    q_base: usize,
+    base_edge: usize,
+    llr: &[f32],
+    edge_r: &[f32],
+    q_row: &mut [f32],
+) {
+    unsafe {
+        // Span 1: q_row[q_base..q_base+span1] = llr[var_base+shift..var_base+z] - edge_r[base_edge..]
+        let span1 = z - shift;
+        let full1 = span1 & !7;
+        let mut i = 0usize;
+        while i < full1 {
+            let lv = _mm256_loadu_ps(llr.as_ptr().add(var_base + shift + i));
+            let ev = _mm256_loadu_ps(edge_r.as_ptr().add(base_edge + i));
+            _mm256_storeu_ps(q_row.as_mut_ptr().add(q_base + i), _mm256_sub_ps(lv, ev));
+            i += 8;
+        }
+        for j in i..span1 {
+            q_row[q_base + j] = llr[var_base + shift + j] - edge_r[base_edge + j];
+        }
+
+        // Span 2: q_row[q_base+span1..q_base+z] = llr[var_base..var_base+shift] - edge_r[base_edge+span1..]
+        if shift > 0 {
+            let full2 = shift & !7;
+            let mut i = 0usize;
+            while i < full2 {
+                let lv = _mm256_loadu_ps(llr.as_ptr().add(var_base + i));
+                let ev = _mm256_loadu_ps(edge_r.as_ptr().add(base_edge + span1 + i));
+                _mm256_storeu_ps(
+                    q_row.as_mut_ptr().add(q_base + span1 + i),
+                    _mm256_sub_ps(lv, ev),
+                );
+                i += 8;
+            }
+            for j in i..shift {
+                q_row[q_base + span1 + j] = llr[var_base + j] - edge_r[base_edge + span1 + j];
+            }
+        }
+    }
+}

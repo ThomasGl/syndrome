@@ -1,0 +1,70 @@
+[package]
+name = "glezer_rsv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Multi-standard Forward Error Correction in safe Rust: 5G NR TS 38.212 (QC-LDPC LOMS), Wi-Fi 6/7, Reed-Solomon, Viterbi and Polar codes, with AVX2/NEON SIMD and lock-free pipelining."
+authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
+readme = "README.md"
+keywords = ["fec", "ldpc", "5g", "reed-solomon", "simd"]
+categories = ["algorithms", "encoding", "no-std"]
+
+[dependencies]
+core_affinity = { version = "0.6", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[build-dependencies]
+serde_json = "1.0"
+
+[features]
+# enable architecture-specific SIMD optimizations
+simd_avx2 = []
+simd_avx512 = []
+simd_neon = []
+# convenience umbrella feature to enable any SIMD backend
+simd = ["simd_avx2", "simd_neon"]
+# enable thread-affinity helpers (depends on core_affinity)
+affinity = ["core_affinity"]
+# enable no_std Cortex-M compatible builds (requires additional setup)
+cortex-m = []
+[dev-dependencies]
+proptest = "1.4"
+once_cell = "1.20"
+criterion = { version = "0.5", features = ["html_reports"] }
+hotpath = "0.16"
+
+[[bench]]
+name = "fec_bench"
+harness = false
+
+# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`, so every lint
+# allowed below is a deliberate, documented decision rather than ambient noise.
+[lints.clippy]
+# Performance-intentional. CLAUDE.md mandates index-based, branch-free hot loops
+# with explicit arithmetic (SoA + SIMD friendliness). These lints would rewrite
+# the validated numeric kernels into iterator / std-helper forms we avoid on
+# purpose, so they are allowed crate-wide.
+needless_range_loop = "allow"
+manual_clamp = "allow"
+manual_div_ceil = "allow"
+manual_is_multiple_of = "allow"
+manual_range_contains = "allow"
+identity_op = "allow"
+assign_op_pattern = "allow"
+
+# API ergonomics. The FEC chain functions legitimately take many spec-defined
+# parameters (lifting size Z, base graph, redundancy version, ...); slice-vs-Vec
+# signatures and `new()`-without-`Default` are intentional for these owning APIs.
+too_many_arguments = "allow"
+ptr_arg = "allow"
+new_without_default = "allow"
+vec_box = "allow"
+
+# Intentional placeholders kept for clarity / future wiring (Phase 2 rate
+# matching and pipeline ownership hand-off). Logic is deliberately explicit.
+if_same_then_else = "allow"
+forget_non_drop = "allow"
+
+# Cosmetic doc-rendering nit across the long ///-doc blocks; not worth churning.
+doc_overindented_list_items = "allow"

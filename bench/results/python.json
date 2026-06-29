@@ -1,0 +1,86 @@
+[
+  {
+    "lang": "python_same_algo",
+    "impl": "encode_into",
+    "shard_len": 256,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 2560,
+    "ns_per_iter": 1032084.5,
+    "mib_per_s": 2.4
+  },
+  {
+    "lang": "python_same_algo",
+    "impl": "encode_into",
+    "shard_len": 1024,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 10240,
+    "ns_per_iter": 3990699.5,
+    "mib_per_s": 2.4
+  },
+  {
+    "lang": "python_same_algo",
+    "impl": "encode_into",
+    "shard_len": 4096,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 40960,
+    "ns_per_iter": 16630569.3,
+    "mib_per_s": 2.3
+  },
+  {
+    "lang": "python_same_algo",
+    "impl": "encode_into",
+    "shard_len": 16384,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 163840,
+    "ns_per_iter": 67840467.9,
+    "mib_per_s": 2.3
+  },
+  {
+    "lang": "python_reedsolo",
+    "impl": "reedsolo.RSCodec.encode",
+    "shard_len": 256,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 2560,
+    "ns_per_iter": 1207960.2,
+    "mib_per_s": 2.0,
+    "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
+  },
+  {
+    "lang": "python_reedsolo",
+    "impl": "reedsolo.RSCodec.encode",
+    "shard_len": 1024,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 10240,
+    "ns_per_iter": 4449267.7,
+    "mib_per_s": 2.2,
+    "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
+  },
+  {
+    "lang": "python_reedsolo",
+    "impl": "reedsolo.RSCodec.encode",
+    "shard_len": 4096,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 40960,
+    "ns_per_iter": 17895919.0,
+    "mib_per_s": 2.2,
+    "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
+  },
+  {
+    "lang": "python_reedsolo",
+    "impl": "reedsolo.RSCodec.encode",
+    "shard_len": 16384,
+    "data_shards": 10,
+    "parity_shards": 4,
+    "payload_bytes": 163840,
+    "ns_per_iter": 71227959.5,
+    "mib_per_s": 2.2,
+    "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
+  }
+]
