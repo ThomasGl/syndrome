@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Performance
+- **QC-LDPC encode: 2.75 Mbit/s → ~1.66 Gbit/s (~590×)** — replaced the dense
+  generator-matrix multiply with the standard sparse structured encoding: the
+  double-diagonal core-parity solve is derived programmatically from the 3GPP
+  base-graph tables at construction (no hardcoded row/shift folklore), with
+  back-substitution for p2–p4 and direct identity-extension rows. Verified by
+  bit-identical equivalence with the retained dense reference and by syndrome
+  checks across BG1/BG2 × 7 lifting sizes; a dense fallback exists but never
+  triggers for any valid (BG, Z). Encoder construction drops from O(M²N) to
+  O(E).
+
 Decoder vectorization pass across all cores (single-thread, x86-64 AVX2;
 every optimized path is runtime-detected, keeps its scalar implementation as
 a tested reference, and is proven output-equivalent on seeded random inputs):

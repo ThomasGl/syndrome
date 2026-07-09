@@ -3,7 +3,7 @@
 [![CI](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-195%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-200%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -23,7 +23,7 @@
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 195 total — 126 unit · 7 integration · 4 media reconstruction · 58 doctests |
+| **Tests** | 200 total — 131 unit · 7 integration · 4 media reconstruction · 58 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~82/64 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
@@ -353,11 +353,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (195 tests total)
+### 4.1 Component coverage (200 tests total)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 126 | embedded in `src/*.rs` |
+| Unit tests | 131 | embedded in `src/*.rs` |
 | LDPC integration (encode→decode round-trips) | 7 | `tests/ldpc_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Doctests | 58 | `///` examples in all public API |
@@ -424,7 +424,7 @@ Uniform metric: **information-bit throughput** (payload bits per second — pari
 | Viterbi | K=7, R=1/2, soft | 557 Mbit/s | 5.1 → **29.9 Mbit/s** (5.9×) | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
 | Polar | (1024,512), SC | 133 Mbit/s | 5.9 → **35.0 Mbit/s** (6.0×) | Killed ~3 000 recursion allocations; partial sums O(N log²N) → O(N log N) via GF(2) linearity; branch-free f/g kernels |
 | Turbo | LTE K=1024, 8 iter | 328 Mbit/s | 3.1 → **13.4 Mbit/s** (4.3×) | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact ±1 arithmetic, no FMA) |
-| QC-LDPC | BG1 Z=384, 10 iter | 3.0 Mbit/s | 11.6 Mbit/s | Already AVX2/NEON from day one (§5.2) |
+| QC-LDPC | BG1 Z=384, 10 iter | 3.0 Mbit/s → **1.66 Gbit/s** (≈550×) | 11.6 Mbit/s | Encode: dense generator multiply replaced by the standard sparse double-diagonal solve, derived programmatically from the 3GPP tables; decode already AVX2/NEON (§5.2) |
 
 The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3). Every optimization above kept the scalar implementation as a tested reference: SIMD paths are runtime-detected and proven equivalent, never assumed.
 
