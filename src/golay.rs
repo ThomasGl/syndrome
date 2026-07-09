@@ -4,7 +4,7 @@
 //! # History and motivation
 //!
 //! The extended Golay code is one of the most celebrated objects in coding
-//! theory: a *perfect-adjacent*, highly symmetric $[24,12,8]$ code whose
+//! theory: a *perfect-adjacent*, highly symmetric `[24,12,8]` code whose
 //! automorphism group is (twice) the Mathieu group $M_{24}$. It flew on
 //! Voyager 1 and 2 to compress and protect the color imagery returned from
 //! Jupiter and Saturn (the shorter, perfect $(23,12,7)$ code is the
@@ -34,9 +34,9 @@
 //! \end{cases}
 //! $$
 //!
-//! This $B$ is computed programmatically from `QR_11` in [`build_b_rows`]
+//! This $B$ is computed programmatically from `QR_11` in `build_b_rows`
 //! rather than hardcoded, and is verified by the test suite below to
-//! produce a genuine $[24,12,8]$ self-dual code (weight enumerator
+//! produce a genuine `[24,12,8]` self-dual code (weight enumerator
 //! $1 + 759x^8 + 2576x^{12} + 759x^{16} + x^{24}$).
 //!
 //! Note on symmetry: since $-1$ is a quadratic *non*-residue mod $11$

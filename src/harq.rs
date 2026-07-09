@@ -8,12 +8,12 @@
 //!
 //! # Combining Equation
 //!
-//! Let $L^{(t)}[j]$ be the accumulated LLR for circular-buffer position $j$
+//! Let $L^{(t)}_j$ be the accumulated LLR for circular-buffer position $j$
 //! after $t$ transmissions.  Each call to [`HarqBuffer::combine`] adds:
 //!
-//! $$L^{(t)}[j] = L^{(t-1)}[j] + l^{(t)}[j]$$
+//! $$L^{(t)}_j = L^{(t-1)}_j + l^{(t)}_j$$
 //!
-//! where $l^{(t)}[j]$ is the de-rate-matched LLR from transmission $t$.
+//! where $l^{(t)}_j$ is the de-rate-matched LLR from transmission $t$.
 //! The combined buffer is then passed to the LDPC decoder.
 //!
 //! # Usage
@@ -38,7 +38,7 @@ use crate::rate_matching::rate_dematch_llr;
 /// HARQ soft-combining accumulator for one code block.
 ///
 /// Holds a $N_{cb}$-length f32 LLR buffer that accumulates soft information
-/// across multiple HARQ transmissions.  Call [`flush`] to reset for the next
+/// across multiple HARQ transmissions.  Call [`HarqBuffer::flush`] to reset for the next
 /// transport block.
 pub struct HarqBuffer {
     bg: BaseGraph,
@@ -149,7 +149,7 @@ impl HarqBuffer {
     ///
     /// Pass this to the LDPC decoder as the channel LLR input.  The first
     /// $2Z$ positions correspond to the punctured systematic bits and may be
-    /// zero (erasures); the decoder handles this via [`decode_5g`].
+    /// zero (erasures); the decoder handles this via [`crate::qc_ldpc::QcLdpcDecoder::decode_5g`].
     pub fn llr_buffer(&self) -> &[f32] {
         &self.acc
     }

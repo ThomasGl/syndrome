@@ -9,7 +9,7 @@
 //!
 //! The circular buffer for code block $r$ contains $N_{cb}$ entries ordered as:
 //!
-//! $$d[j], \quad j = 0, 1, \ldots, N_{cb} - 1$$
+//! $$d_j, \quad j = 0, 1, \ldots, N_{cb} - 1$$
 //!
 //! where $d[0..N_{systematic}]$ = systematic bits and
 //! $d[N_{systematic}..N_{cb}]$ = parity bits.  The first $2Z$ systematic
@@ -19,7 +19,7 @@
 //!
 //! The bit-selection loop (§5.4.2.1) is:
 //!
-//! $$e[k] = d[(k_0 + j) \bmod N_{cb}], \quad k = 0, \ldots, E-1$$
+//! $$e_k = d_{(k_0 + j) \bmod N_{cb}}, \quad k = 0, \ldots, E-1$$
 //!
 //! skipping positions that are marked as `<NULL>` (filler).
 //!

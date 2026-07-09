@@ -185,7 +185,7 @@ impl DlSchEncoder {
     ///
     /// * `tb`      - Transport block bits (length must equal `tb_size`).
     /// * `rv`      - Redundancy version (0..=3).
-    /// * `out`     - Output buffer of length [`output_bits()`].
+    /// * `out`     - Output buffer of length [`DlSchEncoder::output_bits`].
     ///
     /// # Errors
     ///
@@ -257,7 +257,7 @@ impl Clone for QcLdpcEncoder {
 /// 5G NR DL-SCH/UL-SCH transport block decoder.
 ///
 /// Maintains per-CB [`HarqBuffer`]s across retransmissions.  Call
-/// [`decode`] on each received LLR vector (with `rv` indicating the
+/// [`DlSchDecoder::decode`] on each received LLR vector (with `rv` indicating the
 /// redundancy version).  On success, the TB bits are returned and the
 /// HARQ buffers are flushed.  On failure (CRC miss), keep calling
 /// `decode` with subsequent transmissions to perform IR combining.

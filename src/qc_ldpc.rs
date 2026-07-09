@@ -341,7 +341,7 @@ impl QcLdpcParams {
 /// QC-LDPC layered offset min-sum decoder.
 ///
 /// The decoder itself holds no per-decode allocation; all working buffers are
-/// passed in by the caller via [`decode_layered_offset_min_sum`].
+/// passed in by the caller via [`QcLdpcDecoder::decode_layered_offset_min_sum`].
 ///
 /// # Examples
 ///
@@ -431,7 +431,7 @@ impl QcLdpcDecoder {
     /// 5G NR-compliant decode wrapper (TS 38.212 §5.3.2).
     ///
     /// Initialises LLRs for the two 3GPP-punctured systematic columns and for
-    /// filler bit positions, then calls [`decode_layered_offset_min_sum`].
+    /// filler bit positions, then calls [`QcLdpcDecoder::decode_layered_offset_min_sum`].
     ///
     /// The first $2Z$ systematic positions are punctured (never transmitted) and
     /// arrive as channel erasures (LLR = 0.0).  Filler bits at positions
@@ -446,14 +446,14 @@ impl QcLdpcDecoder {
     ///   positions $[0 .. 2Z]$ at 0.0 (punctured erasure).
     ///   This function fills $[K' .. K]$ with the filler-bit LLR.
     /// * `n_filler`  - Number of filler bits ($K - K'$).
-    /// * `edge_r`    - Caller-owned C→V buffer (length ≥ [`required_edge_buffer()`]).
-    /// * `scratch`   - Caller-owned per-layer scratch (length ≥ [`required_layer_buffer()`]).
+    /// * `edge_r`    - Caller-owned C→V buffer (length ≥ [`QcLdpcDecoder::required_edge_buffer`]).
+    /// * `scratch`   - Caller-owned per-layer scratch (length ≥ [`QcLdpcDecoder::required_layer_buffer`]).
     /// * `hard`      - Hard-decision output of length $N$.
     /// * `iterations`- Number of layered passes.
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`decode_layered_offset_min_sum`].
+    /// Propagates any error from [`QcLdpcDecoder::decode_layered_offset_min_sum`].
     ///
     /// # Examples
     ///
@@ -517,13 +517,13 @@ impl QcLdpcDecoder {
     /// # Arguments
     ///
     /// * `llr`           - Channel LLR input; overwritten with a-posteriori values.
-    ///   Length must equal [`variable_node_count()`].
+    ///   Length must equal [`QcLdpcDecoder::variable_node_count`].
     /// * `edge_r`        - Preallocated flat C→V extrinsic buffer.
-    ///   Minimum length: [`required_edge_buffer()`].
+    ///   Minimum length: [`QcLdpcDecoder::required_edge_buffer`].
     /// * `layer_scratch` - Per-layer V→C scratch buffer.
-    ///   Minimum length: [`required_layer_buffer()`].
+    ///   Minimum length: [`QcLdpcDecoder::required_layer_buffer`].
     /// * `hard_output`   - Bit-wise hard-decision output.
-    ///   Length must equal [`variable_node_count()`].
+    ///   Length must equal [`QcLdpcDecoder::variable_node_count`].
     /// * `iterations`    - Number of full layered passes.
     ///
     /// # Errors
@@ -925,7 +925,7 @@ impl ParityGenerator {
 /// QC-LDPC systematic encoder for 5G NR BG1/BG2.
 ///
 /// Precomputes a GF(2) parity generator at construction time via Gaussian
-/// elimination; the [`encode`] call is then a simple matrix–vector multiply
+/// elimination; the [`QcLdpcEncoder::encode`] call is then a simple matrix–vector multiply
 /// over GF(2).
 ///
 /// The encoder may allocate during construction; it is not intended for
@@ -1001,7 +1001,7 @@ impl QcLdpcEncoder {
     /// 5G NR-compliant encode wrapper (TS 38.212 §5.3.2).
     ///
     /// Accepts $K'$ info bits, pads with $n_{filler}$ zero filler bits to
-    /// reach $K = k_b \cdot Z$, then calls [`encode`].  The first $2Z$
+    /// reach $K = k_b \cdot Z$, then calls [`QcLdpcEncoder::encode`].  The first $2Z$
     /// systematic bits in the output codeword are **not** transmitted (the rate
     /// matcher handles that puncturing separately).
     ///
@@ -1055,8 +1055,8 @@ impl QcLdpcEncoder {
     ///
     /// # Arguments
     ///
-    /// * `info_bits` - Systematic bits of length [`info_bit_count()`].
-    /// * `codeword`  - Output buffer of length [`codeword_bit_count()`].
+    /// * `info_bits` - Systematic bits of length [`QcLdpcEncoder::info_bit_count`].
+    /// * `codeword`  - Output buffer of length [`QcLdpcEncoder::codeword_bit_count`].
     ///
     /// # Errors
     ///

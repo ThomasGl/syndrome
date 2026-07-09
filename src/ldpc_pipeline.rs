@@ -65,9 +65,9 @@ struct FrameSlot {
 
 /// A borrowed decode slot.  Obtained via [`LdpcPipeline::acquire`].
 ///
-/// Fill [`llr_mut`] with channel LLR values, then hand ownership to the
+/// Fill [`LdpcFrame::llr_mut`] with channel LLR values, then hand ownership to the
 /// pipeline with [`LdpcPipeline::submit`].  After receiving a completed
-/// frame via [`LdpcPipeline::try_recv`], read results from [`hard`], then
+/// frame via [`LdpcPipeline::try_recv`], read results from [`LdpcFrame::hard`], then
 /// return the slot with [`LdpcPipeline::release`].
 ///
 /// # Ownership invariant
