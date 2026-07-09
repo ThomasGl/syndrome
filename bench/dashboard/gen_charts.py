@@ -26,13 +26,18 @@ GRIDCOLOR = "#2d3748"
 TEXT      = "#e2e8f0"
 DIM       = "#94a3b8"
 
-RUST_COLORS  = ["#f97316", "#fb923c", "#fdba74"]
+# Primary two-hue pair validated for the dark surface (#1e293b) with the
+# dataviz palette validator: lightness band, chroma floor, CVD separation,
+# and 3:1 contrast all pass for #ea580c / #3b82f6.
+RUST_COLORS  = ["#ea580c", "#fb923c", "#fdba74"]
 CPP_COLOR    = "#3b82f6"
 PY_COLOR     = "#a855f7"
 PY2_COLOR    = "#22c55e"
-BER_COLOR    = "#f97316"
+BER_COLOR    = "#ea580c"
 BLER_COLOR   = "#3b82f6"
 SHANNON_COL  = "#ef4444"
+ENCODE_COLOR = "#ea580c"
+DECODE_COLOR = "#3b82f6"
 
 def mpl():
     """Import matplotlib with a non-interactive backend."""
@@ -158,6 +163,7 @@ def chart_ldpc_comparison():
 
     style_ax(ax, ylabel="Melem/s (variable-node-iteration-updates / s)",
              title="QC-LDPC Decode Throughput — BG1 Z=384, 10 iterations")
+    ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, color=DIM, rotation=15, ha="right", fontsize=9)
     fig.tight_layout()
     out = EXPORTS / "ldpc_comparison.png"
@@ -180,9 +186,9 @@ def chart_ber_waterfall():
     bers = [r["ber"]  if r["ber"]  > 0 else None for r in ber_data]
     blers= [r["bler"] if r["bler"] > 0 else None for r in ber_data]
 
+    # BER and BLER are the same unit (error probability), so they share ONE
+    # log axis — a dual-axis (twinx) chart here would be misleading.
     fig, ax = plt.subplots(figsize=(10, 5), facecolor=BG)
-    ax2 = ax.twinx()
-    ax2.set_facecolor(BG)
 
     ber_y  = [v for v in bers  if v is not None]
     bler_y = [v for v in blers if v is not None]
@@ -191,27 +197,20 @@ def chart_ber_waterfall():
 
     ax.semilogy(ber_x,  ber_y,  "o-", color=BER_COLOR,  linewidth=2, markersize=6,
                 label="BER (Rust LOMS)")
-    ax2.semilogy(bler_x, bler_y, "s--", color=BLER_COLOR, linewidth=2, markersize=6,
-                 label="BLER (Rust LOMS)")
+    ax.semilogy(bler_x, bler_y, "s--", color=BLER_COLOR, linewidth=2, markersize=6,
+                label="BLER (Rust LOMS)")
 
-    # Shannon limit for BPSK AWGN at R = 22/68:
-    # Eb/N0_shannon = 10*log10((2^(2*R) - 1) / R)
+    # Shannon limit for a rate-R code on the real AWGN channel (BPSK is one
+    # bit per real dimension): Eb/N0_min = (2^(2R) - 1) / (2R).
+    # For R = 22/68 ≈ 0.324 this is ≈ -0.58 dB.
     R = 22 / 68
-    shannon_db = 10 * np.log10((2 ** (2 * R) - 1) / R)
+    shannon_db = 10 * np.log10((2 ** (2 * R) - 1) / (2 * R))
     ax.axvline(shannon_db, color=SHANNON_COL, linestyle="--", linewidth=1.5,
                label=f"Shannon limit R={R:.3f} ≈ {shannon_db:.1f} dB")
 
-    style_ax(ax, xlabel="Eb/N0 (dB)", ylabel="BER",
-             title="BER Waterfall — QC-LDPC BG1 Z=384 (BPSK AWGN, β=0.25, 10 iter)")
-    ax2.set_ylabel("BLER", color=DIM)
-    ax2.tick_params(colors=DIM, labelcolor=DIM)
-    for spine in ax2.spines.values():
-        spine.set_edgecolor(GRIDCOLOR)
-
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2,
-              facecolor=BG, edgecolor=GRIDCOLOR, labelcolor=TEXT, fontsize=9)
+    style_ax(ax, xlabel="Eb/N0 (dB)", ylabel="Error rate (log)",
+             title="BER / BLER Waterfall — QC-LDPC BG1 Z=384 (BPSK AWGN, β=0.25, 10 iter)")
+    ax.legend(facecolor=BG, edgecolor=GRIDCOLOR, labelcolor=TEXT, fontsize=9)
 
     fig.tight_layout()
     out = EXPORTS / "ber_waterfall.png"
@@ -291,6 +290,78 @@ def chart_latency():
     print(f"  wrote {out}")
 
 
+# ─── Chart 5: all-algorithm encode/decode throughput comparison ───────────────
+def chart_algo_comparison():
+    """Horizontal grouped bars: info-bit throughput of every FEC core.
+
+    Reads bench/results/algos.json (written by `cargo run --release --bin
+    algo_bench_export`). One row per algorithm, two bars (encode / decode),
+    log x-axis because throughput spans ~4 orders of magnitude between a
+    table-lookup Golay decode and an iterative Turbo decode.
+    """
+    plt = mpl()
+    import numpy as np
+
+    recs = load_json(RESULTS / "algos.json")
+    if not recs:
+        print("  [skip] algo_comparison — no data "
+              "(run: cargo run --release --bin algo_bench_export)")
+        return
+
+    # {algo_label: {"encode": mbit/s, "decode": mbit/s}}
+    by_algo = {}
+    for r in recs:
+        if r.get("mbit_per_s") is None:
+            continue
+        label = r.get("label", r.get("algo", "?"))
+        by_algo.setdefault(label, {})[r.get("op", "?")] = r["mbit_per_s"]
+
+    if not by_algo:
+        return
+
+    # Sort rows by decode throughput so the ranking is readable top-to-bottom.
+    labels = sorted(by_algo, key=lambda a: by_algo[a].get("decode", 0.0),
+                    reverse=True)
+    enc = [by_algo[a].get("encode") for a in labels]
+    dec = [by_algo[a].get("decode") for a in labels]
+
+    y = np.arange(len(labels))
+    h = 0.36  # bar height; the 0.28 gap between pairs acts as the mark spacer
+
+    fig, ax = plt.subplots(figsize=(11, 0.62 * len(labels) + 1.8), facecolor=BG)
+    ax.set_xscale("log")
+
+    def fmt(v):
+        if v >= 1000:
+            return f"{v/1000:,.1f} Gbit/s"
+        if v >= 1:
+            return f"{v:,.0f} Mbit/s"
+        return f"{v*1000:,.0f} kbit/s"
+
+    for vals, off, color, name in [(enc, -h / 2, ENCODE_COLOR, "encode"),
+                                   (dec, +h / 2, DECODE_COLOR, "decode")]:
+        ys = [yi + off for yi, v in zip(y, vals) if v is not None]
+        vs = [v for v in vals if v is not None]
+        bars = ax.barh(ys, vs, h * 0.92, color=color, alpha=0.9, label=name)
+        for bar, v in zip(bars, vs):
+            ax.text(v * 1.15, bar.get_y() + bar.get_height() / 2, fmt(v),
+                    va="center", ha="left", color=TEXT, fontsize=8)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, color=TEXT, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(right=ax.get_xlim()[1] * 8)  # headroom for end labels
+    style_ax(ax, xlabel="Information-bit throughput (Mbit/s, log scale)",
+             title="FEC Core Throughput — encode vs decode (single thread)")
+    ax.legend(facecolor=BG, edgecolor=GRIDCOLOR, labelcolor=TEXT, fontsize=9,
+              loc="lower right")
+    fig.tight_layout()
+    out = EXPORTS / "algo_comparison.png"
+    fig.savefig(out, dpi=150, facecolor=BG)
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     EXPORTS.mkdir(parents=True, exist_ok=True)
@@ -299,5 +370,6 @@ if __name__ == "__main__":
     chart_ldpc_comparison()
     chart_ber_waterfall()
     chart_latency()
+    chart_algo_comparison()
     print("Done. PNG files are in bench/dashboard/exports/")
     print("Embed in README with: ![Chart](bench/dashboard/exports/<name>.png)")

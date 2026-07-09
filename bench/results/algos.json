@@ -1,0 +1,19 @@
+[
+  {"algo":"hamming","label":"Hamming(7,4)","op":"encode","info_bits":16384,"ns_per_iter":7321.4,"mbit_per_s":2237.825},
+  {"algo":"hamming","label":"Hamming(7,4)","op":"decode","info_bits":16384,"ns_per_iter":10874.5,"mbit_per_s":1506.643},
+  {"algo":"crc24a","label":"CRC-24A (6144-bit block)","op":"encode","info_bits":6144,"ns_per_iter":5876.1,"mbit_per_s":1045.590},
+  {"algo":"reed_solomon","label":"Reed-Solomon RS(10,4) GF(256)","op":"encode","info_bits":327680,"ns_per_iter":4394.6,"mbit_per_s":74564.408},
+  {"algo":"reed_solomon","label":"Reed-Solomon RS(10,4) GF(256)","op":"decode","info_bits":327680,"ns_per_iter":337165.4,"mbit_per_s":971.867},
+  {"algo":"viterbi","label":"Viterbi K=7 R=1/2","op":"encode","info_bits":2048,"ns_per_iter":3793.7,"mbit_per_s":539.844},
+  {"algo":"viterbi","label":"Viterbi K=7 R=1/2","op":"decode","info_bits":2048,"ns_per_iter":404691.7,"mbit_per_s":5.061},
+  {"algo":"polar","label":"Polar (1024,512) SC","op":"encode","info_bits":512,"ns_per_iter":4243.6,"mbit_per_s":120.653},
+  {"algo":"polar","label":"Polar (1024,512) SC","op":"decode","info_bits":512,"ns_per_iter":87243.6,"mbit_per_s":5.869},
+  {"algo":"turbo","label":"Turbo LTE K=1024 R=1/3","op":"encode","info_bits":1024,"ns_per_iter":3272.5,"mbit_per_s":312.911},
+  {"algo":"turbo","label":"Turbo LTE K=1024 R=1/3","op":"decode","info_bits":1024,"ns_per_iter":331880.3,"mbit_per_s":3.085},
+  {"algo":"bch","label":"BCH(255,223,t=4)","op":"encode","info_bits":223,"ns_per_iter":404.9,"mbit_per_s":550.790},
+  {"algo":"bch","label":"BCH(255,223,t=4)","op":"decode","info_bits":223,"ns_per_iter":3493.6,"mbit_per_s":63.831},
+  {"algo":"golay","label":"Golay(24,12) ext.","op":"encode","info_bits":12288,"ns_per_iter":6912.4,"mbit_per_s":1777.684},
+  {"algo":"golay","label":"Golay(24,12) ext.","op":"decode","info_bits":12288,"ns_per_iter":18957.4,"mbit_per_s":648.191},
+  {"algo":"qc_ldpc","label":"QC-LDPC BG1 Z=384 LOMS","op":"encode","info_bits":8448,"ns_per_iter":2517959.3,"mbit_per_s":3.355},
+  {"algo":"qc_ldpc","label":"QC-LDPC BG1 Z=384 LOMS","op":"decode","info_bits":8448,"ns_per_iter":787662.3,"mbit_per_s":10.725}
+]
