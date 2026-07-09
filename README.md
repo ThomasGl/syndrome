@@ -3,7 +3,7 @@
 [![CI](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-184%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-195%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -21,12 +21,12 @@
 |---|---|
 | **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), 802.11ax/be (Wi-Fi 6/7), IMT-2030 (6G research) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
-| **SIMD** | AVX2 (x86-64, runtime-detected), NEON (AArch64, compile-gated) |
+| **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 184 total — 115 unit · 7 integration · 4 media reconstruction · 58 doctests |
+| **Tests** | 195 total — 126 unit · 7 integration · 4 media reconstruction · 58 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
-| **Benchmarks** | RS: ~75 Gbit/s info (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
+| **Benchmarks** | RS: ~82/64 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
 
 ### The algorithm portfolio — one library, every generation
 
@@ -353,11 +353,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (184 tests total)
+### 4.1 Component coverage (195 tests total)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 115 | embedded in `src/*.rs` |
+| Unit tests | 126 | embedded in `src/*.rs` |
 | LDPC integration (encode→decode round-trips) | 7 | `tests/ldpc_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Doctests | 58 | `///` examples in all public API |
@@ -374,6 +374,10 @@ Highlights of what the tests actually *prove* (not just exercise):
   reference table for all $t \le 10$; $g(x)$ provably divides $x^{255}+1$.
 - **Turbo**: every QPP interleaver is asserted to be a valid permutation;
   both constituent encoders provably terminate in state zero.
+- **SIMD equivalence**: every AVX2 path (Viterbi ACS, Turbo BCJR, RS decode)
+  and every table-driven rewrite (CRC, BCH) is tested against its retained
+  scalar reference implementation on hundreds of seeded random inputs —
+  bit-for-bit where the arithmetic permits, which it does in all cases here.
 
 Run all:
 ```bash
@@ -408,21 +412,21 @@ All numbers are produced by running the code on this machine (`bench/run_all.sh`
 
 ### 5.0 Cross-algorithm comparison — all nine cores, one metric
 
-Uniform metric: **information-bit throughput** (payload bits per second — parity overhead not counted), single thread, x86-64 with AVX2.
+Uniform metric: **information-bit throughput** (payload bits per second — parity overhead not counted), single thread, x86-64 with AVX2. The *before* column is the original scalar implementation; *after* is the current SIMD/table-optimized code (every decoder was vectorized or table-accelerated in a dedicated optimization pass, each proven output-equivalent to its scalar reference by seeded randomized tests).
 
-| Algorithm | Configuration | Encode | Decode | Why the gap |
+| Algorithm | Configuration | Encode | Decode (before → after) | How the decode was accelerated |
 |---|---|---|---|---|
-| Reed-Solomon | RS(10,4), 4 KiB shards, AVX2 | **74.6 Gbit/s** | 972 Mbit/s | Encode is pure VPSHUFB streaming; decode inverts a matrix then re-multiplies |
-| Hamming | (7,4), table | 2.24 Gbit/s | 1.51 Gbit/s | Both are table lookups |
-| Golay | (24,12), syndrome table | 1.78 Gbit/s | 648 Mbit/s | O(1) table decode with bit packing |
-| CRC-24A | 6144-bit block | 1.05 Gbit/s | — (detection) | Bit-serial LFSR |
-| BCH | (255,223,t=4) | 551 Mbit/s | 64 Mbit/s | Decode = syndromes + Berlekamp–Massey + Chien search |
-| Viterbi | K=7, R=1/2, soft | 540 Mbit/s | 5.1 Mbit/s | Decode walks a 64-state trellis per bit |
-| Turbo | LTE K=1024, 8 iter | 313 Mbit/s | 3.1 Mbit/s | Decode = 16 BCJR passes over the trellis |
-| Polar | (1024,512), SC | 121 Mbit/s | 5.9 Mbit/s | Decode = sequential N log N tree walk |
-| QC-LDPC | BG1 Z=384, 10 iter | 3.4 Mbit/s | 10.7 Mbit/s | Encode = dense generator multiply; decode is layered + SIMD |
+| Reed-Solomon | RS(10,4), 4 KiB shards | **82 Gbit/s** | 972 Mbit/s → **63.8 Gbit/s** (66×) | Removed 8 192 hidden per-call heap allocations; routed reconstruction through the same AVX2 VPSHUFB kernel as encode |
+| CRC-24A | 6144-bit block | 1.05 → **3.95 Gbit/s** (3.8×) | — (detection) | Bit-serial LFSR → 256-entry byte table (nibble table for CRC-6) |
+| Golay | (24,12), syndrome table | 1.86 Gbit/s | 654 Mbit/s | Already O(1) table decode by design |
+| Hamming | (7,4), table | 2.59 Gbit/s | 1.54 Gbit/s | Already table lookups |
+| BCH | (255,223,t=4) | 551 Mbit/s → **1.17 Gbit/s** (2.1×) | 64 → **209 Mbit/s** (3.3×) | Weight-proportional syndrome tables + per-β Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
+| Viterbi | K=7, R=1/2, soft | 557 Mbit/s | 5.1 → **29.9 Mbit/s** (5.9×) | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
+| Polar | (1024,512), SC | 133 Mbit/s | 5.9 → **35.0 Mbit/s** (6.0×) | Killed ~3 000 recursion allocations; partial sums O(N log²N) → O(N log N) via GF(2) linearity; branch-free f/g kernels |
+| Turbo | LTE K=1024, 8 iter | 328 Mbit/s | 3.1 → **13.4 Mbit/s** (4.3×) | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact ±1 arithmetic, no FMA) |
+| QC-LDPC | BG1 Z=384, 10 iter | 3.0 Mbit/s | 11.6 Mbit/s | Already AVX2/NEON from day one (§5.2) |
 
-The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3).
+The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3). Every optimization above kept the scalar implementation as a tested reference: SIMD paths are runtime-detected and proven equivalent, never assumed.
 
 Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algos.json` → `python bench/dashboard/gen_charts.py`.
 

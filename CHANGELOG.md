@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+Decoder vectorization pass across all cores (single-thread, x86-64 AVX2;
+every optimized path is runtime-detected, keeps its scalar implementation as
+a tested reference, and is proven output-equivalent on seeded random inputs):
+- **Reed-Solomon erasure decode: 972 Mbit/s → ~64 Gbit/s (66×)** — removed
+  8 192 hidden per-call heap allocations and routed reconstruction through
+  the same AVX2 VPSHUFB kernel as encode.
+- **Polar SC decode: 5.9 → 35 Mbit/s (6×), SCL ~2.6×** — eliminated ~3 000
+  recursion allocations per call; partial-sum re-encoding reduced from
+  O(N log²N) to O(N log N) via GF(2) linearity; branch-free f/g kernels.
+- **Viterbi soft decode: 5.1 → 30 Mbit/s (5.9×)** — AVX2 ACS processing all
+  64 trellis states per step with shuffle-deinterleaved butterfly gathers.
+- **Turbo decode: 3.1 → 13.4 Mbit/s (4.3×)** — AVX2 BCJR with all 8 states
+  per register, bit-identical to scalar by design (sign-exact ±1 arithmetic).
+- **BCH: encode 2.1×, decode 3.3×** — weight-proportional syndrome tables,
+  per-β Chien multiply tables, byte-wise LFSR (≈70 KiB of tables per code).
+- **CRC family: 3.8×** — bit-serial LFSR replaced by a 256-entry byte table
+  (16-entry nibble table for CRC-6), equivalent by construction.
+
 ### Added
 - **LTE Turbo codes** (`src/turbo.rs`): rate-1/3 PCCC per TS 36.212 — two 8-state
   RSC constituent encoders, QPP interleaver (8 supported K, pairs from Table
@@ -40,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[lints.clippy]` policy.
 
 ### Fixed
+- Resolved all 35 rustdoc warnings (unqualified intra-doc links now
+  type-qualified, links to private items demoted to plain code spans, and
+  bracketed math indices rewritten as LaTeX subscripts so they no longer
+  parse as broken links); `cargo doc` is now warning-free alongside rustc
+  and clippy.
 - **Polar SC/SCL decoder correctness**: the successive-cancellation g-function
   consumed raw decoded bits instead of the re-encoded partial sums, silently
   producing wrong codewords for any message of Hamming weight ≥ 2 (the old
