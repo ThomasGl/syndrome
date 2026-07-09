@@ -8,7 +8,7 @@ Lock-Free Atomic RingsThread workers query work using lock-free Single-Producer 
 
 The project ships a reproducible benchmark suite that measures Reed-Solomon encode throughput in Rust, same-algorithm C++, and Python. All numbers come from actually running the code — never hand-written.
 
-Current Implementation Status (99 tests: 64 unit + 7 integration + 28 doctests)
+Current Implementation Status (184 tests: 115 unit + 11 integration/media + 58 doctests)
 
 The following components are real and tested:
 
@@ -21,9 +21,14 @@ The following components are real and tested:
 
 FEC cores:
 - Hamming(7,4) encode/decode (src/hamming.rs)
+- Extended Golay(24,12,8) (src/golay.rs) — syndrome-table 3-error correction; weight enumerator verified
+- BCH(255,k,t≤10) over GF(2^8) (src/bch.rs) — Berlekamp–Massey + Chien; (t,n,k) matches the standard table
 - Reed-Solomon erasure encoder/decoder (src/reed_solomon.rs) — GF(256) 0x11D; AVX2 VPSHUFB path
 - Rate-1/2 K=7 Viterbi decoder (src/viterbi.rs) — hard (Hamming ACS) + soft (max-log-MAP)
-- Polar codes SC + CA-SCL (src/polar.rs) — 3GPP reliability sequence; list decode
+- LTE rate-1/3 Turbo (src/turbo.rs) — TS 36.212 QPP interleaver, iterative max-log-MAP, 8 supported K
+- Polar codes SC + CA-SCL (src/polar.rs) — 3GPP reliability sequence (N≤256) + polarization-weight
+  fallback (N>256); partial-sum propagation fixed and proven by exhaustive round-trip tests
+- 7 runnable teaching examples (examples/) + all-algorithm benchmark exporter (algo_bench_export)
 
 QC-LDPC kernel:
 - BG1 (Z=384, R≈1/3) and BG2 (Z=128) from 3GPP TS 38.212 — 7 integration tests
