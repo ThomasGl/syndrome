@@ -357,6 +357,15 @@ pub struct TurboDecoder {
     // decoders (sized for k info steps + 3 termination steps).
     alpha: Vec<f32>,
     beta: Vec<f32>,
+
+    // Precomputed per-position branch-metric halves `a = 0.5*(sys+apriori)`
+    // and `p = 0.5*par`, length `k + 3` (info positions + 3 termination
+    // positions). Filled once per `siso_max_log_map` call and then reused,
+    // unmodified, by the forward, backward, *and* LLR-extraction passes (and
+    // by both the scalar and AVX2 kernels) instead of recomputing the same
+    // arithmetic from `ch_sys`/`ch_par`/`apriori` on every trellis edge.
+    gamma_a: Vec<f32>,
+    gamma_p: Vec<f32>,
 }
 
 impl TurboDecoder {
@@ -404,6 +413,8 @@ impl TurboDecoder {
             hard2_nat: vec![0u8; k],
             alpha: vec![0.0; n_alpha_beta],
             beta: vec![0.0; n_alpha_beta],
+            gamma_a: vec![0.0; k + 3],
+            gamma_p: vec![0.0; k + 3],
         })
     }
 
@@ -464,6 +475,23 @@ impl TurboDecoder {
         out: &mut [u8],
         max_iters: usize,
     ) -> Result<usize, FecError> {
+        self.decode_with_backend(llr, out, max_iters, SisoBackend::Auto)
+    }
+
+    /// Identical to [`Self::decode`] but lets the caller force a specific
+    /// SISO backend instead of the runtime auto-detection `decode` uses.
+    ///
+    /// This exists solely so the test suite can assert bit-for-bit (or
+    /// near-bit-for-bit) equivalence between the scalar reference kernel and
+    /// the AVX2 kernel on identical inputs; it is not part of the public API.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn decode_with_backend(
+        &mut self,
+        llr: &[f32],
+        out: &mut [u8],
+        max_iters: usize,
+        backend: SisoBackend,
+    ) -> Result<usize, FecError> {
         let k = self.k;
         if max_iters == 0 {
             return Err(FecError::InvalidParam("max_iters must be >= 1"));
@@ -514,7 +542,10 @@ impl TurboDecoder {
                 &self.apriori1,
                 &mut self.alpha,
                 &mut self.beta,
+                &mut self.gamma_a,
+                &mut self.gamma_p,
                 &mut self.llr_total1,
+                backend,
             );
             for t in 0..k {
                 self.extrinsic1[t] =
@@ -535,7 +566,10 @@ impl TurboDecoder {
                 &self.apriori2,
                 &mut self.alpha,
                 &mut self.beta,
+                &mut self.gamma_a,
+                &mut self.gamma_p,
                 &mut self.llr_total2,
+                backend,
             );
             for i in 0..k {
                 let e2 =
@@ -557,11 +591,94 @@ impl TurboDecoder {
     }
 }
 
+/// Which SISO kernel implementation to run.
+///
+/// `Auto` (used by the public [`TurboDecoder::decode`] through
+/// [`TurboDecoder::decode_with_backend`]) picks the AVX2 kernel when the
+/// running CPU supports it, falling back to the scalar reference otherwise.
+/// `Scalar` and `Avx2` force one specific backend; they exist only so the
+/// test suite can assert equivalence between the two kernels on identical
+/// inputs and are never selected by production code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum SisoBackend {
+    Auto,
+    Scalar,
+    Avx2,
+}
+
+/// Renormalization period (in trellis steps) for the forward/backward metric
+/// recursions: every `NORM_PERIOD`-th step, the 8 state metrics of the row
+/// just written are shifted by their common maximum (see
+/// [`normalize_row`]). See that function's docs for why this is exact.
+const NORM_PERIOD: usize = 64;
+
+/// Subtract the row maximum from all 8 lanes of a just-written alpha/beta
+/// row, in place.
+///
+/// # Numerical safety
+///
+/// Max-log-MAP forms its output ([`llr_out`](siso_max_log_map_scalar)) as a
+/// *difference* `best0 - best1` of two path metrics, and each path metric is
+/// built by repeatedly adding branch metrics ($\gamma$, unaffected by this
+/// function) to a chain of $\alpha$ or $\beta$ values. If every one of the 8
+/// states at trellis step $t$ is shifted by the *same* constant $C_t$ (which
+/// is exactly what this function does — it subtracts one scalar from all 8
+/// lanes), that constant propagates additively and identically through every
+/// subsequent `max` in the recursion (because
+/// $\max(x_1 - C, x_2 - C) = \max(x_1, x_2) - C$), and both `best0` and
+/// `best1` in the final LLR difference draw from the *same* (possibly
+/// shifted) $\alpha[t]$ row and the *same* $\beta[t+1]$ row. So any
+/// accumulated shift cancels exactly in `best0 - best1`, regardless of how
+/// the forward and backward renormalization schedules happen to align. This
+/// is the standard periodic-renormalization trick used to bound metric
+/// growth in log-domain BCJR/Viterbi decoders; here it guards against
+/// metric magnitude growth over long blocks (large $K$) or many extrinsic
+/// exchange iterations, at negligible cost (one 8-wide max reduction and one
+/// subtraction every `NORM_PERIOD` steps, not every step).
+///
+/// The guard `m > NEG_INF * 0.5` skips normalization on a (never actually
+/// reached, but defensively handled) row where every state is still the
+/// pruned-path sentinel [`NEG_INF`]: subtracting `NEG_INF` from `NEG_INF`
+/// would otherwise yield `0.0` and make an unreachable state look reachable.
+#[inline(always)]
+fn normalize_row(row: &mut [f32]) {
+    let m = row.iter().copied().fold(NEG_INF, f32::max);
+    if m > NEG_INF * 0.5 {
+        for v in row.iter_mut() {
+            *v -= m;
+        }
+    }
+}
+
+/// Branch metric $\gamma(b, z)$ given the precomputed halves
+/// `a = 0.5*(sys+apriori)` and `p = 0.5*par` for the current trellis step
+/// (see [`TurboDecoder::gamma_a`]/`gamma_p`).
+///
+/// Expands to exactly `0.5*sys_bp*(lsys+la) + 0.5*z_bp*lpar` (the original,
+/// direct formula) for every `(b, z)` combination: only four distinct
+/// branch-metric values exist per trellis step ($\pm a \pm p$), so instead
+/// of recomputing that product/sum from scratch on every one of the (up to)
+/// 16 edges touched per step, every call site precomputes `a`/`p` once and
+/// this function just picks the right sign combination.
+#[inline(always)]
+fn gamma_ab(a: f32, p: f32, b: usize, z: u8) -> f32 {
+    match (b, z) {
+        (0, 0) => a + p,
+        (0, _) => a - p,
+        (_, 0) => -a + p,
+        _ => -a - p,
+    }
+}
+
 /// One max-log-MAP SISO (BCJR) pass over a single 8-state RSC constituent
 /// trellis of `k` information positions followed by 3 termination positions.
 ///
 /// Runs in $O(k \cdot 8)$ time using only the caller-provided buffers: no
-/// heap allocation occurs inside this function.
+/// heap allocation occurs inside this function. Dispatches to the AVX2
+/// kernel ([`avx2_kernel::siso_max_log_map_avx2`]) when `backend` allows it
+/// and the CPU supports AVX2, otherwise runs the scalar reference
+/// ([`siso_max_log_map_scalar`]).
 ///
 /// * `ch_sys`, `ch_par` - Channel LLRs for the `k` information positions
 ///   (systematic and this encoder's parity, respectively), in this
@@ -572,6 +689,9 @@ impl TurboDecoder {
 ///   information positions; termination positions have no a priori term.
 /// * `alpha`, `beta` - Scratch trellis metrics, length `(k + 4) * 8`,
 ///   indexed `[time * 8 + state]`.
+/// * `gamma_a`, `gamma_p` - Scratch, length `k + 3`; filled here from
+///   `ch_sys`/`ch_par`/`apriori`/`tail_sys`/`tail_par` and then reused by
+///   every pass (see [`gamma_ab`]).
 /// * `llr_out` - Receives the total a posteriori LLR for the `k` information
 ///   positions.
 #[allow(clippy::too_many_arguments)]
@@ -584,61 +704,117 @@ fn siso_max_log_map(
     apriori: &[f32],
     alpha: &mut [f32],
     beta: &mut [f32],
+    gamma_a: &mut [f32],
+    gamma_p: &mut [f32],
+    llr_out: &mut [f32],
+    backend: SisoBackend,
+) {
+    // Precompute the two branch-metric halves once per trellis position;
+    // shared by the forward, backward, and LLR-extraction passes below (and
+    // by both the scalar and AVX2 kernels), instead of recomputing
+    // `lsys + la` / `lpar` and the sign-multiplications on every trellis
+    // edge (up to 16 edges per step) as the original per-edge closure did.
+    for t in 0..k {
+        gamma_a[t] = 0.5 * (ch_sys[t] + apriori[t]);
+        gamma_p[t] = 0.5 * ch_par[t];
+    }
+    for i in 0..3 {
+        gamma_a[k + i] = 0.5 * tail_sys[i];
+        gamma_p[k + i] = 0.5 * tail_par[i];
+    }
+
+    match backend {
+        SisoBackend::Scalar => {
+            siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
+        }
+        SisoBackend::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert!(
+                    is_x86_feature_detected!("avx2"),
+                    "SisoBackend::Avx2 forced but this CPU has no AVX2 support"
+                );
+                // SAFETY: AVX2 support asserted immediately above.
+                unsafe {
+                    avx2_kernel::siso_max_log_map_avx2(k, gamma_a, gamma_p, alpha, beta, llr_out);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
+            }
+        }
+        SisoBackend::Auto => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") {
+                    // SAFETY: AVX2 support checked immediately above.
+                    unsafe {
+                        avx2_kernel::siso_max_log_map_avx2(
+                            k, gamma_a, gamma_p, alpha, beta, llr_out,
+                        );
+                    }
+                    return;
+                }
+            }
+            siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
+        }
+    }
+}
+
+/// Scalar reference SISO kernel (kept as ground truth / non-x86_64
+/// fallback). See [`siso_max_log_map`] for the shared contract; `gamma_a`
+/// and `gamma_p` (length `k + 3`) must already be filled by the caller.
+fn siso_max_log_map_scalar(
+    k: usize,
+    gamma_a: &[f32],
+    gamma_p: &[f32],
+    alpha: &mut [f32],
+    beta: &mut [f32],
     llr_out: &mut [f32],
 ) {
     let (next_state, out_z) = RSC_TRELLIS;
     let n_ext = k + 3;
 
-    // Branch metric gamma for a transition with input bit `b` and parity
-    // output `z`, at trellis time `t`.
-    let gamma_at = |t: usize, b: usize, z: u8| -> f32 {
-        let (lsys, lpar, la) = if t >= k {
-            (tail_sys[t - k], tail_par[t - k], 0.0)
-        } else {
-            (ch_sys[t], ch_par[t], apriori[t])
-        };
-        let sys_bp = 1.0 - 2.0 * (b as f32);
-        let z_bp = 1.0 - 2.0 * (z as f32);
-        0.5 * sys_bp * (lsys + la) + 0.5 * z_bp * lpar
-    };
-
-    // Forward pass: alpha[0] = log(1) at state 0.
+    // Forward pass: alpha[0] = log(1) at state 0. Only the `k` info-step
+    // iterations are run: the 3 termination rows (alpha[k+1..=n_ext]) are
+    // *never read* by anything (the LLR-extraction loop below only ever
+    // indexes alpha[0..k]), so computing them would be pure dead work; this
+    // holds for both the scalar and AVX2 kernels.
     for s in 0..8 {
         alpha[s] = if s == 0 { 0.0 } else { NEG_INF };
     }
-    for t in 0..n_ext {
-        let is_tail = t >= k;
+    for t in 0..k {
+        let a = gamma_a[t];
+        let p = gamma_p[t];
         let base_out = (t + 1) * 8;
         for ns in 0..8 {
             alpha[base_out + ns] = NEG_INF;
         }
         let base_in = t * 8;
         for s in 0..8usize {
-            let a = alpha[base_in + s];
-            if a <= NEG_INF {
+            let av = alpha[base_in + s];
+            if av <= NEG_INF {
                 continue;
             }
-            let s1 = (s >> 1) & 1;
-            let s2 = (s >> 2) & 1;
-            let (lo, hi) = if is_tail {
-                let b = s1 ^ s2;
-                (b, b)
-            } else {
-                (0usize, 1usize)
-            };
-            for b in lo..=hi {
+            for b in 0..2usize {
                 let idx = s * 2 + b;
                 let ns = next_state[idx] as usize;
                 let z = out_z[idx];
-                let cand = a + gamma_at(t, b, z);
+                let cand = av + gamma_ab(a, p, b, z);
                 if cand > alpha[base_out + ns] {
                     alpha[base_out + ns] = cand;
                 }
             }
         }
+        if (t + 1) % NORM_PERIOD == 0 {
+            normalize_row(&mut alpha[base_out..base_out + 8]);
+        }
     }
 
     // Backward pass: beta[n_ext] = log(1) at state 0 (forced termination).
+    // Unlike alpha's tail rows, beta's tail rows *are* needed (they bootstrap
+    // beta[k], which the LLR-extraction loop reads), so the full sweep runs.
     {
         let base = n_ext * 8;
         for s in 0..8 {
@@ -647,6 +823,8 @@ fn siso_max_log_map(
     }
     for t in (0..n_ext).rev() {
         let is_tail = t >= k;
+        let a = gamma_a[t];
+        let p = gamma_p[t];
         let base_cur = t * 8;
         for s in 0..8 {
             beta[base_cur + s] = NEG_INF;
@@ -665,16 +843,21 @@ fn siso_max_log_map(
                 let idx = s * 2 + b;
                 let ns = next_state[idx] as usize;
                 let z = out_z[idx];
-                let cand = gamma_at(t, b, z) + beta[base_next + ns];
+                let cand = gamma_ab(a, p, b, z) + beta[base_next + ns];
                 if cand > beta[base_cur + s] {
                     beta[base_cur + s] = cand;
                 }
             }
         }
+        if t % NORM_PERIOD == 0 {
+            normalize_row(&mut beta[base_cur..base_cur + 8]);
+        }
     }
 
     // Total a posteriori LLR for each information position.
     for t in 0..k {
+        let a = gamma_a[t];
+        let p = gamma_p[t];
         let base_in = t * 8;
         let base_next = (t + 1) * 8;
         let mut best0 = NEG_INF;
@@ -684,7 +867,7 @@ fn siso_max_log_map(
                 let idx = s * 2 + b;
                 let ns = next_state[idx] as usize;
                 let z = out_z[idx];
-                let val = alpha[base_in + s] + gamma_at(t, b, z) + beta[base_next + ns];
+                let val = alpha[base_in + s] + gamma_ab(a, p, b, z) + beta[base_next + ns];
                 if b == 0 {
                     if val > best0 {
                         best0 = val;
@@ -695,6 +878,264 @@ fn siso_max_log_map(
             }
         }
         llr_out[t] = best0 - best1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AVX2 vectorized SISO kernel (x86_64 only)
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated SISO kernel: all 8 trellis states for one time step fit
+/// in a single 256-bit `f32x8` register, so each recursion step is one
+/// gather (fixed permutation), one FMA-based branch-metric compute, one
+/// `max` (or, for the 3 forced termination steps, one blend), and one store.
+///
+/// See the module-level trellis derivation in the source for how the fixed
+/// permutation/sign tables below were obtained from [`RSC_TRELLIS`].
+#[cfg(target_arch = "x86_64")]
+mod avx2_kernel {
+    use super::{NEG_INF, NORM_PERIOD, RSC_TRELLIS};
+    use std::arch::x86_64::*;
+
+    /// Fixed lookup tables for the AVX2 recursions, derived once (at compile
+    /// time) from [`RSC_TRELLIS`] so there is a single source of truth for
+    /// the trellis topology between the scalar and AVX2 kernels.
+    ///
+    /// For the `b=0`/`b=1` transition out of (or into) any state, the
+    /// parity output `z` for `b=1` is always the complement of the `z` for
+    /// `b=0` at the same lane (a structural property of this RSC trellis:
+    /// flipping the input bit flips both the feedback and parity bits).
+    /// Consequently `gamma(t, 1, ·) == -gamma(t, 0, ·)` at every lane, so
+    /// only one sign table is needed per recursion (`alpha_sign0`,
+    /// `beta_sign0`) and the `b=1` branch metric is a single sign-bit XOR of
+    /// the `b=0` one — see [`siso_max_log_map_avx2`].
+    struct Tables {
+        /// `pred_b0[ns]` = source state whose `b=0` edge lands on `ns`.
+        pred_b0: [i32; 8],
+        /// `pred_b1[ns]` = source state whose `b=1` edge lands on `ns`.
+        pred_b1: [i32; 8],
+        /// `succ0[s]` = destination state of the `b=0` edge out of `s`.
+        succ0: [i32; 8],
+        /// `succ1[s]` = destination state of the `b=1` edge out of `s`.
+        succ1: [i32; 8],
+        /// `alpha_sign0[ns] = 1 - 2*z` for the `b=0` edge landing on `ns`.
+        alpha_sign0: [f32; 8],
+        /// `beta_sign0[s] = 1 - 2*z` for the `b=0` edge leaving `s`.
+        beta_sign0: [f32; 8],
+        /// All-ones (as i32 bit pattern) where the forced termination input
+        /// bit for source state `s` is `0`, else all-zero. Used to `blendv`
+        /// between the two branch candidates during the 3 forced
+        /// termination steps of the backward recursion (only one of the two
+        /// candidates is legal per source state during termination).
+        beta_tail_mask0: [i32; 8],
+    }
+
+    const fn build_tables() -> Tables {
+        let (next_state, out_z) = RSC_TRELLIS;
+        let mut pred_b0 = [0i32; 8];
+        let mut pred_b1 = [0i32; 8];
+        let mut succ0 = [0i32; 8];
+        let mut succ1 = [0i32; 8];
+        let mut alpha_sign0 = [0f32; 8];
+        let mut beta_sign0 = [0f32; 8];
+        let mut beta_tail_mask0 = [0i32; 8];
+        let mut s = 0usize;
+        while s < 8 {
+            let ns0 = next_state[s * 2] as usize;
+            let z0 = out_z[s * 2];
+            let ns1 = next_state[s * 2 + 1] as usize;
+            succ0[s] = ns0 as i32;
+            succ1[s] = ns1 as i32;
+            let sign0 = 1.0 - 2.0 * (z0 as f32);
+            beta_sign0[s] = sign0;
+            pred_b0[ns0] = s as i32;
+            pred_b1[ns1] = s as i32;
+            alpha_sign0[ns0] = sign0;
+
+            let s1 = (s >> 1) & 1;
+            let s2 = (s >> 2) & 1;
+            let forced_b = s1 ^ s2;
+            beta_tail_mask0[s] = if forced_b == 0 { -1i32 } else { 0i32 };
+            s += 1;
+        }
+        Tables {
+            pred_b0,
+            pred_b1,
+            succ0,
+            succ1,
+            alpha_sign0,
+            beta_sign0,
+            beta_tail_mask0,
+        }
+    }
+
+    const TABLES: Tables = build_tables();
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_idx(t: &[i32; 8]) -> __m256i {
+        _mm256_setr_epi32(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7])
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_signs(t: &[f32; 8]) -> __m256 {
+        _mm256_setr_ps(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7])
+    }
+
+    /// Horizontal max of the 8 lanes of `v`. Order-independent (max is
+    /// associative/commutative for the non-NaN finite values used here), so
+    /// this yields the exact same value as the scalar kernel's sequential
+    /// `>`-comparison reduction over the same 8 numbers.
+    #[target_feature(enable = "avx2")]
+    unsafe fn hmax(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let m1 = _mm_max_ps(hi, lo);
+        let m2 = _mm_max_ps(m1, _mm_movehl_ps(m1, m1));
+        let m3 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+        _mm_cvtss_f32(m3)
+    }
+
+    /// Subtract the row max from all 8 lanes of `row` (AVX2 counterpart of
+    /// [`super::normalize_row`]; see that function's docs for the numerical
+    /// safety argument, which applies identically here).
+    #[target_feature(enable = "avx2")]
+    unsafe fn normalize_row_avx2(row: __m256) -> __m256 {
+        unsafe {
+            let m = hmax(row);
+            if m > NEG_INF * 0.5 {
+                _mm256_sub_ps(row, _mm256_set1_ps(m))
+            } else {
+                row
+            }
+        }
+    }
+
+    /// AVX2 SISO kernel. See [`super::siso_max_log_map`] for the shared
+    /// contract; `gamma_a`/`gamma_p` (length `k + 3`) must already be filled
+    /// by the caller.
+    ///
+    /// # Safety
+    ///
+    /// Caller must verify AVX2 support at runtime (e.g. via
+    /// `is_x86_feature_detected!("avx2")`) before calling this function.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn siso_max_log_map_avx2(
+        k: usize,
+        gamma_a: &[f32],
+        gamma_p: &[f32],
+        alpha: &mut [f32],
+        beta: &mut [f32],
+        llr_out: &mut [f32],
+    ) {
+        // SAFETY: every intrinsic below requires AVX2, which the caller
+        // guarantees; all slice indices are in-bounds given the length
+        // contracts documented on `siso_max_log_map`.
+        unsafe {
+            let n_ext = k + 3;
+            let sign_bit = _mm256_set1_ps(-0.0f32);
+
+            let pred_b0_v = load_idx(&TABLES.pred_b0);
+            let pred_b1_v = load_idx(&TABLES.pred_b1);
+            let succ0_v = load_idx(&TABLES.succ0);
+            let succ1_v = load_idx(&TABLES.succ1);
+            let alpha_sign0_v = load_signs(&TABLES.alpha_sign0);
+            let beta_sign0_v = load_signs(&TABLES.beta_sign0);
+            let tail_mask0 = _mm256_castsi256_ps(load_idx(&TABLES.beta_tail_mask0));
+
+            // ── Forward (alpha) recursion: info steps only (t = 0..k). ────
+            // Tail rows are dead code — see the scalar kernel's comment.
+            _mm256_storeu_ps(
+                alpha.as_mut_ptr(),
+                _mm256_setr_ps(
+                    0.0, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF,
+                ),
+            );
+            for t in 0..k {
+                let a_v = _mm256_set1_ps(gamma_a[t]);
+                let p_v = _mm256_set1_ps(gamma_p[t]);
+                // gamma(0, ·) = a + p*sign0 (one lane per destination state);
+                // gamma(1, ·) = -gamma(0, ·) exactly (sign-bit flip only —
+                // see the `Tables` docs for why this holds per lane).
+                // Not an FMA: `alpha_sign0_v` is always exactly +-1.0, so
+                // `p_v * alpha_sign0_v` is an *exact* sign flip (no
+                // rounding); a plain mul+add therefore has the same single
+                // rounding step (on the add) as a fused multiply-add would,
+                // giving bit-identical results without requiring the
+                // separate "fma" target feature beyond plain AVX2.
+                let gamma0 = _mm256_add_ps(_mm256_mul_ps(p_v, alpha_sign0_v), a_v);
+                let gamma1 = _mm256_xor_ps(gamma0, sign_bit);
+
+                let row = _mm256_loadu_ps(alpha[t * 8..].as_ptr());
+                let cand0 = _mm256_add_ps(_mm256_permutevar8x32_ps(row, pred_b0_v), gamma0);
+                let cand1 = _mm256_add_ps(_mm256_permutevar8x32_ps(row, pred_b1_v), gamma1);
+                let mut new_row = _mm256_max_ps(cand0, cand1);
+                if (t + 1) % NORM_PERIOD == 0 {
+                    new_row = normalize_row_avx2(new_row);
+                }
+                _mm256_storeu_ps(alpha[(t + 1) * 8..].as_mut_ptr(), new_row);
+            }
+
+            // ── Backward (beta) recursion: full sweep, n_ext-1 downto 0. ──
+            {
+                let base = n_ext * 8;
+                _mm256_storeu_ps(
+                    beta[base..].as_mut_ptr(),
+                    _mm256_setr_ps(
+                        0.0, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF, NEG_INF,
+                    ),
+                );
+            }
+            for t in (0..n_ext).rev() {
+                let is_tail = t >= k;
+                let a_v = _mm256_set1_ps(gamma_a[t]);
+                let p_v = _mm256_set1_ps(gamma_p[t]);
+                // See the forward-pass comment above: exact +-1.0 sign
+                // multiply, so plain mul+add is bit-identical to an FMA here.
+                let gamma0 = _mm256_add_ps(_mm256_mul_ps(p_v, beta_sign0_v), a_v);
+                let gamma1 = _mm256_xor_ps(gamma0, sign_bit);
+
+                let next_row = _mm256_loadu_ps(beta[(t + 1) * 8..].as_ptr());
+                let cand0 = _mm256_add_ps(gamma0, _mm256_permutevar8x32_ps(next_row, succ0_v));
+                let cand1 = _mm256_add_ps(gamma1, _mm256_permutevar8x32_ps(next_row, succ1_v));
+                let mut new_row = if is_tail {
+                    // Forced termination: exactly one of the two candidates
+                    // is legal per source-state lane; select it directly
+                    // instead of maxing (the illegal candidate must not
+                    // participate at all).
+                    _mm256_blendv_ps(cand1, cand0, tail_mask0)
+                } else {
+                    _mm256_max_ps(cand0, cand1)
+                };
+                if t % NORM_PERIOD == 0 {
+                    new_row = normalize_row_avx2(new_row);
+                }
+                _mm256_storeu_ps(beta[t * 8..].as_mut_ptr(), new_row);
+            }
+
+            // ── LLR extraction: two masked max reductions per step. ───────
+            for t in 0..k {
+                let a_v = _mm256_set1_ps(gamma_a[t]);
+                let p_v = _mm256_set1_ps(gamma_p[t]);
+                // See the forward-pass comment above: exact +-1.0 sign
+                // multiply, so plain mul+add is bit-identical to an FMA here.
+                let gamma0 = _mm256_add_ps(_mm256_mul_ps(p_v, beta_sign0_v), a_v);
+                let gamma1 = _mm256_xor_ps(gamma0, sign_bit);
+
+                let alpha_row = _mm256_loadu_ps(alpha[t * 8..].as_ptr());
+                let beta_next = _mm256_loadu_ps(beta[(t + 1) * 8..].as_ptr());
+                let val0 = _mm256_add_ps(
+                    _mm256_add_ps(alpha_row, gamma0),
+                    _mm256_permutevar8x32_ps(beta_next, succ0_v),
+                );
+                let val1 = _mm256_add_ps(
+                    _mm256_add_ps(alpha_row, gamma1),
+                    _mm256_permutevar8x32_ps(beta_next, succ1_v),
+                );
+                let best0 = hmax(val0);
+                let best1 = hmax(val1);
+                llr_out[t] = best0 - best1;
+            }
+        }
     }
 }
 
@@ -876,5 +1317,188 @@ mod tests {
 
         let mut short_out = vec![0u8; 2];
         assert!(dec.decode(&llr, &mut short_out, 4).is_err());
+    }
+
+    /// Whether this CPU can actually run the AVX2 SISO kernel; the
+    /// equivalence tests below are skipped (not failed) when it can't, so
+    /// the suite stays green on non-x86_64 CI runners or old x86_64 CPUs.
+    fn avx2_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Small deterministic xorshift PRNG for generating varied seeded test
+    /// data without pulling in a `rand` dependency (matches the style of
+    /// `random_bits` in `src/bin/algo_bench_export.rs`).
+    fn xorshift_bits(len: usize, mut seed: u64) -> Vec<u8> {
+        if seed == 0 {
+            seed = 0x9E37_79B9_7F4A_7C15;
+        }
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 63) as u8
+            })
+            .collect()
+    }
+
+    /// AVX2 vs scalar SISO-kernel equivalence.
+    ///
+    /// The AVX2 restructuring in [`avx2_kernel`] was designed to be
+    /// bit-identical to the scalar reference for the forward/backward/LLR
+    /// passes themselves (see the derivation comments on `Tables` and on the
+    /// `gamma0`/`gamma1` computations: the sign multiplier is always exactly
+    /// `+-1.0`, so `mul+add` rounds identically to the scalar `+`/`-`
+    /// formula, and `max`/horizontal-max are order-independent for the
+    /// non-NaN values used here). The periodic renormalization
+    /// ([`NORM_PERIOD`]) is applied identically by both backends, so it does
+    /// not break this equivalence either.
+    ///
+    /// This test still checks both hard-decision equality *and* a numeric
+    /// tolerance on the total a posteriori LLR (rather than relying solely
+    /// on the bit-identical design argument), across 100 seeded AWGN trials
+    /// spanning 1.0-2.5 dB Eb/N0, for every supported block length that
+    /// realistically appears in the mandate: K = 40 (short), 1024 (typical
+    /// LTE), and 6144 (max LTE Turbo block).
+    #[test]
+    fn simd_scalar_equivalence_100_trials() {
+        if !avx2_available() {
+            eprintln!("skipping simd_scalar_equivalence_100_trials: no AVX2 on this CPU");
+            return;
+        }
+        const TRIALS: u64 = 100;
+        const MAX_ITERS: usize = 8;
+
+        for &k in &[40usize, 1024, 6144] {
+            let enc = TurboEncoder::new(k).unwrap();
+            let mut dec_scalar = TurboDecoder::new(k).unwrap();
+            let mut dec_avx2 = TurboDecoder::new(k).unwrap();
+
+            for trial in 0..TRIALS {
+                let snr_db = 1.0f32 + 1.5f32 * (trial as f32) / (TRIALS as f32 - 1.0);
+                let info = xorshift_bits(k, 0xD1B5_4A32 ^ (k as u64) << 32 ^ trial);
+                let mut coded = vec![0u8; enc.output_len()];
+                enc.encode(&info, &mut coded).unwrap();
+
+                let mut ch = AwgnChannel::new(snr_db, 1.0 / 3.0, 10_000 + trial);
+                let llr = ch.transmit(&coded);
+
+                let mut out_scalar = vec![0u8; k];
+                let mut out_avx2 = vec![0u8; k];
+                let iters_scalar = dec_scalar
+                    .decode_with_backend(&llr, &mut out_scalar, MAX_ITERS, SisoBackend::Scalar)
+                    .unwrap();
+                let iters_avx2 = dec_avx2
+                    .decode_with_backend(&llr, &mut out_avx2, MAX_ITERS, SisoBackend::Avx2)
+                    .unwrap();
+
+                assert_eq!(
+                    iters_scalar, iters_avx2,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: iteration counts differ \
+                     (scalar={iters_scalar}, avx2={iters_avx2})"
+                );
+                assert_eq!(
+                    out_scalar, out_avx2,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: hard decisions differ between backends"
+                );
+
+                let max_abs_diff = dec_scalar
+                    .llr_total1
+                    .iter()
+                    .zip(dec_avx2.llr_total1.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs_diff < 1e-3,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: max abs extrinsic/LLR diff \
+                     {max_abs_diff} >= 1e-3"
+                );
+            }
+        }
+    }
+
+    /// Forcing the AVX2 backend on noiseless input (perfect LLRs) must
+    /// still round-trip exactly, for every supported block length — this
+    /// exercises the AVX2 kernel's termination/tail handling directly
+    /// (rather than only through `Auto` dispatch) across all QPP sizes, not
+    /// just the three checked by the main equivalence test.
+    #[test]
+    fn avx2_noiseless_roundtrip_all_sizes() {
+        if !avx2_available() {
+            eprintln!("skipping avx2_noiseless_roundtrip_all_sizes: no AVX2 on this CPU");
+            return;
+        }
+        for &(k, _, _) in QPP_TABLE {
+            let enc = TurboEncoder::new(k).unwrap();
+            let mut dec = TurboDecoder::new(k).unwrap();
+            let info = xorshift_bits(k, 0x1234_5678 ^ (k as u64));
+            let mut coded = vec![0u8; enc.output_len()];
+            enc.encode(&info, &mut coded).unwrap();
+
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 0 { 12.0 } else { -12.0 })
+                .collect();
+            let mut out = vec![0u8; k];
+            dec.decode_with_backend(&llr, &mut out, 8, SisoBackend::Avx2)
+                .unwrap();
+            assert_eq!(
+                out, info,
+                "K={k}: AVX2-forced noiseless round-trip must be bit-exact"
+            );
+        }
+    }
+
+    /// Informational, not a correctness check: prints scalar-vs-AVX2
+    /// decode throughput attribution at K=1024/8 iters/1.5 dB (same shape as
+    /// `src/bin/algo_bench_export.rs`'s Turbo case). `#[ignore]`d so it
+    /// doesn't run as part of the normal test gate; run explicitly with
+    /// `cargo test --release turbo::tests::bench_backend_attribution -- \
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_backend_attribution() {
+        if !avx2_available() {
+            eprintln!("no AVX2 on this CPU; only the scalar backend can be measured");
+        }
+        let k = 1024usize;
+        let enc = TurboEncoder::new(k).unwrap();
+        let info = xorshift_bits(k, 19);
+        let mut coded = vec![0u8; enc.output_len()];
+        enc.encode(&info, &mut coded).unwrap();
+        let mut ch = AwgnChannel::new(1.5, 1.0 / 3.0, 21);
+        let llr = ch.transmit(&coded);
+
+        let backends: &[(&str, SisoBackend)] = &[
+            ("scalar", SisoBackend::Scalar),
+            ("avx2", SisoBackend::Avx2),
+            ("auto", SisoBackend::Auto),
+        ];
+        for &(name, backend) in backends {
+            if backend == SisoBackend::Avx2 && !avx2_available() {
+                continue;
+            }
+            let mut dec = TurboDecoder::new(k).unwrap();
+            let mut out = vec![0u8; k];
+            for _ in 0..3 {
+                dec.decode_with_backend(&llr, &mut out, 8, backend).unwrap();
+            }
+            let iters = 30;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                dec.decode_with_backend(&llr, &mut out, 8, backend).unwrap();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+            let mbit_s = k as f64 / ns * 1e3;
+            eprintln!("backend={name:<6} ns/call={ns:>10.1} mbit/s={mbit_s:>8.3}");
+        }
     }
 }
