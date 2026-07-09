@@ -69,18 +69,83 @@ impl CrcKind {
     }
 }
 
+/// Single-bit LFSR step: the mathematical definition of the CRC recurrence.
+///
+/// Given the current register `reg` (only the low `len` bits are
+/// meaningful), folds in one more input `bit` (0 or 1):
+///
+/// $$ \text{feedback} = (\text{reg} \gg (\text{len}-1)) \oplus \text{bit} $$
+/// $$ \text{reg}' = ((\text{reg} \ll 1) \bmod 2^{\text{len}}) \oplus
+///    (\text{feedback} \cdot \text{poly}) $$
+///
+/// Every table entry used by [`Crc24::compute`] is built by iterating this
+/// exact function, so the table-driven fast path is equivalent to the
+/// bit-serial path *by construction*.
+#[inline]
+const fn bit_serial_step(reg: u32, bit: u8, len: usize, poly: u32, mask: u32) -> u32 {
+    let feedback = ((reg >> (len - 1)) ^ (bit as u32 & 1)) & 1;
+    let shifted = (reg << 1) & mask;
+    if feedback != 0 {
+        shifted ^ poly
+    } else {
+        shifted
+    }
+}
+
+/// Reference bit-serial LFSR CRC over a full bit-string (historical
+/// implementation, 1 bit per iteration).
+///
+/// Kept as a private reference so the equivalence tests below can check the
+/// table-driven [`Crc24::compute`] against it directly, bit for bit, over
+/// randomized inputs. [`bit_serial_step`] (the per-bit primitive this is
+/// built from) is also used directly by production code: to derive the
+/// tables in [`Crc24::new`], and to process the tail bits that don't fill a
+/// whole table chunk in [`Crc24::compute`].
+#[cfg(test)]
+fn compute_bit_serial(bits: &[u8], len: usize, poly: u32, mask: u32) -> u32 {
+    let mut reg = 0u32;
+    for &bit in bits {
+        reg = bit_serial_step(reg, bit, len, poly, mask);
+    }
+    reg
+}
+
 /// CRC engine built around one of the 3GPP generator polynomials.
 ///
-/// Uses a bit-serial LFSR shift register so it works correctly for all
-/// polynomial lengths (6, 11, 16, 24 bits). This is a setup-path operation
-/// (runs on transport blocks / code blocks, not in the LDPC inner loop),
-/// so throughput optimisation is not needed.
+/// Runs a byte-wise (or, for `Crc6`, nibble-wise) table-driven LFSR so that
+/// [`Crc24::compute`] advances 8 (or 4) input bit-entries per step instead
+/// of 1. CRC sits inside the 5G transport-block hot path (every TB and code
+/// block is CRC-checked), so this table-driven form matters for throughput.
+///
+/// The tables are derived directly from the bit-serial recurrence
+/// (see `bit_serial_step`), so the two paths are equivalent by
+/// construction, and are additionally checked against each other by the
+/// `table_matches_bit_serial_reference` proptest-style test.
 pub struct Crc24 {
     kind: CrcKind,
+    /// Byte-wise (8-bit) lookup table, used when `kind.length() >= 8`
+    /// (`Crc24A/B/C`, `Crc16`, `Crc11`). Entry `i` is the register value
+    /// obtained by feeding the 8 bits of `i` (MSB-first) into
+    /// [`bit_serial_step`] starting from a zero register.
+    ///
+    /// Unused (left zeroed) for `Crc6`.
+    table: [u32; 256],
+    /// Nibble-wise (4-bit) lookup table, used only for `Crc6`
+    /// (`length() == 6`). An 8-bit table would require shifting the
+    /// 6-bit register right by `len - 8 = -2` bits, which is not
+    /// representable, so `Crc6` processes 4 bits at a time instead using
+    /// this 16-entry table (same construction as `table`, but over 4-bit
+    /// chunks).
+    ///
+    /// Unused (left zeroed) for all other kinds.
+    nibble_table: [u32; 16],
 }
 
 impl Crc24 {
     /// Construct a CRC engine for the given polynomial kind.
+    ///
+    /// Precomputes the byte-wise (or, for `Crc6`, nibble-wise) lookup table
+    /// used by [`Crc24::compute`].
     ///
     /// # Arguments
     ///
@@ -93,7 +158,38 @@ impl Crc24 {
     /// let crc = Crc24::new(CrcKind::Crc24A);
     /// ```
     pub fn new(kind: CrcKind) -> Self {
-        Self { kind }
+        let len = kind.length();
+        let mask = (1u32 << len).wrapping_sub(1);
+        let poly = kind.poly() & mask;
+
+        let mut table = [0u32; 256];
+        let mut nibble_table = [0u32; 16];
+
+        if len >= 8 {
+            for (i, entry) in table.iter_mut().enumerate() {
+                let mut reg = 0u32;
+                for shift in (0..8).rev() {
+                    let bit = ((i >> shift) & 1) as u8;
+                    reg = bit_serial_step(reg, bit, len, poly, mask);
+                }
+                *entry = reg;
+            }
+        } else {
+            for (i, entry) in nibble_table.iter_mut().enumerate() {
+                let mut reg = 0u32;
+                for shift in (0..4).rev() {
+                    let bit = ((i >> shift) & 1) as u8;
+                    reg = bit_serial_step(reg, bit, len, poly, mask);
+                }
+                *entry = reg;
+            }
+        }
+
+        Self {
+            kind,
+            table,
+            nibble_table,
+        }
     }
 
     /// Return the CRC kind this engine was built for.
@@ -130,14 +226,46 @@ impl Crc24 {
         let mask = (1u32 << len).wrapping_sub(1);
         let poly = self.kind.poly() & mask;
         let mut reg = 0u32;
-        // Bit-serial LFSR: works for any poly length 1..=32.
-        for &bit in bits {
-            let feedback = ((reg >> (len - 1)) ^ (bit as u32 & 1)) & 1;
-            reg = (reg << 1) & mask;
-            if feedback != 0 {
-                reg ^= poly;
+
+        if len >= 8 {
+            // Byte-wise table step: `reg' = (reg << 8) ^ table[(reg >> (len-8)) ^ byte]`.
+            // Equivalent to 8 bit_serial_step calls by construction (see `new`).
+            let chunks = bits.len() / 8;
+            let processed = chunks * 8;
+            for c in 0..chunks {
+                let base = c * 8;
+                let mut packed = 0u32;
+                for k in 0..8 {
+                    packed = (packed << 1) | (bits[base + k] as u32 & 1);
+                }
+                let idx = ((reg >> (len - 8)) ^ packed) & 0xFF;
+                reg = ((reg << 8) & mask) ^ self.table[idx as usize];
+            }
+            // Tail: fewer than 8 bits left, fall back to the bit-serial step.
+            for &bit in &bits[processed..] {
+                reg = bit_serial_step(reg, bit, len, poly, mask);
+            }
+        } else {
+            // Crc6 (len == 6 < 8): a byte shift would require `reg >> (len-8)`,
+            // i.e. a negative shift. Use a 4-bit nibble table instead: same
+            // construction, half the chunk width.
+            let chunks = bits.len() / 4;
+            let processed = chunks * 4;
+            for c in 0..chunks {
+                let base = c * 4;
+                let mut nibble = 0u32;
+                for k in 0..4 {
+                    nibble = (nibble << 1) | (bits[base + k] as u32 & 1);
+                }
+                let idx = ((reg >> (len - 4)) ^ nibble) & 0xF;
+                reg = ((reg << 4) & mask) ^ self.nibble_table[idx as usize];
+            }
+            // Tail: fewer than 4 bits left, fall back to the bit-serial step.
+            for &bit in &bits[processed..] {
+                reg = bit_serial_step(reg, bit, len, poly, mask);
             }
         }
+
         reg
     }
 
@@ -251,5 +379,62 @@ mod tests {
     fn check_returns_false_for_too_short_input() {
         let crc = Crc24::new(CrcKind::Crc24A);
         assert!(!crc.check(&[0u8; 10]));
+    }
+
+    /// Minimal deterministic PRNG (xorshift64), avoids adding a dev-dependency
+    /// just for reproducible test bit-strings.
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Random length in `1..=max` (inclusive), deliberately including
+        /// lengths not divisible by 8 (or 4).
+        fn next_len(&mut self, max: usize) -> usize {
+            (self.next_u64() as usize % max) + 1
+        }
+
+        fn next_bits(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| (self.next_u64() & 1) as u8).collect()
+        }
+    }
+
+    /// Table-driven `compute` must match the bit-serial reference exactly,
+    /// for every `CrcKind`, over 200 seeded-random bit strings per kind with
+    /// random lengths in `1..=2000` — including lengths not divisible by 8
+    /// (exercising the tail loop) and, for `Crc6`, not divisible by 4.
+    #[test]
+    fn table_matches_bit_serial_reference() {
+        for kind in [
+            CrcKind::Crc24A,
+            CrcKind::Crc24B,
+            CrcKind::Crc24C,
+            CrcKind::Crc16,
+            CrcKind::Crc11,
+            CrcKind::Crc6,
+        ] {
+            let crc = Crc24::new(kind);
+            let len = kind.length();
+            let mask = (1u32 << len).wrapping_sub(1);
+            let poly = kind.poly() & mask;
+
+            // Seed varies per kind so the 6 sweeps don't share a sequence.
+            let mut rng = Xorshift64(0x9E3779B97F4A7C15 ^ (kind as u64 + 1));
+            for _ in 0..200 {
+                let n = rng.next_len(2000);
+                let bits = rng.next_bits(n);
+                let table_driven = crc.compute(&bits);
+                let bit_serial = compute_bit_serial(&bits, len, poly, mask);
+                assert_eq!(
+                    table_driven, bit_serial,
+                    "kind={kind:?} len={n} mismatch: table={table_driven:#x} bit_serial={bit_serial:#x}"
+                );
+            }
+        }
     }
 }
