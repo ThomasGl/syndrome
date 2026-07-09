@@ -226,6 +226,31 @@ pub struct BchCode {
     g_full: u128,
     exp: [u8; 512],
     log: [u8; 256],
+    /// Flattened `MAX_T x N` per-position power table for the odd syndromes:
+    /// row `r` (for syndrome index $j = 2r+1$) holds, at column `i`,
+    /// $\alpha^{j (N-1-i) \bmod 255}$ — i.e. the Horner weight that bit
+    /// position `i` contributes to $S_j$. Turns the syndrome inner loop from
+    /// a serial $GF(2^8)$ Horner multiply chain into a branch-free
+    /// table-XOR accumulation (see [`BchCode::syndromes`]). Built once in
+    /// [`BchCode::new`]; `MAX_T * N` = 2550 bytes, fixed regardless of `t`.
+    syn_pow: [u8; MAX_T * N],
+    /// Flattened `N x 256` "multiply by $\beta$" tables, for every field
+    /// element $\beta = \alpha^u$, $u = 0 \ldots 254$:
+    /// `mul_beta[u*256 + x] = x \cdot \alpha^u`. Lets the Chien search's
+    /// per-position Horner evaluation (see [`BchCode::chien_search`])
+    /// replace each `gf_mul(val, beta)` (an `exp`/`log` double-indirection
+    /// behind a zero-check branch) with a single direct table lookup, while
+    /// keeping the per-position evaluation independent across positions —
+    /// the property that lets the CPU pipeline many short degree-`l` chains
+    /// in parallel. `N * 256` = 65280 bytes, fixed regardless of `t`.
+    mul_beta: [u8; N * 256],
+    /// Table-driven LFSR encode table: `lfsr_byte_table[y]` is the `nk`-bit
+    /// remainder produced by feeding the 8 bits of `y` (MSB-first) through
+    /// the bit-serial encoder LFSR starting from a zero register — the
+    /// standard table-driven CRC construction (see
+    /// [`BchCode::lfsr_remainder`]). 256 entries * 16 bytes (`u128`) = 4096
+    /// bytes, fixed regardless of `t`.
+    lfsr_byte_table: [u128; 256],
 }
 
 impl BchCode {
@@ -317,6 +342,52 @@ impl BchCode {
         }
 
         let k = N - deg_g;
+
+        // Position-power table for the odd syndromes: row r (syndrome index
+        // j = 2r+1), column i -> alpha^{j*(N-1-i) mod 255}, matching the
+        // Horner expansion S_j = XOR_{i: bit_i=1} alpha^{j*(N-1-i) mod 255}.
+        // Built for all MAX_T rows unconditionally (cheap, keeps the table
+        // size independent of the runtime `t`).
+        let mut syn_pow = [0u8; MAX_T * N];
+        for r in 0..MAX_T {
+            let j = 2 * r + 1;
+            for i in 0..N {
+                let e = (j * (N - 1 - i)) % 255;
+                syn_pow[r * N + i] = exp[e];
+            }
+        }
+
+        // "Multiply by beta" tables for the Chien search's per-position
+        // Horner evaluation, one per field element beta = alpha^u,
+        // u = 0..=254: mul_beta[u*256 + x] = gf_mul(x, alpha^u).
+        let mut mul_beta = [0u8; N * 256];
+        for u in 0..N {
+            let beta = exp[u];
+            for x in 0..256usize {
+                mul_beta[u * 256 + x] = gf_mul(&exp, &log, x as u8, beta);
+            }
+        }
+
+        // Table-driven encoder LFSR byte table: T[y] = remainder of feeding
+        // the 8 bits of y (MSB-first) through the bit-serial LFSR from a
+        // zero register. `deg_g >= 8` always holds (t=1 already gives
+        // deg_g = 8), so the byte-at-a-time shift below is always valid.
+        let mask: u128 = (1u128 << deg_g) - 1;
+        let poly = g_full & mask;
+        let mut lfsr_byte_table = [0u128; 256];
+        for y in 0..256usize {
+            let mut reg: u128 = 0;
+            for bit_idx in (0..8).rev() {
+                let bit = ((y >> bit_idx) & 1) as u8;
+                let feedback = ((reg >> (deg_g - 1)) as u8 & 1) ^ bit;
+                reg = (reg << 1) & mask;
+                if feedback != 0 {
+                    reg ^= poly;
+                }
+            }
+            lfsr_byte_table[y] = reg;
+        }
+
         Ok(BchCode {
             t,
             n: N,
@@ -325,6 +396,9 @@ impl BchCode {
             g_full,
             exp,
             log,
+            syn_pow,
+            mul_beta,
+            lfsr_byte_table,
         })
     }
 
@@ -359,20 +433,21 @@ impl BchCode {
     }
 
     #[inline]
+    #[cfg(test)]
     fn alpha_pow(&self, p: usize) -> u8 {
         self.exp[p % 255]
     }
 
-    /// Run the systematic-encoder LFSR over `info` and return the `nk`-bit
-    /// remainder $x^{n-k} i(x) \bmod g(x)$, packed into a `u128` (bit $j$ =
-    /// coefficient of $x^j$).
+    /// Reference bit-serial LFSR remainder (equivalence baseline for
+    /// [`BchCode::lfsr_remainder`], not on the hot path).
     ///
     /// This is a bit-serial division register of width `nk`, structurally
     /// identical to [`crate::crc::Crc24::compute`] but generalized to a
     /// `u128` register (`nk <= 127` always holds for `t <= 10`). No dynamic
     /// allocation.
     #[inline]
-    fn lfsr_remainder(&self, info: &[u8]) -> u128 {
+    #[cfg(test)]
+    fn lfsr_remainder_reference(&self, info: &[u8]) -> u128 {
         let nk = self.nk;
         let mask: u128 = (1u128 << nk) - 1;
         let poly = self.g_full & mask; // low `nk` bits; leading bit implicit.
@@ -383,6 +458,56 @@ impl BchCode {
             if feedback != 0 {
                 reg ^= poly;
             }
+        }
+        reg
+    }
+
+    /// Run the systematic-encoder LFSR over `info` and return the `nk`-bit
+    /// remainder $x^{n-k} i(x) \bmod g(x)$, packed into a `u128` (bit $j$ =
+    /// coefficient of $x^j$).
+    ///
+    /// Table-driven, CRC-style: 8 input bits are consumed per step instead
+    /// of 1. `nk >= 8` always holds (the smallest supported code, `t=1`,
+    /// already has `deg g(x) = 8`), so the standard byte-at-a-time division
+    /// identity applies: for register `R` (width `nk`, mask `M`) and next
+    /// input byte `x` (MSB-first),
+    /// $$ R' = ((R \ll 8) \,\&\, M) \oplus T\bigl((R \gg (nk-8)) \oplus
+    /// x\bigr) $$
+    /// where `T` is the 256-entry `lfsr_byte_table` built once in
+    /// [`BchCode::new`] (`T[y]` = the remainder of feeding the 8 bits of `y`
+    /// through the bit-serial LFSR from a zero register). This is the same
+    /// linearity identity that underlies every table-driven CRC
+    /// implementation, generalized from a fixed 8/16/32-bit width to
+    /// arbitrary `nk`. Any leading `info.len() % 8` bits are still run
+    /// through the bit-serial reference step one at a time, preserving the
+    /// MSB-first bit order before the byte loop takes over. No dynamic
+    /// allocation.
+    #[inline]
+    fn lfsr_remainder(&self, info: &[u8]) -> u128 {
+        let nk = self.nk;
+        let mask: u128 = (1u128 << nk) - 1;
+        let poly = self.g_full & mask;
+        let mut reg: u128 = 0;
+
+        let lead = info.len() % 8;
+        let mut i = 0usize;
+        while i < lead {
+            let feedback = ((reg >> (nk - 1)) as u8 & 1) ^ (info[i] & 1);
+            reg = (reg << 1) & mask;
+            if feedback != 0 {
+                reg ^= poly;
+            }
+            i += 1;
+        }
+
+        while i + 8 <= info.len() {
+            let mut byte = 0u8;
+            for lane in 0..8 {
+                byte = (byte << 1) | (info[i + lane] & 1);
+            }
+            let top = ((reg >> (nk - 8)) as u8) ^ byte;
+            reg = ((reg << 8) & mask) ^ self.lfsr_byte_table[top as usize];
+            i += 8;
         }
         reg
     }
@@ -514,13 +639,16 @@ impl BchCode {
         Ok(())
     }
 
-    /// Compute syndromes $S_1, \ldots, S_{2t}$ via Horner evaluation.
+    /// Reference syndrome computation via per-position Horner evaluation
+    /// (equivalence baseline for [`BchCode::syndromes`], not on the hot
+    /// path).
     ///
     /// Only odd-indexed syndromes require a full $O(n)$ Horner pass; each
     /// even-indexed syndrome reachable by repeated doubling is derived via
     /// $S_{2i} = S_i^2$ (binary-field Frobenius identity), halving the
     /// number of $O(n)$ passes needed.
-    fn syndromes(&self, codeword: &[u8]) -> ([u8; MAX_TWO_T], bool) {
+    #[cfg(test)]
+    fn syndromes_reference(&self, codeword: &[u8]) -> ([u8; MAX_TWO_T], bool) {
         let two_t = 2 * self.t;
         let mut s = [0u8; MAX_TWO_T];
         let mut any_nonzero = false;
@@ -550,26 +678,81 @@ impl BchCode {
         (s, any_nonzero)
     }
 
-    /// Full algebraic decode over an `n`-length codeword buffer (private
-    /// core, shared by [`BchCode::decode`] and [`BchCode::shortened_decode`]).
-    fn decode_full(&self, codeword: &mut [u8]) -> Result<usize, FecError> {
-        if codeword.len() != self.n {
-            return Err(FecError::BufferTooSmall {
-                required: self.n,
-                provided: codeword.len(),
-            });
-        }
-
+    /// Compute syndromes $S_1, \ldots, S_{2t}$.
+    ///
+    /// Only odd-indexed syndromes require a full $O(n)$ pass; each
+    /// even-indexed syndrome reachable by repeated doubling is derived via
+    /// $S_{2i} = S_i^2$ (binary-field Frobenius identity), halving the
+    /// number of $O(n)$ passes needed (identical structure to
+    /// [`BchCode::syndromes_reference`]).
+    ///
+    /// Unlike the reference, the $O(n)$ pass is not a serial $GF(2^8)$
+    /// Horner multiply chain (which forces a 255-deep sequential dependency
+    /// through `gf_mul`'s data-dependent zero-check branch). Instead it uses
+    /// the precomputed `syn_pow` position-power table: since codeword bits
+    /// are binary, $S_j = \bigoplus_{i:\,c_i=1} \alpha^{j(N-1-i) \bmod 255}$,
+    /// so each position contributes independently via a branch-free
+    /// table-XOR (`mask = 0 - bit` is `0x00`/`0xFF`, no data-dependent
+    /// branch). Four independent accumulators break the reduction into
+    /// short parallel chains that overlap on the CPU instead of one long
+    /// serial chain, exposing instruction-level parallelism.
+    fn syndromes(&self, codeword: &[u8]) -> ([u8; MAX_TWO_T], bool) {
         let two_t = 2 * self.t;
-        let (s, any_nonzero) = self.syndromes(codeword);
-        if !any_nonzero {
-            return Ok(0);
-        }
+        let mut s = [0u8; MAX_TWO_T];
+        let mut any_nonzero = false;
+        let mut r = 0usize;
+        let mut j = 1usize;
+        while j <= two_t {
+            let row = &self.syn_pow[r * N..r * N + N];
 
-        // --- Berlekamp-Massey: find the error-locator polynomial Lambda(x).
-        // C(x) is the current locator candidate, B(x) the previous one at
-        // the last length-change step. All polys have degree <= t <= 10, so
-        // fixed-size [u8; MAX_T + 1] arrays suffice (no heap allocation).
+            let mut acc = [0u8; 4];
+            let mut i = 0usize;
+            while i + 4 <= N {
+                for lane in 0..4 {
+                    let bit = codeword[i + lane] & 1;
+                    let mask = 0u8.wrapping_sub(bit);
+                    acc[lane] ^= row[i + lane] & mask;
+                }
+                i += 4;
+            }
+            let mut val = acc[0] ^ acc[1] ^ acc[2] ^ acc[3];
+            while i < N {
+                let bit = codeword[i] & 1;
+                let mask = 0u8.wrapping_sub(bit);
+                val ^= row[i] & mask;
+                i += 1;
+            }
+
+            s[j - 1] = val;
+            any_nonzero |= val != 0;
+
+            let mut idx = j;
+            let mut v = val;
+            loop {
+                idx *= 2;
+                if idx > two_t {
+                    break;
+                }
+                v = self.mul(v, v);
+                s[idx - 1] = v;
+                any_nonzero |= v != 0;
+            }
+            r += 1;
+            j += 2;
+        }
+        (s, any_nonzero)
+    }
+
+    /// Berlekamp-Massey: find the error-locator polynomial $\Lambda(x)$ from
+    /// the syndrome sequence `s[0..2t]`.
+    ///
+    /// $C(x)$ is the current locator candidate, $B(x)$ the previous one at
+    /// the last length-change step. All polys have degree $\le t \le 10$, so
+    /// fixed-size `[u8; MAX_T + 1]` arrays suffice (no heap allocation).
+    ///
+    /// Returns `(Lambda coefficients, deg Lambda)` on success.
+    fn berlekamp_massey(&self, s: &[u8; MAX_TWO_T]) -> Result<([u8; MAX_T + 1], usize), FecError> {
+        let two_t = 2 * self.t;
         let mut c = [0u8; MAX_T + 1];
         let mut b_poly = [0u8; MAX_T + 1];
         c[0] = 1;
@@ -621,8 +804,15 @@ impl BchCode {
         if l == 0 || l > self.t {
             return Err(FecError::DecoderNotConverged);
         }
+        Ok((c, l))
+    }
 
-        // --- Chien search: find roots of Lambda(x) among alpha^0..alpha^254.
+    /// Reference Chien search (per-position Horner evaluation): find roots
+    /// of $\Lambda(x)$ among $\alpha^0 \ldots \alpha^{254}$ and flip the
+    /// corresponding codeword bits in place. Equivalence baseline for
+    /// [`BchCode::chien_search`], not on the hot path.
+    #[cfg(test)]
+    fn chien_search_reference(&self, c: &[u8; MAX_T + 1], l: usize, codeword: &mut [u8]) -> usize {
         let mut corrected = 0usize;
         for u in 0..255usize {
             let beta = self.exp[u];
@@ -636,6 +826,63 @@ impl BchCode {
                 corrected += 1;
             }
         }
+        corrected
+    }
+
+    /// Chien search: find roots of $\Lambda(x)$ among $\alpha^0 \ldots
+    /// \alpha^{254}$ and flip the corresponding codeword bits in place.
+    ///
+    /// Keeps the reference's per-position Horner *structure* — each of the
+    /// 255 candidate positions evaluates $\Lambda(\beta)$ from a fresh
+    /// `val = c[l]`, independently of every other position — because that
+    /// independence is exactly what lets an out-of-order CPU pipeline many
+    /// short (`l <= 10`)-deep evaluation chains concurrently; degree `l` is
+    /// small enough that this is already latency-hidden. What's expensive in
+    /// the reference is `gf_mul`'s `exp`/`log` double-indirection behind a
+    /// zero-check branch. This version replaces it with a single direct
+    /// lookup in the precomputed `mul_beta` table (`x * beta`, one 256-entry
+    /// row per field element, selected once per position outside the `l`
+    /// loop). An earlier "incremental" version was tried — advancing a
+    /// per-coefficient register by `alpha^j` across positions instead of
+    /// re-deriving `beta^j` each time — but it was *slower*: it turns the
+    /// 255 independent short per-position chains into `l` genuinely serial
+    /// 255-long load-dependent chains (each step's table index depends on
+    /// the previous step's result), which pipelines far worse than the
+    /// independent-position form kept here.
+    fn chien_search(&self, c: &[u8; MAX_T + 1], l: usize, codeword: &mut [u8]) -> usize {
+        let mut corrected = 0usize;
+        for u in 0..255usize {
+            let table = &self.mul_beta[u * 256..u * 256 + 256];
+            let mut val = c[l];
+            for jx in (0..l).rev() {
+                val = table[val as usize] ^ c[jx];
+            }
+            if val == 0 {
+                let idx = (u + 254) % 255; // maps root exponent -> bit position
+                codeword[idx] ^= 1;
+                corrected += 1;
+            }
+        }
+        corrected
+    }
+
+    /// Full algebraic decode over an `n`-length codeword buffer (private
+    /// core, shared by [`BchCode::decode`] and [`BchCode::shortened_decode`]).
+    fn decode_full(&self, codeword: &mut [u8]) -> Result<usize, FecError> {
+        if codeword.len() != self.n {
+            return Err(FecError::BufferTooSmall {
+                required: self.n,
+                provided: codeword.len(),
+            });
+        }
+
+        let (s, any_nonzero) = self.syndromes(codeword);
+        if !any_nonzero {
+            return Ok(0);
+        }
+
+        let (c, l) = self.berlekamp_massey(&s)?;
+        let corrected = self.chien_search(&c, l, codeword);
 
         if corrected != l {
             // Root count doesn't match Lambda's degree: more errors than the
@@ -997,6 +1244,121 @@ mod tests {
                 let result = bch.shortened_decode(k_short, &mut received);
                 assert_eq!(result, Ok(j), "t={t} k_short={k_short} j={j}");
                 assert_eq!(&received[..k_short], &info[..], "t={t} j={j}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Equivalence: optimized hot-path routines vs. the reference
+    // implementations they replace, across t, error counts 0..=t, and
+    // shortened codes.
+    // -----------------------------------------------------------------
+
+    /// Build a full `n`-bit codeword (optionally via the shortened-code
+    /// zero-padding convention) with exactly `j` errors injected, for
+    /// equivalence testing of the private hot-path routines.
+    fn full_codeword_with_errors(
+        bch: &BchCode,
+        rng: &mut Xorshift64,
+        j: usize,
+        shortened: Option<usize>,
+    ) -> Vec<u8> {
+        let mut codeword = vec![0u8; bch.n()];
+        match shortened {
+            None => {
+                let info = random_bits(rng, bch.k());
+                bch.encode(&info, &mut codeword).unwrap();
+            }
+            Some(k_short) => {
+                let pad = bch.k() - k_short;
+                let info = random_bits(rng, k_short);
+                let mut short_cw = vec![0u8; k_short + bch.parity_len()];
+                bch.shortened_encode(k_short, &info, &mut short_cw).unwrap();
+                codeword[pad..pad + k_short].copy_from_slice(&short_cw[..k_short]);
+                codeword[bch.k()..bch.n()].copy_from_slice(&short_cw[k_short..]);
+            }
+        }
+        inject_errors(rng, &mut codeword, j);
+        codeword
+    }
+
+    #[test]
+    fn syndromes_match_reference() {
+        let mut rng = Xorshift64::new(0xC0FF_EE01);
+        for t in [1usize, 2, 4, 8, 10] {
+            let bch = BchCode::new(t).unwrap();
+            for j in 0..=t {
+                for shortened in [None, Some((bch.k() / 3).max(1))] {
+                    for trial in 0..10u64 {
+                        let codeword = full_codeword_with_errors(&bch, &mut rng, j, shortened);
+                        let fast = bch.syndromes(&codeword);
+                        let reference = bch.syndromes_reference(&codeword);
+                        assert_eq!(
+                            fast, reference,
+                            "t={t} j={j} shortened={shortened:?} trial={trial}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chien_search_matches_reference() {
+        let mut rng = Xorshift64::new(0xC0FF_EE02);
+        for t in [1usize, 2, 4, 8, 10] {
+            let bch = BchCode::new(t).unwrap();
+            for j in 0..=t {
+                for shortened in [None, Some((bch.k() / 3).max(1))] {
+                    for trial in 0..10u64 {
+                        let codeword = full_codeword_with_errors(&bch, &mut rng, j, shortened);
+                        let (s, any_nonzero) = bch.syndromes(&codeword);
+                        if !any_nonzero {
+                            continue;
+                        }
+                        let Ok((c, l)) = bch.berlekamp_massey(&s) else {
+                            continue;
+                        };
+
+                        let mut fast_buf = codeword.clone();
+                        let fast_corrected = bch.chien_search(&c, l, &mut fast_buf);
+                        let mut ref_buf = codeword.clone();
+                        let ref_corrected = bch.chien_search_reference(&c, l, &mut ref_buf);
+
+                        assert_eq!(
+                            fast_corrected, ref_corrected,
+                            "t={t} j={j} shortened={shortened:?} trial={trial}"
+                        );
+                        assert_eq!(
+                            fast_buf, ref_buf,
+                            "t={t} j={j} shortened={shortened:?} trial={trial}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lfsr_remainder_matches_reference() {
+        let mut rng = Xorshift64::new(0xC0FF_EE03);
+        for t in [1usize, 2, 4, 8, 10] {
+            let bch = BchCode::new(t).unwrap();
+            // Info lengths spanning every remainder mod 8, plus k itself and
+            // a shortened (k_short) length, so the leading-remainder-bits
+            // path and the byte-table path are both exercised.
+            let mut lens: Vec<usize> = (0..8).map(|r| (bch.k() / 2) + r).collect();
+            lens.push(bch.k());
+            lens.push((bch.k() / 3).max(1));
+            lens.push(0);
+            lens.push(1);
+            for len in lens {
+                for trial in 0..8u64 {
+                    let info = random_bits(&mut rng, len);
+                    let fast = bch.lfsr_remainder(&info);
+                    let reference = bch.lfsr_remainder_reference(&info);
+                    assert_eq!(fast, reference, "t={t} len={len} trial={trial}");
+                }
             }
         }
     }
