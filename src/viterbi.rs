@@ -49,6 +49,67 @@ struct TrellisTable {
     next_state: Vec<u8>,
     out0: Vec<u8>,
     out1: Vec<u8>,
+    /// Butterfly-reorganised branch tables used by the AVX2 ACS kernel.
+    bfly: ButterflyTables,
+}
+
+/// Branch-output tables reorganised into the "butterfly" layout consumed by
+/// the vectorised ACS kernel.
+///
+/// # Butterfly structure
+///
+/// For a rate-1/2 code the next-state function is
+/// $$
+///   \mathrm{ns}(s, b) = (b \ll (K-2)) \mathrel{|} (s \gg 1),
+/// $$
+/// i.e. the two states $2j$ and $2j+1$ (same $j = s \gg 1$) are the *only*
+/// predecessors of next-states $j$ (via input $b=0$) and $\mathrm{half}+j$
+/// (via input $b=1$).  Grouping the trellis by $j = 0 \dots \mathrm{half}-1$
+/// turns the per-bit ACS update into `half` independent 2-way compare-selects,
+/// which vectorise cleanly across 8-wide SIMD lanes when `half` is a multiple
+/// of 8 (true for K=7, where `half = 32`).
+///
+/// Layout: `out0_even[b * half + j]` is the `out0` value for source state
+/// $2j$ with input `b`; `out0_odd`/`out1_odd` are the same for source state
+/// $2j+1$.  Built for any even `n_states`, but only consumed by the AVX2
+/// kernel when `n_states == 64` (K=7); other constraint lengths use the
+/// scalar fallback and never read these tables.
+struct ButterflyTables {
+    /// `n_states / 2` (0 when `n_states == 1`, i.e. K=1).
+    half: usize,
+    out0_even: Vec<i32>,
+    out1_even: Vec<i32>,
+    out0_odd: Vec<i32>,
+    out1_odd: Vec<i32>,
+}
+
+impl ButterflyTables {
+    /// Reorganise the state-major `out0`/`out1` tables into the butterfly
+    /// (predecessor-pair-major) layout described on [`ButterflyTables`].
+    fn build(n_states: usize, out0: &[u8], out1: &[u8]) -> Self {
+        let half = n_states / 2;
+        let mut out0_even = vec![0i32; 2 * half];
+        let mut out1_even = vec![0i32; 2 * half];
+        let mut out0_odd = vec![0i32; 2 * half];
+        let mut out1_odd = vec![0i32; 2 * half];
+        for j in 0..half {
+            let s_even = 2 * j;
+            let s_odd = 2 * j + 1;
+            for b in 0..2usize {
+                out0_even[b * half + j] = out0[s_even * 2 + b] as i32;
+                out1_even[b * half + j] = out1[s_even * 2 + b] as i32;
+                out0_odd[b * half + j] = out0[s_odd * 2 + b] as i32;
+                out1_odd[b * half + j] = out1[s_odd * 2 + b] as i32;
+            }
+        }
+        ButterflyTables {
+            half,
+            out0_even,
+            out1_even,
+            out0_odd,
+            out1_odd,
+        }
+    }
 }
 
 impl TrellisTable {
@@ -76,11 +137,236 @@ impl TrellisTable {
                 out1[s * 2 + b] = o1;
             }
         }
+        let bfly = ButterflyTables::build(n_states, &out0, &out1);
         TrellisTable {
             n_states,
             next_state,
             out0,
             out1,
+            bfly,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AVX2 add-compare-select kernel (x86_64, K=7 / 64-state specific)
+// ---------------------------------------------------------------------------
+//
+// This module vectorises the butterfly ACS recursion described on
+// [`ButterflyTables`]. Each call processes one trellis step (one received
+// bit pair) for all 64 states, expressed as 4 groups of 8 lanes over the
+// `half = 32` predecessor pairs.
+//
+// # Deinterleave trick
+//
+// The predecessor metrics `cur_met[2j]` / `cur_met[2j+1]` are adjacent pairs
+// in the natural (state-indexed) metric array, so reading 8 lanes worth of
+// `j` requires deinterleaving 16 consecutive `cur_met` entries into their
+// even- and odd-indexed halves. `_mm256_permutevar8x32_{ps,epi32}` extracts
+// the even (or odd) elements from each 8-wide half independently (fast,
+// single-cycle-throughput shuffle — no AVX2 gather instruction needed), and
+// `_mm256_insertf128_{ps,si256}` stitches the two 4-lane results back into
+// one 8-lane vector. Destination writes need no such trick: the two
+// butterfly outputs (`b=0` group and `b=1` group) land on the *contiguous*
+// natural state ranges `0..32` and `32..64` respectively.
+#[cfg(target_arch = "x86_64")]
+mod avx2_acs {
+    use super::ButterflyTables;
+    use core::arch::x86_64::*;
+
+    /// Number of butterfly pairs processed for K=7 (`half = 32`, 4 lanes of 8).
+    const N_CHUNKS: usize = 4;
+
+    /// Deinterleave 16 consecutive `f32`s starting at `src[base..base+16]`
+    /// into their even-indexed and odd-indexed 8-wide halves.
+    ///
+    /// Returns `(even, odd)` where `even` lane `i` = `src[base + 2*i]` and
+    /// `odd` lane `i` = `src[base + 2*i + 1]`, for `i` in `0..8`.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee AVX2 support and `src.len() >= base + 16`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn deinterleave16_ps(src: &[f32], base: usize) -> (__m256, __m256) {
+        unsafe {
+            let idx_even = _mm256_set_epi32(6, 4, 2, 0, 6, 4, 2, 0);
+            let idx_odd = _mm256_set_epi32(7, 5, 3, 1, 7, 5, 3, 1);
+            let r0 = _mm256_loadu_ps(src.as_ptr().add(base));
+            let r1 = _mm256_loadu_ps(src.as_ptr().add(base + 8));
+            let e0 = _mm256_permutevar8x32_ps(r0, idx_even);
+            let e1 = _mm256_permutevar8x32_ps(r1, idx_even);
+            let o0 = _mm256_permutevar8x32_ps(r0, idx_odd);
+            let o1 = _mm256_permutevar8x32_ps(r1, idx_odd);
+            let even = _mm256_insertf128_ps(e0, _mm256_castps256_ps128(e1), 1);
+            let odd = _mm256_insertf128_ps(o0, _mm256_castps256_ps128(o1), 1);
+            (even, odd)
+        }
+    }
+
+    /// Integer counterpart of [`deinterleave16_ps`] for the hard-decision path.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee AVX2 support and `src.len() >= base + 16`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn deinterleave16_epi32(src: &[i32], base: usize) -> (__m256i, __m256i) {
+        unsafe {
+            let idx_even = _mm256_set_epi32(6, 4, 2, 0, 6, 4, 2, 0);
+            let idx_odd = _mm256_set_epi32(7, 5, 3, 1, 7, 5, 3, 1);
+            let r0 = _mm256_loadu_si256(src.as_ptr().add(base) as *const __m256i);
+            let r1 = _mm256_loadu_si256(src.as_ptr().add(base + 8) as *const __m256i);
+            let e0 = _mm256_permutevar8x32_epi32(r0, idx_even);
+            let e1 = _mm256_permutevar8x32_epi32(r1, idx_even);
+            let o0 = _mm256_permutevar8x32_epi32(r0, idx_odd);
+            let o1 = _mm256_permutevar8x32_epi32(r1, idx_odd);
+            let even = _mm256_insertf128_si256(e0, _mm256_castsi256_si128(e1), 1);
+            let odd = _mm256_insertf128_si256(o0, _mm256_castsi256_si128(o1), 1);
+            (even, odd)
+        }
+    }
+
+    /// One AVX2 trellis step of the soft-decision (max-log-MAP) ACS recursion.
+    ///
+    /// `cur_met`/`nxt_met` are length-64 metric arrays (natural state order).
+    /// `traceback_row` is the length-64 traceback row for this step (previous
+    /// state that won each next-state). `sign*_{even,odd}` are the
+    /// precomputed $\pm 1$ branch-sign tables (length `2*half`, see
+    /// [`ButterflyTables`] layout) built once per `decode_soft` call from the
+    /// integer `out0`/`out1` tables. `l0`/`l1` are this step's received LLRs.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee AVX2 support at runtime and `bfly.half == 32`
+    /// (K=7 / 64 states); all slice arguments must have the lengths
+    /// documented above.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn acs_step_soft(
+        cur_met: &[f32],
+        nxt_met: &mut [f32],
+        traceback_row: &mut [u8],
+        bfly: &ButterflyTables,
+        sign0_even: &[f32],
+        sign1_even: &[f32],
+        sign0_odd: &[f32],
+        sign1_odd: &[f32],
+        l0: f32,
+        l1: f32,
+    ) {
+        unsafe {
+            debug_assert_eq!(bfly.half, N_CHUNKS * 8);
+            let half = bfly.half;
+            let l0v = _mm256_set1_ps(l0);
+            let l1v = _mm256_set1_ps(l1);
+            let one = _mm256_set1_epi32(1);
+            let iota = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+
+            for c in 0..N_CHUNKS {
+                let base16 = c * 16;
+                let (even_v, odd_v) = deinterleave16_ps(cur_met, base16);
+                let j_base = _mm256_add_epi32(iota, _mm256_set1_epi32((c * 8) as i32));
+                let state_base = _mm256_slli_epi32(j_base, 1); // 2*j
+
+                for b in 0..2usize {
+                    let off = b * half + c * 8;
+                    let s0e = _mm256_loadu_ps(sign0_even[off..].as_ptr());
+                    let s1e = _mm256_loadu_ps(sign1_even[off..].as_ptr());
+                    let s0o = _mm256_loadu_ps(sign0_odd[off..].as_ptr());
+                    let s1o = _mm256_loadu_ps(sign1_odd[off..].as_ptr());
+
+                    let bm_even = _mm256_add_ps(_mm256_mul_ps(s0e, l0v), _mm256_mul_ps(s1e, l1v));
+                    let bm_odd = _mm256_add_ps(_mm256_mul_ps(s0o, l0v), _mm256_mul_ps(s1o, l1v));
+
+                    let cand_even = _mm256_add_ps(even_v, bm_even);
+                    let cand_odd = _mm256_add_ps(odd_v, bm_odd);
+
+                    // Strict '>' matches the scalar tie-break: the even (2j)
+                    // predecessor always arrives first, so ties keep it.
+                    let mask = _mm256_cmp_ps(cand_odd, cand_even, _CMP_GT_OQ);
+                    let winner = _mm256_blendv_ps(cand_even, cand_odd, mask);
+
+                    let dest = b * half + c * 8;
+                    _mm256_storeu_ps(nxt_met[dest..].as_mut_ptr(), winner);
+
+                    let mask_i = _mm256_castps_si256(mask);
+                    let winner_bit = _mm256_and_si256(mask_i, one);
+                    let pred_state = _mm256_add_epi32(state_base, winner_bit);
+
+                    let mut tmp = [0i32; 8];
+                    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
+                    for i in 0..8 {
+                        traceback_row[dest + i] = tmp[i] as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One AVX2 trellis step of the hard-decision (Hamming-metric) ACS
+    /// recursion. Mirrors [`acs_step_soft`] with `i32` metrics: branch
+    /// metrics are `(r ^ out)` summed (values in `{0, 1, 2}`), and the
+    /// merge picks the *smaller* candidate (min, not max), again breaking
+    /// ties toward the even predecessor to match the scalar reference.
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`acs_step_soft`].
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn acs_step_hard(
+        cur_met: &[i32],
+        nxt_met: &mut [i32],
+        traceback_row: &mut [u8],
+        bfly: &ButterflyTables,
+        r0: i32,
+        r1: i32,
+    ) {
+        unsafe {
+            debug_assert_eq!(bfly.half, N_CHUNKS * 8);
+            let half = bfly.half;
+            let r0v = _mm256_set1_epi32(r0);
+            let r1v = _mm256_set1_epi32(r1);
+            let one = _mm256_set1_epi32(1);
+            let iota = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+
+            for c in 0..N_CHUNKS {
+                let base16 = c * 16;
+                let (even_v, odd_v) = deinterleave16_epi32(cur_met, base16);
+                let j_base = _mm256_add_epi32(iota, _mm256_set1_epi32((c * 8) as i32));
+                let state_base = _mm256_slli_epi32(j_base, 1); // 2*j
+
+                for b in 0..2usize {
+                    let off = b * half + c * 8;
+                    let o0e = _mm256_loadu_si256(bfly.out0_even[off..].as_ptr() as *const __m256i);
+                    let o1e = _mm256_loadu_si256(bfly.out1_even[off..].as_ptr() as *const __m256i);
+                    let o0o = _mm256_loadu_si256(bfly.out0_odd[off..].as_ptr() as *const __m256i);
+                    let o1o = _mm256_loadu_si256(bfly.out1_odd[off..].as_ptr() as *const __m256i);
+
+                    let bm_even =
+                        _mm256_add_epi32(_mm256_xor_si256(r0v, o0e), _mm256_xor_si256(r1v, o1e));
+                    let bm_odd =
+                        _mm256_add_epi32(_mm256_xor_si256(r0v, o0o), _mm256_xor_si256(r1v, o1o));
+
+                    let cand_even = _mm256_add_epi32(even_v, bm_even);
+                    let cand_odd = _mm256_add_epi32(odd_v, bm_odd);
+
+                    // odd wins only if strictly smaller (min-metric, tie -> even).
+                    let mask = _mm256_cmpgt_epi32(cand_even, cand_odd);
+                    let winner = _mm256_blendv_epi8(cand_even, cand_odd, mask);
+
+                    let dest = b * half + c * 8;
+                    _mm256_storeu_si256(nxt_met[dest..].as_mut_ptr() as *mut __m256i, winner);
+
+                    let winner_bit = _mm256_and_si256(mask, one);
+                    let pred_state = _mm256_add_epi32(state_base, winner_bit);
+
+                    let mut tmp = [0i32; 8];
+                    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
+                    for i in 0..8 {
+                        traceback_row[dest + i] = tmp[i] as u8;
+                    }
+                }
+            }
         }
     }
 }
@@ -133,7 +419,7 @@ pub struct ViterbiDecoder {
 
 impl ViterbiDecoder {
     /// Create a decoder for a rate-1/2, constraint-length `k` code using the
-    /// standard generator polynomials for that `k` (see [`default_generators`]).
+    /// standard generator polynomials for that `k` (see `default_generators`).
     ///
     /// # Arguments
     ///
@@ -227,6 +513,17 @@ impl ViterbiDecoder {
     /// assert_eq!(dec.decode_hard(&coded), info);
     /// ```
     pub fn decode_hard(&self, coded: &[u8]) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+            return self.decode_hard_avx2(coded);
+        }
+        self.decode_hard_scalar(coded)
+    }
+
+    /// Scalar reference implementation of hard-decision decode (see
+    /// [`decode_hard`](Self::decode_hard)). Kept `pub(crate)` so tests can
+    /// compare it directly against [`decode_hard_avx2`](Self::decode_hard_avx2).
+    pub(crate) fn decode_hard_scalar(&self, coded: &[u8]) -> Vec<u8> {
         let k = self.constraint_length;
         let n_states = self.trellis.n_states;
         let t_max = coded.len() / 2;
@@ -270,6 +567,59 @@ impl ViterbiDecoder {
         self.traceback_from_zero(t_max, n_info, &traceback)
     }
 
+    /// AVX2-vectorised hard-decision decode for the K=7 (64-state) trellis.
+    ///
+    /// Uses `i32` Hamming path metrics (branch metrics are in `{0, 1, 2}`
+    /// per step, so `i32` gives enormous headroom against overflow for any
+    /// realistic frame length — a `u16` metric would need explicit
+    /// saturation logic to stay safe on long frames, which AVX2 cannot do
+    /// for `epi32`-width lanes without extra instructions, so plain
+    /// non-saturating `i32` addition was chosen for simplicity and safety
+    /// margin). See [`avx2_acs::acs_step_hard`] and [`ButterflyTables`] for
+    /// the vectorisation strategy.
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_hard`](Self::decode_hard) after checking
+    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `pub(crate)` for the equivalence tests, which perform the same check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn decode_hard_avx2(&self, coded: &[u8]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "AVX2 ACS path requires K=7");
+        let k = self.constraint_length;
+        let n_states = self.trellis.n_states;
+        let t_max = coded.len() / 2;
+        let tail = k.saturating_sub(1);
+        let n_info = t_max.saturating_sub(tail);
+        if n_info == 0 {
+            return vec![];
+        }
+
+        // Generous headroom sentinel; see doc comment above for why `i32`
+        // (not saturating, not `u16`) is safe here.
+        const INF: i32 = i32::MAX / 4;
+        let mut cur_met = vec![INF; n_states];
+        let mut nxt_met = vec![INF; n_states];
+        cur_met[0] = 0;
+
+        let mut traceback = vec![0u8; n_states * t_max];
+        let bfly = &self.trellis.bfly;
+
+        for t in 0..t_max {
+            let r0 = (coded[2 * t] & 1) as i32;
+            let r1 = (coded[2 * t + 1] & 1) as i32;
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            // SAFETY: caller guarantees AVX2 support (checked in
+            // `decode_hard`/test callers); `bfly.half == 32` for n_states==64.
+            unsafe {
+                avx2_acs::acs_step_hard(&cur_met, &mut nxt_met, row, bfly, r0, r1);
+            }
+            core::mem::swap(&mut cur_met, &mut nxt_met);
+        }
+
+        self.traceback_from_zero(t_max, n_info, &traceback)
+    }
+
     /// Soft-decision Viterbi decode (max-log-MAP branch metric).
     ///
     /// `llr` contains paired LLR values `[L0, L1, L0, L1, …]` where
@@ -295,6 +645,17 @@ impl ViterbiDecoder {
     /// assert_eq!(dec.decode_soft(&llr), info);
     /// ```
     pub fn decode_soft(&self, llr: &[f32]) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+            return self.decode_soft_avx2(llr);
+        }
+        self.decode_soft_scalar(llr)
+    }
+
+    /// Scalar reference implementation of soft-decision decode (see
+    /// [`decode_soft`](Self::decode_soft)). Kept `pub(crate)` so tests can
+    /// compare it directly against [`decode_soft_avx2`](Self::decode_soft_avx2).
+    pub(crate) fn decode_soft_scalar(&self, llr: &[f32]) -> Vec<u8> {
         let k = self.constraint_length;
         let n_states = self.trellis.n_states;
         let t_max = llr.len() / 2;
@@ -337,7 +698,77 @@ impl ViterbiDecoder {
         self.traceback_from_zero(t_max, n_info, &traceback)
     }
 
-    /// Decode hard-decision coded bits (alias for [`decode_hard`]).
+    /// AVX2-vectorised soft-decision (max-log-MAP) decode for the K=7
+    /// (64-state) trellis.
+    ///
+    /// The branch metric $\mathrm{bm} = (1-2c_0)L_0 + (1-2c_1)L_1$ is fused
+    /// directly into the vectorised ACS step (via precomputed $\pm 1$ sign
+    /// tables built once per call below) rather than computed in a separate
+    /// pass — profiling showed the scalar branch-metric arithmetic is not a
+    /// separable cost, it is interleaved with the compare-select on every
+    /// trellis edge, so fusing it avoids an extra memory round-trip.
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_soft`](Self::decode_soft) after checking
+    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `pub(crate)` for the equivalence tests, which perform the same check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn decode_soft_avx2(&self, llr: &[f32]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "AVX2 ACS path requires K=7");
+        let k = self.constraint_length;
+        let n_states = self.trellis.n_states;
+        let t_max = llr.len() / 2;
+        let tail = k.saturating_sub(1);
+        let n_info = t_max.saturating_sub(tail);
+        if n_info == 0 {
+            return vec![];
+        }
+
+        let bfly = &self.trellis.bfly;
+        // Precompute the +-1 branch-sign tables once per call (not once per
+        // bit): bm = sign0*l0 + sign1*l1 replaces the per-edge (1-2*out)*L
+        // scalar formula with a fused multiply-add over constant vectors.
+        let to_sign =
+            |out: &[i32]| -> Vec<f32> { out.iter().map(|&o| 1.0 - 2.0 * o as f32).collect() };
+        let sign0_even = to_sign(&bfly.out0_even);
+        let sign1_even = to_sign(&bfly.out1_even);
+        let sign0_odd = to_sign(&bfly.out0_odd);
+        let sign1_odd = to_sign(&bfly.out1_odd);
+
+        let mut cur_met = vec![f32::NEG_INFINITY; n_states];
+        let mut nxt_met = vec![f32::NEG_INFINITY; n_states];
+        cur_met[0] = 0.0;
+
+        let mut traceback = vec![0u8; n_states * t_max];
+
+        for t in 0..t_max {
+            let l0 = llr[2 * t];
+            let l1 = llr[2 * t + 1];
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            // SAFETY: caller guarantees AVX2 support (checked in
+            // `decode_soft`/test callers); `bfly.half == 32` for n_states==64.
+            unsafe {
+                avx2_acs::acs_step_soft(
+                    &cur_met,
+                    &mut nxt_met,
+                    row,
+                    bfly,
+                    &sign0_even,
+                    &sign1_even,
+                    &sign0_odd,
+                    &sign1_odd,
+                    l0,
+                    l1,
+                );
+            }
+            core::mem::swap(&mut cur_met, &mut nxt_met);
+        }
+
+        self.traceback_from_zero(t_max, n_info, &traceback)
+    }
+
+    /// Decode hard-decision coded bits (alias for [`ViterbiDecoder::decode_hard`]).
     ///
     /// Kept for backward compatibility with the original stub API.
     pub fn decode(&self, bits: &[u8]) -> Vec<u8> {
@@ -464,5 +895,116 @@ mod tests {
             let decoded = dec.decode_hard(&coded);
             prop_assert_eq!(decoded, bits);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AVX2 vs. scalar equivalence (K=7 / 64-state ACS kernel)
+    // -----------------------------------------------------------------------
+    //
+    // These tests only exercise the AVX2 path on hosts that actually have
+    // AVX2 at runtime (checked explicitly, never assumed from
+    // `target_feature` at compile time) so they degrade gracefully to a
+    // no-op on non-AVX2 x86_64 hosts and are entirely absent on other
+    // architectures.
+
+    /// Small deterministic PRNG (splitmix64) so the equivalence tests are
+    /// reproducible without adding a dependency on `rand`.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn decode_soft_avx2_matches_scalar_on_random_noisy_llrs() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no AVX2");
+            return;
+        }
+        let dec = ViterbiDecoder::new(7);
+        let mut seed = 0xC0FF_EE00_1234_5678u64;
+        for trial in 0..50 {
+            let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let coded = dec.encode(&info);
+            // Noisy soft channel: correct-sign LLR plus continuous noise in
+            // [-1.2, 1.2), occasionally flipping the sign outright so both
+            // decoders see genuinely ambiguous (tie-adjacent) metrics.
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| {
+                    let base = if b == 0 { 3.0 } else { -3.0 };
+                    let noise = (splitmix64(&mut seed) % 2401) as f32 / 1000.0 - 1.2;
+                    base + noise
+                })
+                .collect();
+            let scalar = dec.decode_soft_scalar(&llr);
+            let avx2 = dec.decode_soft_avx2(&llr);
+            assert_eq!(
+                scalar, avx2,
+                "trial {trial} (len={len}) soft decode mismatch between scalar and AVX2"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn decode_hard_avx2_matches_scalar_on_random_bit_flips() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no AVX2");
+            return;
+        }
+        let dec = ViterbiDecoder::new(7);
+        let mut seed = 0x1357_9BDF_2468_ACE0u64;
+        for trial in 0..50 {
+            let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let mut coded = dec.encode(&info);
+            // Flip roughly 5% of coded bits at pseudo-random positions.
+            for bit in coded.iter_mut() {
+                if splitmix64(&mut seed) % 20 == 0 {
+                    *bit ^= 1;
+                }
+            }
+            let scalar = dec.decode_hard_scalar(&coded);
+            let avx2 = dec.decode_hard_avx2(&coded);
+            assert_eq!(
+                scalar, avx2,
+                "trial {trial} (len={len}) hard decode mismatch between scalar and AVX2"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_soft_moderate_noise_roundtrip_still_passes() {
+        // Round-trip correctness at moderate noise (not just error-free or
+        // single-bit-flip): a fixed, reproducible noisy LLR channel that
+        // stays well within the K=7 code's correction capability.
+        let dec = ViterbiDecoder::new(7);
+        let mut seed = 0xFEED_FACE_C0DE_BEEFu64;
+        let info: Vec<u8> = (0..500)
+            .map(|_| (splitmix64(&mut seed) & 1) as u8)
+            .collect();
+        let coded = dec.encode(&info);
+        let llr: Vec<f32> = coded
+            .iter()
+            .map(|&b| {
+                let base = if b == 0 { 4.0 } else { -4.0 };
+                let noise = (splitmix64(&mut seed) % 3001) as f32 / 1000.0 - 1.5;
+                base + noise
+            })
+            .collect();
+        let decoded = dec.decode_soft(&llr);
+        assert_eq!(
+            decoded, info,
+            "moderate-noise soft decode must still recover info bits"
+        );
     }
 }
