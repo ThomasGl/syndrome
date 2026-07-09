@@ -258,6 +258,8 @@ fn process_z_positions_simd(
 /// only borrows slices into these `Vec`s — no allocation during decode.
 #[derive(Clone)]
 pub struct QcLdpcParams {
+    /// Base graph these parameters were expanded from.
+    pub bg: BaseGraph,
     /// Lifting size $Z$.
     pub z: usize,
     /// Number of check-node block rows.
@@ -320,6 +322,7 @@ impl QcLdpcParams {
         let max_layer_degree = row_degrees.iter().copied().max().unwrap_or(0);
 
         Ok(Self {
+            bg,
             z,
             num_row_blocks,
             num_col_blocks,
@@ -983,6 +986,16 @@ impl QcLdpcEncoder {
     /// Total codeword length ($N = n_b \cdot Z$).
     pub fn codeword_bit_count(&self) -> usize {
         self.params.num_col_blocks * self.params.z
+    }
+
+    /// Base graph this encoder was constructed for.
+    pub fn base_graph(&self) -> BaseGraph {
+        self.params.bg
+    }
+
+    /// Lifting size $Z$ this encoder was constructed for.
+    pub fn lifting_size(&self) -> usize {
+        self.params.z
     }
 
     /// 5G NR-compliant encode wrapper (TS 38.212 §5.3.2).

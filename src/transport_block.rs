@@ -44,7 +44,7 @@
 use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
 use crate::harq::HarqBuffer;
-use crate::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
+use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
 use crate::rate_matching::rate_match;
 use crate::segmentation::{SegmentationParams, compute_segmentation, segment};
 
@@ -244,19 +244,9 @@ impl DlSchEncoder {
 // Encoder must be Clone for multi-worker use.
 impl Clone for QcLdpcEncoder {
     fn clone(&self) -> Self {
-        // Re-derive the encoder from params (builds a new parity generator).
-        // This is a setup path — allocation here is intentional.
-        let bg = if self.info_bit_count() == (self.codeword_bit_count() / 68) * 22 {
-            BaseGraph::Bg1
-        } else {
-            BaseGraph::Bg2
-        };
-        let z = self.codeword_bit_count()
-            / match bg {
-                BaseGraph::Bg1 => 68,
-                BaseGraph::Bg2 => 52,
-            };
-        QcLdpcEncoder::new(bg, z).expect("clone: original encoder was valid")
+        // Rebuild from the stored (bg, z) — a setup path, allocation intended.
+        QcLdpcEncoder::new(self.base_graph(), self.lifting_size())
+            .expect("clone: original encoder was valid")
     }
 }
 
