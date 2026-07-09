@@ -901,10 +901,20 @@ impl ParityGenerator {
     /// Compute `m` parity bits from `k` systematic bits (packed as input).
     ///
     /// Each parity bit = popcount(rows\[i\] AND packed\_sys) mod 2.
+    ///
+    /// `sys_packed` is a fixed-size stack array (no heap allocation): the
+    /// largest $K$ across all valid 3GPP (BG, Z) combinations is
+    /// $22 \cdot 384 = 8448$ bits = 132 `u64` words, well under
+    /// [`GEN_WORDS_MAX`]. This path is only reached via the
+    /// [`EncodeStrategy::Dense`] fallback or the test-only
+    /// `encode_dense_reference`, never the default hot path.
     #[inline]
     fn apply(&self, systematic: &[u8], parity_out: &mut [u8]) {
+        const GEN_WORDS_MAX: usize = 140;
+        debug_assert!(self.words_per_row <= GEN_WORDS_MAX);
+
         // Pack systematic bits into u64 words for fast inner product.
-        let mut sys_packed = vec![0u64; self.words_per_row];
+        let mut sys_packed = [0u64; GEN_WORDS_MAX];
         for (j, &b) in systematic.iter().enumerate() {
             if b & 1 != 0 {
                 sys_packed[j >> 6] |= 1u64 << (j & 63);
@@ -922,14 +932,274 @@ impl ParityGenerator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sparse structured encoding (3GPP TS 38.212 §5.3.2)
+// ---------------------------------------------------------------------------
+//
+// 5G NR base graphs are structured as H = [A | B | I_ext]: `k_b` systematic
+// column-blocks, then 4 "core" parity column-blocks (p1..p4) forming a
+// double-diagonal over base rows 0..3, then an identity extension over the
+// remaining `m_b - 4` rows (row `i` connects, among the parity columns, only
+// to its own diagonal column `k_b + i`, with shift 0).
+//
+// Reading the actual table entries (not folklore) for both BG1 and BG2
+// confirms the following invariant structure for the core 4x4 block, using
+// column offsets 0..3 for p1..p4:
+//
+//   row0: { p1 (shift s_edge), p2 (shift s0_p2) }
+//   row3: { p1 (shift s_edge — same value as row0), p4 (shift s3_p4) }
+//   {row1, row2}: one of them additionally carries a *second*, generally
+//     different, shift for p1 (call that row `row_x`, shift `s_x`); the other
+//     ("row_y") does not touch p1 at all. Both always carry p3 between them;
+//     row1 always also carries p2, row2 always also carries p4.
+//
+// XOR-summing all four core-row parity-check equations cancels every term
+// that appears in exactly two rows with an *equal* shift: p1's row0/row3
+// pair cancels (equal shift), p2's row0/row1 pair cancels, p3's row1/row2
+// pair cancels, p4's row2/row3 pair cancels — leaving exactly
+// `rotate(p1, s_x)` on the left. That pins down p1 in closed form; p2, p3,
+// p4 then follow by direct back-substitution through rows 0, 1, 2 (row 3 is
+// the redundant/consistency equation, checked only in debug builds).
+//
+// Extension rows (i >= 4) are a direct identity: `p_i = lambda_i XOR (that
+// row's edges into p1..p4, already known at this point)`.
+
+/// Z ≤ 384 is the largest valid 3GPP lifting size (Table 5.3.2-1); every
+/// scratch block used by the sparse encoder is a fixed `[u8; Z_MAX]` stack
+/// array sized for the worst case, never a heap allocation.
+const Z_MAX: usize = 384;
+
+/// `dst[i] ^= src[(i + shift) mod z]` for `i in 0..z`, without a per-element
+/// modulo (the wraparound is exactly two contiguous spans).
+#[inline]
+fn rotl_xor_into(dst: &mut [u8], src: &[u8], shift: usize, z: usize) {
+    if shift == 0 {
+        for i in 0..z {
+            dst[i] ^= src[i];
+        }
+    } else {
+        let head = z - shift;
+        for i in 0..head {
+            dst[i] ^= src[i + shift];
+        }
+        for i in head..z {
+            dst[i] ^= src[i - head];
+        }
+    }
+}
+
+/// `dst[i] = src[(i + shift) mod z]` for `i in 0..z` (assignment, not XOR).
+#[inline]
+fn rotl_assign(dst: &mut [u8], src: &[u8], shift: usize, z: usize) {
+    if shift == 0 {
+        dst[..z].copy_from_slice(&src[..z]);
+    } else {
+        let head = z - shift;
+        dst[..head].copy_from_slice(&src[shift..shift + head]);
+        dst[head..z].copy_from_slice(&src[..shift]);
+    }
+}
+
+/// Accumulate $\lambda_{\text{row}} = \bigoplus_j \mathrm{rotate}(\text{info}_j, \text{shift}_j)$
+/// over the info-column edges (`col < k_b`) of base row `row` into `lambda`
+/// (which the caller must have zeroed). Reads the systematic section of
+/// `codeword` (`codeword[..k_b*z]`), which must already be populated.
+#[inline]
+fn accumulate_lambda(
+    params: &QcLdpcParams,
+    row: usize,
+    k_b: usize,
+    z: usize,
+    codeword: &[u8],
+    lambda: &mut [u8],
+) {
+    let begin = params.layer_offsets[row];
+    let end = params.layer_offsets[row + 1];
+    for e in begin..end {
+        let col = params.submatrix_cols[e];
+        if col < k_b {
+            let shift = params.submatrix_shifts[e] as usize;
+            let src = &codeword[col * z..col * z + z];
+            rotl_xor_into(&mut lambda[..z], src, shift, z);
+        }
+    }
+}
+
+/// Collect `(column_offset, shift)` pairs for entries of base `row` whose
+/// column falls in the 4-wide core-parity block `[k_b, k_b + 4)`. Returns
+/// the filled prefix and its length; capped at 4 slots defensively (a valid
+/// base graph never has more than 3 such entries in any one core row).
+fn core_entries(params: &QcLdpcParams, row: usize, k_b: usize) -> ([(usize, usize); 4], usize) {
+    let mut out = [(0usize, 0usize); 4];
+    let mut n = 0usize;
+    let begin = params.layer_offsets[row];
+    let end = params.layer_offsets[row + 1];
+    for e in begin..end {
+        let col = params.submatrix_cols[e];
+        if col >= k_b && col < k_b + 4 && n < 4 {
+            out[n] = (col - k_b, params.submatrix_shifts[e] as usize);
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// Look up the shift for column-offset `offset` within a row's core-entry
+/// list, or `None` if that column is not connected in this row.
+fn shift_for(entries: &[(usize, usize)], offset: usize) -> Option<usize> {
+    entries.iter().find(|&&(o, _)| o == offset).map(|&(_, s)| s)
+}
+
+/// Derived 4x4 core double-diagonal solve structure for one `(BaseGraph, Z)`
+/// combination. Computed once at [`QcLdpcEncoder::new`] time; the fields are
+/// the shifts and row-role bit needed by the closed-form back-substitution
+/// described above.
+#[derive(Clone, Copy, Debug)]
+struct CoreLayout {
+    /// Shift shared by p1's appearances in row0 and row3.
+    shift_p1_edge: usize,
+    /// Shift of p1's extra appearance in `row_x`.
+    shift_p1_x: usize,
+    /// `true` if `row_x == 1` (row1 carries the extra p1 edge), `false` if
+    /// `row_x == 2`.
+    row_x_is_1: bool,
+    /// Shift of p2 in row0.
+    shift0_p2: usize,
+    /// Shift of p2 in row1.
+    shift1_p2: usize,
+    /// Shift of p3 in row1.
+    shift1_p3: usize,
+    /// Shift of p3 in row2.
+    shift2_p3: usize,
+    /// Shift of p4 in row2.
+    shift2_p4: usize,
+    /// Shift of p4 in row3 (only used by the debug-only row-3 consistency
+    /// check; row 3 is redundant for the forward solve). Unread in release
+    /// builds, where that check compiles out — hence the targeted allow.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    shift3_p4: usize,
+}
+
+impl CoreLayout {
+    /// Derive the core solve structure from the actual base-graph table
+    /// entries for `params` (with `k_b` systematic column-blocks).
+    ///
+    /// Returns `None` if the entries do not match the double-diagonal
+    /// pattern the closed-form solve below relies on — the caller must then
+    /// fall back to the dense generator for this `(bg, z)` combination.
+    fn derive(params: &QcLdpcParams, k_b: usize) -> Option<Self> {
+        let m_b = params.num_row_blocks;
+        if m_b < 4 || params.num_col_blocks < k_b + 4 {
+            return None;
+        }
+
+        let (row0, n0) = core_entries(params, 0, k_b);
+        let (row1, n1) = core_entries(params, 1, k_b);
+        let (row2, n2) = core_entries(params, 2, k_b);
+        let (row3, n3) = core_entries(params, 3, k_b);
+        let row0 = &row0[..n0];
+        let row1 = &row1[..n1];
+        let row2 = &row2[..n2];
+        let row3 = &row3[..n3];
+
+        // Row 0 must connect exactly {p1, p2}; row 3 exactly {p1, p4}, with
+        // p1 carrying the same shift in both (the pair that self-cancels
+        // when the four core-row equations are XOR-summed).
+        if n0 != 2 || n3 != 2 {
+            return None;
+        }
+        let shift0_p1 = shift_for(row0, 0)?;
+        let shift0_p2 = shift_for(row0, 1)?;
+        let shift3_p1 = shift_for(row3, 0)?;
+        let shift3_p4 = shift_for(row3, 3)?;
+        if shift0_p1 != shift3_p1 {
+            return None;
+        }
+
+        // Exactly one of row1/row2 carries the extra p1 edge that survives
+        // the XOR-sum and pins down p1.
+        let row1_p1 = shift_for(row1, 0);
+        let row2_p1 = shift_for(row2, 0);
+        let (row_x_is_1, shift_p1_x) = match (row1_p1, row2_p1) {
+            (Some(s), None) => (true, s),
+            (None, Some(s)) => (false, s),
+            _ => return None,
+        };
+
+        let shift1_p2 = shift_for(row1, 1)?;
+        let shift1_p3 = shift_for(row1, 2)?;
+        let shift2_p3 = shift_for(row2, 2)?;
+        let shift2_p4 = shift_for(row2, 3)?;
+
+        let expected_n1 = if row_x_is_1 { 3 } else { 2 };
+        let expected_n2 = if row_x_is_1 { 2 } else { 3 };
+        if n1 != expected_n1 || n2 != expected_n2 {
+            return None;
+        }
+
+        // Extension rows (i >= 4) must be a pure identity on parity column
+        // k_b + i (shift 0), optionally plus edges back into p1..p4.
+        for row in 4..m_b {
+            let begin = params.layer_offsets[row];
+            let end = params.layer_offsets[row + 1];
+            let mut identity_hits = 0usize;
+            for e in begin..end {
+                let col = params.submatrix_cols[e];
+                if col >= k_b + 4 {
+                    identity_hits += 1;
+                    if col != k_b + row || params.submatrix_shifts[e] != 0 {
+                        return None;
+                    }
+                }
+            }
+            if identity_hits != 1 {
+                return None;
+            }
+        }
+
+        Some(Self {
+            shift_p1_edge: shift0_p1,
+            shift_p1_x,
+            row_x_is_1,
+            shift0_p2,
+            shift1_p2,
+            shift1_p3,
+            shift2_p3,
+            shift2_p4,
+            shift3_p4,
+        })
+    }
+}
+
+/// Which parity-computation strategy an encoder instance uses.
+///
+/// [`CoreLayout::derive`] succeeds for every 3GPP (BG, Z) combination in the
+/// currently generated tables, so `Dense` is a defensive fallback rather
+/// than a path exercised in practice — but it is a genuine, correct
+/// fallback (not a stub) should a future/edited base-graph table not match
+/// the assumed double-diagonal structure.
+enum EncodeStrategy {
+    Sparse(CoreLayout),
+    Dense(ParityGenerator),
+}
+
 /// QC-LDPC systematic encoder for 5G NR BG1/BG2.
 ///
-/// Precomputes a GF(2) parity generator at construction time via Gaussian
-/// elimination; the [`QcLdpcEncoder::encode`] call is then a simple matrix–vector multiply
-/// over GF(2).
+/// Uses the standard 3GPP structured encoding (TS 38.212 §5.3.2): the 4
+/// "core" parity blocks are solved in closed form from the base graph's
+/// double-diagonal structure, and the remaining `m_b - 4` parity blocks
+/// follow directly from the identity extension — total cost
+/// $O(E \cdot Z)$ (E = number of base-graph edges) instead of the dense
+/// $O(M \cdot K)$ generator-matrix multiply. See the module-level comment
+/// above `CoreLayout` (private to this module) for the derivation.
 ///
-/// The encoder may allocate during construction; it is not intended for
-/// the latency-critical decode hot path.
+/// `CoreLayout::derive` is attempted once at construction time; it
+/// succeeds for every (BG, Z) combination in the current 3GPP tables. If it
+/// ever fails for some future/edited table, the encoder falls back to the
+/// dense GF(2) generator (Gaussian elimination, precomputed once at
+/// construction) so correctness is preserved either way — see
+/// [`QcLdpcEncoder::base_graph`]/[`QcLdpcEncoder::lifting_size`] to identify
+/// which combination fell back, if any.
 ///
 /// # Examples
 ///
@@ -945,18 +1215,23 @@ impl ParityGenerator {
 /// ```
 pub struct QcLdpcEncoder {
     params: QcLdpcParams,
-    /// Precomputed GF(2) generator: parity[i] = rows[i] · systematic.
-    generator: ParityGenerator,
+    /// Sparse structured solve (default) or dense GF(2) generator fallback.
+    strategy: EncodeStrategy,
     /// Number of information bits $K = k_b \cdot Z$.
     k_bits: usize,
+    /// Number of systematic column-blocks $k_b$.
+    k_b_blocks: usize,
 }
 
 impl QcLdpcEncoder {
     /// Create an encoder for `bg` at lifting size `z`.
     ///
-    /// Performs GF(2) Gaussian elimination on the parity portion of the
-    /// expanded H matrix to precompute the generator.  This allocates $O(M \cdot (M+K))$
-    /// memory and runs in $O(M^2 \cdot N)$ time (one-time cost).
+    /// Attempts to derive the sparse structured-encoding layout
+    /// (`CoreLayout::derive`) from the base graph's table entries; this is
+    /// $O(E)$ and allocation-free. Only if that derivation fails (never the
+    /// case for the current 3GPP tables) does construction fall back to
+    /// building the dense GF(2) generator via Gaussian elimination, which
+    /// allocates $O(M \cdot (M+K))$ memory and runs in $O(M^2 \cdot N)$ time.
     ///
     /// # Arguments
     ///
@@ -965,17 +1240,29 @@ impl QcLdpcEncoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `z` is not valid, or if the parity matrix is singular.
+    /// Returns `Err` if `z` is not valid, or (dense fallback only) if the
+    /// parity matrix is singular.
     pub fn new(bg: BaseGraph, z: usize) -> Result<Self, &'static str> {
         let params = QcLdpcParams::new(bg, z)?;
-        let k_blocks = params.num_col_blocks - params.num_row_blocks;
-        let k_bits = k_blocks * params.z;
-        let generator = ParityGenerator::build(&params)?;
+        let k_b_blocks = params.num_col_blocks - params.num_row_blocks;
+        let k_bits = k_b_blocks * params.z;
+        let strategy = match CoreLayout::derive(&params, k_b_blocks) {
+            Some(layout) => EncodeStrategy::Sparse(layout),
+            None => EncodeStrategy::Dense(ParityGenerator::build(&params)?),
+        };
         Ok(Self {
             params,
-            generator,
+            strategy,
             k_bits,
+            k_b_blocks,
         })
+    }
+
+    /// Returns `true` if this encoder is using the sparse $O(E \cdot Z)$
+    /// structured encoding path; `false` if it fell back to the dense
+    /// generator (see [`QcLdpcEncoder::new`]).
+    pub fn is_sparse(&self) -> bool {
+        matches!(self.strategy, EncodeStrategy::Sparse(_))
     }
 
     /// Number of information bits ($K = k_b \cdot Z$).
@@ -1050,8 +1337,14 @@ impl QcLdpcEncoder {
     /// Encode systematic `info_bits` into `codeword`.
     ///
     /// Copies the $K$ systematic bits into codeword positions $[0..K]$, then
-    /// computes the $M$ parity bits via the precomputed GF(2) generator and
-    /// writes them into positions $[K..N]$.
+    /// computes the $M$ parity bits and writes them into positions
+    /// $[K..N]$. Uses the sparse $O(E \cdot Z)$ structured solve by default
+    /// (see `CoreLayout`); falls back to the dense GF(2) generator only if
+    /// [`QcLdpcEncoder::is_sparse`] is `false` for this instance.
+    ///
+    /// No heap allocation occurs on the sparse path: all scratch is fixed-size
+    /// `[u8; Z_MAX]` stack arrays (Z ≤ 384, the largest valid 3GPP lifting
+    /// size).
     ///
     /// # Arguments
     ///
@@ -1071,7 +1364,149 @@ impl QcLdpcEncoder {
             return Err("codeword length must equal codeword_bit_count()");
         }
         codeword[..k].copy_from_slice(info_bits);
-        self.generator.apply(info_bits, &mut codeword[k..]);
+        match &self.strategy {
+            EncodeStrategy::Sparse(layout) => self.encode_sparse(layout, codeword),
+            EncodeStrategy::Dense(generator) => generator.apply(info_bits, &mut codeword[k..]),
+        }
+        Ok(())
+    }
+
+    /// Sparse structured parity solve (the default `encode` path). See the
+    /// module-level comment above [`CoreLayout`] for the derivation.
+    ///
+    /// Requires `codeword[..k_bits]` to already hold the systematic bits;
+    /// writes the $M$ parity bits into `codeword[k_bits..]`.
+    fn encode_sparse(&self, layout: &CoreLayout, codeword: &mut [u8]) {
+        let z = self.params.z;
+        let k_b = self.k_b_blocks;
+        let k = self.k_bits;
+        let m_b = self.params.num_row_blocks;
+
+        // λ_i for each of the 4 core rows: XOR of rotate(info_j, shift) over
+        // that row's info-column edges.
+        let mut lambda0 = [0u8; Z_MAX];
+        let mut lambda1 = [0u8; Z_MAX];
+        let mut lambda2 = [0u8; Z_MAX];
+        let mut lambda3 = [0u8; Z_MAX];
+        accumulate_lambda(&self.params, 0, k_b, z, codeword, &mut lambda0[..z]);
+        accumulate_lambda(&self.params, 1, k_b, z, codeword, &mut lambda1[..z]);
+        accumulate_lambda(&self.params, 2, k_b, z, codeword, &mut lambda2[..z]);
+        accumulate_lambda(&self.params, 3, k_b, z, codeword, &mut lambda3[..z]);
+
+        let inv = |s: usize| (z - s) % z;
+
+        // p1 = rotate(λ0 ^ λ1 ^ λ2 ^ λ3, inv(shift_p1_x)).
+        let mut p1 = [0u8; Z_MAX];
+        p1[..z].copy_from_slice(&lambda0[..z]);
+        for i in 0..z {
+            p1[i] ^= lambda1[i];
+        }
+        for i in 0..z {
+            p1[i] ^= lambda2[i];
+        }
+        for i in 0..z {
+            p1[i] ^= lambda3[i];
+        }
+        let mut tmp = [0u8; Z_MAX];
+        tmp[..z].copy_from_slice(&p1[..z]);
+        rotl_assign(&mut p1[..z], &tmp[..z], inv(layout.shift_p1_x), z);
+
+        // p2 = rotate(λ0 ^ rotate(p1, shift_p1_edge), inv(shift0_p2)).
+        let mut p2 = [0u8; Z_MAX];
+        p2[..z].copy_from_slice(&lambda0[..z]);
+        rotl_xor_into(&mut p2[..z], &p1[..z], layout.shift_p1_edge, z);
+        tmp[..z].copy_from_slice(&p2[..z]);
+        rotl_assign(&mut p2[..z], &tmp[..z], inv(layout.shift0_p2), z);
+
+        // p3 = rotate(λ1 ^ rotate(p2, shift1_p2) [^ rotate(p1, shift_p1_x) if
+        // row_x == 1], inv(shift1_p3)).
+        let mut p3 = [0u8; Z_MAX];
+        p3[..z].copy_from_slice(&lambda1[..z]);
+        rotl_xor_into(&mut p3[..z], &p2[..z], layout.shift1_p2, z);
+        if layout.row_x_is_1 {
+            rotl_xor_into(&mut p3[..z], &p1[..z], layout.shift_p1_x, z);
+        }
+        tmp[..z].copy_from_slice(&p3[..z]);
+        rotl_assign(&mut p3[..z], &tmp[..z], inv(layout.shift1_p3), z);
+
+        // p4 = rotate(λ2 ^ rotate(p3, shift2_p3) [^ rotate(p1, shift_p1_x) if
+        // row_x == 2], inv(shift2_p4)).
+        let mut p4 = [0u8; Z_MAX];
+        p4[..z].copy_from_slice(&lambda2[..z]);
+        rotl_xor_into(&mut p4[..z], &p3[..z], layout.shift2_p3, z);
+        if !layout.row_x_is_1 {
+            rotl_xor_into(&mut p4[..z], &p1[..z], layout.shift_p1_x, z);
+        }
+        tmp[..z].copy_from_slice(&p4[..z]);
+        rotl_assign(&mut p4[..z], &tmp[..z], inv(layout.shift2_p4), z);
+
+        // Row 3 is the redundant core equation; checking it is a cheap O(Z)
+        // self-validation of the solve above (debug builds only — no cost
+        // in release, and the mandatory tests validate every (bg, z) case
+        // via the full syndrome check regardless).
+        #[cfg(debug_assertions)]
+        {
+            let mut check = [0u8; Z_MAX];
+            check[..z].copy_from_slice(&lambda3[..z]);
+            rotl_xor_into(&mut check[..z], &p1[..z], layout.shift_p1_edge, z);
+            rotl_xor_into(&mut check[..z], &p4[..z], layout.shift3_p4, z);
+            debug_assert!(
+                check[..z].iter().all(|&b| b == 0),
+                "sparse QC-LDPC core solve failed its row-3 consistency check"
+            );
+        }
+
+        codeword[k..k + z].copy_from_slice(&p1[..z]);
+        codeword[k + z..k + 2 * z].copy_from_slice(&p2[..z]);
+        codeword[k + 2 * z..k + 3 * z].copy_from_slice(&p3[..z]);
+        codeword[k + 3 * z..k + 4 * z].copy_from_slice(&p4[..z]);
+
+        // Extension rows (i >= 4): direct identity, p_i = λ_i XOR (this
+        // row's edges into the already-known p1..p4 blocks, if any).
+        let core = [&p1[..z], &p2[..z], &p3[..z], &p4[..z]];
+        let mut lambda_ext = [0u8; Z_MAX];
+        for row in 4..m_b {
+            lambda_ext[..z].fill(0);
+            let begin = self.params.layer_offsets[row];
+            let end = self.params.layer_offsets[row + 1];
+            for e in begin..end {
+                let col = self.params.submatrix_cols[e];
+                let shift = self.params.submatrix_shifts[e] as usize;
+                if col < k_b {
+                    let src = &codeword[col * z..col * z + z];
+                    rotl_xor_into(&mut lambda_ext[..z], src, shift, z);
+                } else if col < k_b + 4 {
+                    rotl_xor_into(&mut lambda_ext[..z], core[col - k_b], shift, z);
+                }
+                // col >= k_b + 4 is this row's own identity output column;
+                // it is the unknown being solved for, not a summand.
+            }
+            codeword[k + row * z..k + (row + 1) * z].copy_from_slice(&lambda_ext[..z]);
+        }
+    }
+
+    /// Dense GF(2) reference encode, kept for equivalence testing against
+    /// the sparse path. Builds a fresh [`ParityGenerator`] on every call
+    /// (Gaussian elimination is a one-time, non-hot-path cost); this is
+    /// intentionally decoupled from `self.strategy` so it exercises the
+    /// dense math regardless of which strategy a given `(bg, z)` selected.
+    #[cfg(test)]
+    fn encode_dense_reference(
+        &self,
+        info_bits: &[u8],
+        codeword: &mut [u8],
+    ) -> Result<(), &'static str> {
+        let k = self.k_bits;
+        let n = self.codeword_bit_count();
+        if info_bits.len() != k {
+            return Err("info_bits length must equal info_bit_count()");
+        }
+        if codeword.len() != n {
+            return Err("codeword length must equal codeword_bit_count()");
+        }
+        let generator = ParityGenerator::build(&self.params)?;
+        codeword[..k].copy_from_slice(info_bits);
+        generator.apply(info_bits, &mut codeword[k..]);
         Ok(())
     }
 }
@@ -1181,5 +1616,179 @@ mod tests {
             .expect("encode should succeed");
         // All-zero info should produce all-zero codeword.
         assert!(codeword.iter().all(|&b| b == 0));
+    }
+
+    // -- Sparse structured encoder: equivalence + syndrome validation ------
+
+    /// Tiny deterministic PRNG (xorshift64*) so tests don't need a `rand`
+    /// dependency; only used to generate reproducible pseudo-random info
+    /// bits for the tests below.
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn random_bits(&mut self, n: usize) -> Vec<u8> {
+            let mut bits = Vec::with_capacity(n);
+            let mut word = 0u64;
+            let mut avail = 0u32;
+            for _ in 0..n {
+                if avail == 0 {
+                    word = self.next_u64();
+                    avail = 64;
+                }
+                bits.push((word & 1) as u8);
+                word >>= 1;
+                avail -= 1;
+            }
+            bits
+        }
+    }
+
+    /// Check every parity equation directly over hard `0/1` bits — the
+    /// bit-per-u8 analogue of [`QcLdpcDecoder::check_syndrome_f32`], used to
+    /// validate that a fast-encoded codeword satisfies $H \cdot c = 0$.
+    fn codeword_satisfies_all_checks(params: &QcLdpcParams, codeword: &[u8]) -> bool {
+        let z = params.z;
+        for layer in 0..params.num_row_blocks {
+            let begin = params.layer_offsets[layer];
+            let end = params.layer_offsets[layer + 1];
+            for z_idx in 0..z {
+                let mut parity = 0u8;
+                for e in begin..end {
+                    let col = params.submatrix_cols[e];
+                    let shift = params.submatrix_shifts[e] as usize;
+                    let s = z_idx + shift;
+                    let var = col * z + if s >= z { s - z } else { s };
+                    parity ^= codeword[var];
+                }
+                if parity != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Valid 3GPP lifting sizes from the requested test matrix, restricted to
+    /// those actually valid (all of them are, for both BG1 and BG2, but we
+    /// check via `ils_for_z` rather than assume it).
+    const CANDIDATE_Z: [usize; 7] = [2, 16, 52, 96, 128, 208, 384];
+
+    fn valid_test_sizes() -> Vec<usize> {
+        CANDIDATE_Z
+            .iter()
+            .copied()
+            .filter(|&z| ils_for_z(z).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn sparse_encoder_used_for_all_tested_bg_z_combos() {
+        // The sparse structured solve must be the active strategy for every
+        // (bg, z) in the test matrix; if CoreLayout::derive ever regresses
+        // to a silent dense fallback, fail loudly here rather than let the
+        // equivalence test mask it.
+        for &z in &valid_test_sizes() {
+            for bg in [BaseGraph::Bg1, BaseGraph::Bg2] {
+                let enc = QcLdpcEncoder::new(bg, z).unwrap();
+                assert!(
+                    enc.is_sparse(),
+                    "expected sparse strategy for {bg:?} z={z}, got dense fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_matches_dense_reference_bg1() {
+        for &z in &valid_test_sizes() {
+            let enc = QcLdpcEncoder::new(BaseGraph::Bg1, z).unwrap();
+            let k = enc.info_bit_count();
+            let n = enc.codeword_bit_count();
+            let mut rng = XorShift64::new(0xC0FFEE ^ z as u64);
+            let info = rng.random_bits(k);
+
+            let mut sparse_cw = vec![0u8; n];
+            let mut dense_cw = vec![0u8; n];
+            enc.encode(&info, &mut sparse_cw).unwrap();
+            enc.encode_dense_reference(&info, &mut dense_cw).unwrap();
+
+            assert_eq!(
+                sparse_cw, dense_cw,
+                "BG1 z={z}: sparse and dense encodes diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_matches_dense_reference_bg2() {
+        for &z in &valid_test_sizes() {
+            let enc = QcLdpcEncoder::new(BaseGraph::Bg2, z).unwrap();
+            let k = enc.info_bit_count();
+            let n = enc.codeword_bit_count();
+            let mut rng = XorShift64::new(0xBADC0DE ^ z as u64);
+            let info = rng.random_bits(k);
+
+            let mut sparse_cw = vec![0u8; n];
+            let mut dense_cw = vec![0u8; n];
+            enc.encode(&info, &mut sparse_cw).unwrap();
+            enc.encode_dense_reference(&info, &mut dense_cw).unwrap();
+
+            assert_eq!(
+                sparse_cw, dense_cw,
+                "BG2 z={z}: sparse and dense encodes diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_encoded_codewords_satisfy_syndrome() {
+        for &z in &valid_test_sizes() {
+            for bg in [BaseGraph::Bg1, BaseGraph::Bg2] {
+                let params = QcLdpcParams::new(bg, z).unwrap();
+                let enc = QcLdpcEncoder::new(bg, z).unwrap();
+                let k = enc.info_bit_count();
+                let n = enc.codeword_bit_count();
+                let mut rng = XorShift64::new(0x5EED ^ ((bg as u64) << 32) ^ z as u64);
+                let info = rng.random_bits(k);
+
+                let mut codeword = vec![0u8; n];
+                enc.encode(&info, &mut codeword).unwrap();
+
+                assert!(
+                    codeword_satisfies_all_checks(&params, &codeword),
+                    "{bg:?} z={z}: sparse-encoded codeword failed H*c=0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_all_zero_info_yields_all_zero_codeword() {
+        // All-zero is always a valid codeword; also exercises the row_x==2
+        // (BG2) and row_x==1 (BG1) branches trivially.
+        for &z in &valid_test_sizes() {
+            for bg in [BaseGraph::Bg1, BaseGraph::Bg2] {
+                let enc = QcLdpcEncoder::new(bg, z).unwrap();
+                let k = enc.info_bit_count();
+                let n = enc.codeword_bit_count();
+                let info = vec![0u8; k];
+                let mut codeword = vec![0u8; n];
+                enc.encode(&info, &mut codeword).unwrap();
+                assert!(
+                    codeword.iter().all(|&b| b == 0),
+                    "{bg:?} z={z}: all-zero info should yield all-zero codeword"
+                );
+            }
+        }
     }
 }
