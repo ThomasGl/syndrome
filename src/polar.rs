@@ -278,145 +278,299 @@ impl PolarEncoder {
 // Successive Cancellation decoder
 // ---------------------------------------------------------------------------
 
-/// Compute the $f$ combining LLR:
+/// Branch-free $f$ combine kernel over equal-length contiguous slices:
 ///   $f(a, b) = \text{sgn}(a)\text{sgn}(b)\min(|a|, |b|)$ (min-sum approximation).
+///
+/// Computed with bit tricks instead of comparison branches: the sign of the
+/// result is the XOR of `a`'s and `b`'s sign bits (`to_bits() ^ to_bits()`
+/// masked to bit 31), and the magnitude is `min(|a|, |b|)`, both of which
+/// LLVM lowers to branch-free instructions (`andps`/`minps` and friends), so
+/// a plain loop over slices auto-vectorizes into packed SIMD ops without any
+/// architecture-specific code.
+///
+/// # Arguments
+///
+/// * `a`, `b` - Equal-length LLR slices (the two halves of a decode-tree
+///   node's input LLRs).
+/// * `out` - Output slice, same length as `a`/`b`.
 #[inline]
-fn combine_f(a: f32, b: f32) -> f32 {
-    let sign = if (a < 0.0) ^ (b < 0.0) { -1.0f32 } else { 1.0 };
-    sign * a.abs().min(b.abs())
+fn f_kernel(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    const SIGN_MASK: u32 = 0x8000_0000;
+    for ((&av, &bv), ov) in a.iter().zip(b.iter()).zip(out.iter_mut()) {
+        let sign = (av.to_bits() ^ bv.to_bits()) & SIGN_MASK;
+        let abs_min = av.abs().min(bv.abs());
+        *ov = f32::from_bits(abs_min.to_bits() | sign);
+    }
 }
 
-/// Compute the $g$ combining LLR:
+/// Branch-free $g$ combine kernel over equal-length contiguous slices:
 ///   $g(a, b, \hat{u}) = b + (1 - 2\hat{u}) \cdot a$
+///
+/// `u_hat` is 0/1, so $(1 - 2\hat u)$ is exactly $\pm 1$: instead of a
+/// multiply, `a`'s sign bit is XOR-ed with `u_hat` shifted into bit 31
+/// (flipping `a`'s sign iff `u_hat = 1`), then added to `b` -- a bitwise op
+/// plus a float add, both branch-free and auto-vectorizable.
+///
+/// # Arguments
+///
+/// * `a`, `b` - Equal-length LLR slices (the two halves of a decode-tree
+///   node's input LLRs).
+/// * `u_hat` - Equal-length hard-decision slice (the partial sum, see
+///   [`sc_decode_recursive`]'s doc comment).
+/// * `out` - Output slice, same length as `a`/`b`/`u_hat`.
 #[inline]
-fn combine_g(a: f32, b: f32, u_hat: u8) -> f32 {
-    b + (1.0 - 2.0 * u_hat as f32) * a
+fn g_kernel(a: &[f32], b: &[f32], u_hat: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), u_hat.len());
+    debug_assert_eq!(a.len(), out.len());
+    for (((&av, &bv), &u), ov) in a.iter().zip(b.iter()).zip(u_hat.iter()).zip(out.iter_mut()) {
+        let flip = (u as u32) << 31;
+        let signed_a = f32::from_bits(av.to_bits() ^ flip);
+        *ov = bv + signed_a;
+    }
+}
+
+/// XOR-combine two adjacent, equal-length halves of a partial-sum ("beta")
+/// buffer in place: `block[i] ^= block[half + i]` for `i in 0..half`, then
+/// `block[half..]` is left untouched.
+///
+/// This is exactly the *last* butterfly step of [`polar_transform`] for a
+/// block of this size, reusing the two halves' own (already fully
+/// transformed, by the recursive invariant documented on
+/// [`sc_decode_recursive`]) partial sums instead of re-deriving them from
+/// scratch. A tight XOR loop over `u8` slices auto-vectorizes into packed
+/// byte XORs.
+#[inline]
+fn beta_combine(block: &mut [u8]) {
+    let half = block.len() / 2;
+    let (left, right) = block.split_at_mut(half);
+    for (l, &r) in left.iter_mut().zip(right.iter()) {
+        *l ^= r;
+    }
+}
+
+/// Preallocated per-`decode_sc`-call scratch: a single flat LLR buffer
+/// covering every recursion level below the root, plus the flat partial-sum
+/// ("beta") byte array -- both allocated **once per decode call** instead of
+/// once per recursion node. The previous implementation allocated three
+/// `Vec`s (`left_llr`, `right_llr`, `partial_sum`) at *every* internal node;
+/// profiling `decode_sc` at $(N,K)=(1024,512)$ showed that allocation churn
+/// alone accounted for roughly half of total decode time (see the module's
+/// perf notes), dwarfing the actual $f$/$g$/partial-sum arithmetic.
+struct ScScratch {
+    /// Flat LLR scratch for recursion levels `1..=levels` (the root's own
+    /// level-0 LLRs are the caller-supplied `llr` slice, held separately).
+    /// Laid out as `levels` consecutive blocks of `n` `f32`s each; level
+    /// `L`'s block is peeled off the front of the slice as recursion
+    /// descends (see `sc_decode_recursive`), so no level's block is ever
+    /// aliased by another level's mutable borrow.
+    llr: Vec<f32>,
+    /// Flat, in-place bottom-up partial-sum ("beta") byte array, `n` bytes,
+    /// addressed directly by absolute bit position (not peeled).
+    beta: Vec<u8>,
+}
+
+impl ScScratch {
+    fn new(n: usize, levels: usize) -> Self {
+        Self {
+            llr: vec![0.0f32; n * levels],
+            beta: vec![0u8; n],
+        }
+    }
 }
 
 /// Recursive SC decode over LLR array `llr` starting at `bit_start` for
 /// `length` bits.  Decoded bits are written into `decoded[bit_start..]`.
+///
+/// `level_scratch` holds the flat LLR storage for *this node's children and
+/// deeper* (`n` `f32`s per remaining level); it is peeled one level off the
+/// front at each recursive step via `split_at_mut`, so every level's block
+/// is a disjoint region of the one buffer allocated in [`ScScratch::new`] --
+/// no allocation happens inside the recursion itself.
 ///
 /// # Partial-sum propagation
 ///
 /// The encoder recursion is $x_1 = (u_1 \oplus u_2) \cdot G_{N/2}$,
 /// $x_2 = u_2 \cdot G_{N/2}$ (see `polar_transform`), so by GF(2) linearity
 /// $x_1 \oplus x_2 = (u_1 \cdot G_{N/2})$: it is $u_1$ *re-encoded* through
-/// the sub-code, not $u_1$ itself. That means `combine_f`'s output, and
-/// hence the left recursion's decoded result, lives in the *encoded* domain
-/// of $u_1$ -- so the correct "hard decision" to feed into `combine_g` for
-/// the right branch is the **partial sum**: $\hat u_1$ re-encoded through
-/// $G_{N/2}$ (i.e. `polar_transform` applied to the left sub-block's
-/// decoded output), not the raw decoded bits themselves. Because
-/// `polar_transform` is its own left-inverse composed with itself in this
-/// role (re-running the same butterfly reproduces the encoded partial
-/// sums), no separate combine step is needed afterwards -- `decoded[]` is
-/// final as soon as both children return. Skipping the re-encode (i.e.
-/// passing `decoded[bit_start + i]` straight into `combine_g`) is invisible
-/// whenever $u_1 \equiv u_1 \cdot G_{N/2}$, which holds for the all-zero
-/// and single-flag info vectors (small Hamming weight collapses under the
-/// XOR-heavy transform), but corrupts most patterns of weight $\geq 2$.
+/// the sub-code, not $u_1$ itself. That means `f_kernel`'s output, and hence
+/// the left recursion's decoded result, lives in the *encoded* domain of
+/// $u_1$ -- so the correct "hard decision" to feed into `g_kernel` for the
+/// right branch is the **partial sum**: $\hat u_1$ re-encoded through
+/// $G_{N/2}$, not the raw decoded bits themselves.
+///
+/// ## Bottom-up combine (avoiding $O(N \log^2 N)$)
+///
+/// Naively recomputing that re-encode via a fresh call to `polar_transform`
+/// at *every* internal node costs $O(m \log m)$ at a node covering $m$
+/// bits, and summed over the whole tree that is $O(N \log^2 N)$ total --
+/// asymptotically worse than the $O(N \log N)$ $f$/$g$ steps, and it
+/// dominated measured runtime (see `ScScratch`'s doc). Because
+/// `polar_transform` is GF(2)-*linear* (pure XOR, no data dependence beyond
+/// bit values), $\text{transform}(a \oplus b) = \text{transform}(a) \oplus
+/// \text{transform}(b)$. Applying that identity to the encoder recursion
+/// means: if `beta[bit_start..+half]` and `beta[bit_start+half..+length]`
+/// already hold the fully re-encoded ("beta") values for the left and right
+/// children *by the time both children's recursive calls return* (an
+/// invariant maintained inductively -- true trivially at a leaf, where
+/// $G_1$ is the identity, and preserved by the `beta_combine` call at the
+/// end of this function), then this node's own beta is simply
+/// `beta_L ^ beta_R` for the first half and `beta_R` unchanged for the
+/// second -- one `O(half)` XOR pass (`beta_combine`), not a fresh
+/// `O(half log half)` transform. Total cost over the whole tree drops back
+/// to $O(N \log N)$. Skipping this combine (or re-introducing the naive
+/// re-encode) is invisible for the all-zero and single-flag info vectors,
+/// since re-encoding low-weight vectors is close to a no-op, but corrupts
+/// most patterns of weight $\geq 2$ -- exactly the case the exhaustive
+/// tests below exist to catch.
 fn sc_decode_recursive(
     llr: &[f32],
     decoded: &mut [u8],
+    beta: &mut [u8],
     is_frozen: &[bool],
     bit_start: usize,
     length: usize,
-    // LLR workspace: pre-allocated to avoid re-alloc in recursion.
-    workspace: &mut Vec<Vec<f32>>,
-    level: usize,
+    level_scratch: &mut [f32],
+    n: usize,
 ) {
     if length == 1 {
-        let val = llr[0];
         let bit_pos = bit_start;
-        decoded[bit_pos] = if is_frozen[bit_pos] {
+        let bit = if is_frozen[bit_pos] {
             0
         } else {
-            (val < 0.0) as u8
+            (llr[0] < 0.0) as u8
         };
+        decoded[bit_pos] = bit;
+        beta[bit_pos] = bit; // G_1 is the identity: beta == decoded at a leaf.
         return;
     }
     let half = length / 2;
+    let (this_level, deeper) = level_scratch.split_at_mut(n);
 
-    // Compute left-child LLRs: f(a, b) for pairs.
-    if workspace.len() <= level {
-        workspace.push(vec![0.0f32; half]);
-    } else if workspace[level].len() < half {
-        workspace[level].resize(half, 0.0);
-    }
-    for i in 0..half {
-        workspace[level][i] = combine_f(llr[i], llr[i + half]);
-    }
-    let left_llr: Vec<f32> = workspace[level][..half].to_vec();
+    // f-branch: left child's LLRs, written into this level's block.
+    let (a, b) = llr.split_at(half);
+    f_kernel(a, b, &mut this_level[bit_start..bit_start + half]);
 
-    // Recurse left.
     sc_decode_recursive(
-        &left_llr,
+        &this_level[bit_start..bit_start + half],
         decoded,
+        beta,
         is_frozen,
         bit_start,
         half,
-        workspace,
-        level + 1,
+        deeper,
+        n,
     );
 
-    // Partial sum: re-encode the decoded left sub-block through G_{N/2} to
-    // recover the value actually combined into x1 (see doc comment above).
-    let mut partial_sum: Vec<u8> = decoded[bit_start..bit_start + half].to_vec();
-    polar_transform(&mut partial_sum);
+    // g-branch: right child's LLRs, using the partial sum (not the raw
+    // decoded left bits) as the hard-decision input. beta[bit_start..+half]
+    // already holds the left subtree's fully re-encoded output (see doc
+    // comment above), so no re-transform is needed here.
+    let (a, b) = llr.split_at(half);
+    let partial_sum = &beta[bit_start..bit_start + half];
+    g_kernel(
+        a,
+        b,
+        partial_sum,
+        &mut this_level[bit_start + half..bit_start + length],
+    );
 
-    // Compute right-child LLRs: g(a, b, u_hat) for pairs, using the partial
-    // sum (not the raw decoded left bits) as the hard-decision input.
-    let mut right_llr = vec![0.0f32; half];
-    for i in 0..half {
-        right_llr[i] = combine_g(llr[i], llr[i + half], partial_sum[i]);
-    }
-
-    // Recurse right.
     sc_decode_recursive(
-        &right_llr,
+        &this_level[bit_start + half..bit_start + length],
         decoded,
+        beta,
         is_frozen,
         bit_start + half,
         half,
-        workspace,
-        level + 1,
+        deeper,
+        n,
     );
+
+    // This node's own partial sum (needed by its parent, if any): combine
+    // the two children's already-transformed halves in place.
+    beta_combine(&mut beta[bit_start..bit_start + length]);
 }
 
 // ---------------------------------------------------------------------------
 // SCL decoder (list size L)
 // ---------------------------------------------------------------------------
 
+/// Per-level offsets into [`ScPath::llr_flat`], shared read-only across the
+/// whole path list for one `decode_scl` call (computed once, not per path).
+///
+/// Level `lvl` covers `n >> lvl` elements, addressed **locally** (0-based,
+/// relative to whichever node is currently occupying that level -- not by
+/// the node's absolute `bit_start`): the decode tree is walked depth-first,
+/// so at most one node per level is "live" at any instant, and a level's
+/// block is safely reused (overwritten) for the next sibling once the
+/// previous occupant's subtree has returned. This keeps the flat buffer at
+/// `sum_{l=0}^{levels} (n >> l) = 2n - 1` elements total (matching the
+/// original per-level `Vec<Vec<f32>>`'s total memory) instead of `n *
+/// (levels + 1)` (which local-vs-absolute confusion would otherwise cost --
+/// a 1024-length code has 11 levels, so that difference is the whole
+/// ballgame for how much a path-fork clone has to copy).
+fn scl_level_offsets(n: usize, levels: usize) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(levels + 1);
+    let mut acc = 0usize;
+    for lvl in 0..=levels {
+        offsets.push(acc);
+        acc += n >> lvl;
+    }
+    offsets
+}
+
 /// One path in the Successive Cancellation List decoder.
 ///
-/// `llr_levels[lvl]` holds this path's own LLR array for whichever decode
-/// tree node is currently being visited at recursion depth `lvl` (sized
-/// `n >> lvl`, which is correct for *every* node at that depth since the
-/// tree is a perfectly balanced binary split). One buffer per *level*
-/// (rather than per node) is what lets a forked path carry its LLR history
-/// through further recursion for free: cloning a path deep-copies
-/// `llr_levels`, so every survivor keeps its own correct view of the LLRs
-/// it will need once it reaches this level's `g` branch, no matter how much
-/// list forking/pruning happened underneath in the meantime.
+/// `llr_flat` holds this path's LLR arrays for *every* recursion level in
+/// one flat buffer, laid out via [`scl_level_offsets`] (level `lvl`'s block
+/// is `llr_flat[offsets[lvl]..offsets[lvl] + (n >> lvl)]`, addressed
+/// locally -- see that function's doc for why). This is a flat SoA layout
+/// rather than a `Vec<Vec<f32>>` per CLAUDE.md's flat-memory-layout
+/// guidance, and it lets a fork clone the whole LLR history with one
+/// contiguous copy instead of `levels + 1` separate small-`Vec` copies.
+/// Keeping every level (rather than peeling levels off as
+/// `sc_decode_recursive` does) is what lets a forked path carry its LLR
+/// history through further recursion for free: cloning a path deep-copies
+/// `llr_flat` verbatim, so every survivor keeps its own correct view of the
+/// LLRs it will need once it reaches this level's `g` branch, no matter how
+/// much list forking/pruning happened underneath in the meantime.
+///
+/// `beta` is this path's flat partial-sum byte array (see
+/// [`sc_decode_recursive`]'s doc comment for the bottom-up XOR-combine
+/// scheme it implements), addressed directly by absolute bit position (it
+/// is *not* reused across siblings -- ancestors need a subtree's beta long
+/// after that subtree has returned).
 #[derive(Clone)]
 struct ScPath {
     decoded: Vec<u8>,
+    beta: Vec<u8>,
     path_metric: f32,
-    llr_levels: Vec<Vec<f32>>,
+    llr_flat: Vec<f32>,
 }
 
 impl ScPath {
-    fn new(n: usize, levels: usize, initial_llr: &[f32]) -> Self {
-        let mut llr_levels = Vec::with_capacity(levels + 1);
-        llr_levels.push(initial_llr.to_vec());
-        for lvl in 1..=levels {
-            llr_levels.push(vec![0.0f32; n >> lvl]);
-        }
+    fn new(n: usize, initial_llr: &[f32], level_offsets: &[usize]) -> Self {
+        let levels = level_offsets.len() - 1;
+        let total = level_offsets[levels] + (n >> levels);
+        let mut llr_flat = vec![0.0f32; total];
+        llr_flat[..n].copy_from_slice(initial_llr);
         Self {
             decoded: vec![0u8; n],
+            beta: vec![0u8; n],
             path_metric: 0.0,
-            llr_levels,
+            llr_flat,
         }
+    }
+
+    /// This path's LLR slice for the node currently occupying recursion
+    /// `level`, of `length` elements (addressed locally -- see
+    /// [`scl_level_offsets`]).
+    #[inline]
+    fn llr_at(&self, level_offsets: &[usize], level: usize, length: usize) -> &[f32] {
+        let base = level_offsets[level];
+        &self.llr_flat[base..base + length]
     }
 }
 
@@ -424,55 +578,69 @@ impl ScPath {
 ///
 /// Mirrors `sc_decode_recursive`'s $f$/$g$/partial-sum structure (see its
 /// doc comment for the derivation of why the left sub-block must be
-/// re-encoded through $G_{N/2}$ before it can feed `combine_g`), generalised
-/// to a list of candidate paths:
+/// re-encoded through $G_{N/2}$ before it can feed `g_kernel`, and for the
+/// $O(N \log N)$ bottom-up XOR-combine that avoids re-running
+/// `polar_transform` at every node), generalised to a list of candidate
+/// paths:
 ///
-/// - `path.llr_levels[level][..length]` must already hold path `p`'s own
-///   LLR array for *this* node (the root call gets it from `ScPath::new`;
-///   every other call is populated by its parent immediately before
-///   recursing).
+/// - `path.llr_at(level_offsets, level, length)` must already hold path
+///   `p`'s own LLR array for *this* node, addressed **locally** (0-based;
+///   see [`scl_level_offsets`]) -- the root call gets it from
+///   `ScPath::new`; every other call is populated by its parent immediately
+///   before recursing.
 /// - At a leaf: frozen bits force `decoded[bit_start] = 0`; info bits fork
 ///   every current path into `0` and `1` candidates, then the whole list is
-///   sorted by path metric and truncated to `list_size`.
-/// - At an internal node: $f$-LLRs are computed per path into
-///   `llr_levels[level + 1]` and the left subtree recurses -- which may
+///   sorted by path metric and truncated to `list_size`. `beta[bit_start]`
+///   (absolute-addressed, unlike the LLR levels) is set to the same hard
+///   decision -- a leaf's partial sum is itself, since $G_1$ is the
+///   identity.
+/// - At an internal node: $f$-LLRs are computed per path into level
+///   `level + 1`'s block and the left subtree recurses -- which may
 ///   fork/reorder/prune `paths`. Crucially, every surviving path (whatever
-///   its lineage) still carries its own untouched `llr_levels[level]`
-///   (clones copy it verbatim, and nothing below level `level+1` ever
-///   writes to it), so the $g$-LLRs for the right subtree can be computed
-///   correctly regardless of how the list changed underneath.
-/// - Before computing the $g$-branch, each path's decoded left sub-block is
-///   re-encoded (`polar_transform`) into its own partial-sum buffer; that,
-///   not the raw decoded bits, is what `combine_g` needs.
+///   its lineage) still carries its own untouched level-`level` block
+///   (clones copy `llr_flat` verbatim, and nothing below level `level + 1`
+///   ever writes to level `level`), so the $g$-LLRs for the right subtree
+///   can be computed correctly regardless of how the list changed
+///   underneath. By the same inductive invariant as `sc_decode_recursive`,
+///   `path.beta[bit_start..+half]` holds the left subtree's fully
+///   re-encoded partial sum as soon as the left recursive call returns, so
+///   no re-transform is needed before the $g$-branch. After the right
+///   recursive call returns, each surviving path's own partial sum is
+///   folded together with one `beta_combine` XOR pass, maintaining the
+///   invariant for this node's parent.
 fn scl_decode_recursive(
     is_frozen: &[bool],
     bit_start: usize,
     length: usize,
     level: usize,
     list_size: usize,
+    level_offsets: &[usize],
     paths: &mut Vec<ScPath>,
 ) {
     if length == 1 {
         let bit_pos = bit_start;
         if is_frozen[bit_pos] {
             for path in paths.iter_mut() {
-                let bit_llr = path.llr_levels[level][0];
+                let bit_llr = path.llr_at(level_offsets, level, 1)[0];
                 path.decoded[bit_pos] = 0;
+                path.beta[bit_pos] = 0;
                 path.path_metric += 0.0_f32.max(-bit_llr); // ln(1 + e^-|llr|) ≈ 0
             }
         } else {
             // Info bit: fork every path into bit=0 and bit=1 candidates.
             let mut forked: Vec<ScPath> = Vec::with_capacity(paths.len() * 2);
             for path in paths.iter() {
-                let bit_llr = path.llr_levels[level][0];
+                let bit_llr = path.llr_at(level_offsets, level, 1)[0];
 
                 let mut p0 = path.clone();
                 p0.decoded[bit_pos] = 0;
+                p0.beta[bit_pos] = 0;
                 p0.path_metric += 0.0_f32.max(-bit_llr);
                 forked.push(p0);
 
                 let mut p1 = path.clone();
                 p1.decoded[bit_pos] = 1;
+                p1.beta[bit_pos] = 1;
                 p1.path_metric += 0.0_f32.max(bit_llr);
                 forked.push(p1);
             }
@@ -484,34 +652,43 @@ fn scl_decode_recursive(
     }
 
     let half = length / 2;
+    let this_base = level_offsets[level];
+    let next_base = level_offsets[level + 1];
 
     // f-branch, computed per path (a path may already have forked away
-    // from its siblings deeper in an earlier subtree).
+    // from its siblings deeper in an earlier subtree). Local addressing:
+    // this level's block starts at `this_base`, spans `length`; the next
+    // level's block starts at `next_base`, spans `half` (reused below for
+    // the g-branch once the left recursion has fully consumed it).
     for path in paths.iter_mut() {
-        for i in 0..half {
-            let a = path.llr_levels[level][i];
-            let b = path.llr_levels[level][i + half];
-            path.llr_levels[level + 1][i] = combine_f(a, b);
-        }
+        let (head, tail) = path.llr_flat.split_at_mut(next_base);
+        let src = &head[this_base..this_base + length];
+        let (a, b) = src.split_at(half);
+        f_kernel(a, b, &mut tail[..half]);
     }
 
-    scl_decode_recursive(is_frozen, bit_start, half, level + 1, list_size, paths);
+    scl_decode_recursive(
+        is_frozen,
+        bit_start,
+        half,
+        level + 1,
+        list_size,
+        level_offsets,
+        paths,
+    );
 
     // g-branch: needs each surviving path's own partial sum from the left
-    // subtree (the left decoded bits re-encoded through G_{N/2}), not the
-    // raw decoded bits themselves -- see `sc_decode_recursive`'s doc.
-    // `llr_levels[level]` is exactly this node's input array and is
-    // untouched by the recursion above (which only ever writes to level+1
-    // and deeper), so it's still valid here for every surviving (possibly
-    // forked) path.
+    // subtree -- see doc comment above. `path.beta[bit_start..+half]` is
+    // already correct by the recursive invariant, and level `level`'s LLR
+    // block is untouched by the recursion above (which only ever writes to
+    // level `level + 1` and deeper), so it's still valid here for every
+    // surviving (possibly forked) path.
     for path in paths.iter_mut() {
-        let mut partial_sum: Vec<u8> = path.decoded[bit_start..bit_start + half].to_vec();
-        polar_transform(&mut partial_sum);
-        for i in 0..half {
-            let a = path.llr_levels[level][i];
-            let b = path.llr_levels[level][i + half];
-            path.llr_levels[level + 1][i] = combine_g(a, b, partial_sum[i]);
-        }
+        let (head, tail) = path.llr_flat.split_at_mut(next_base);
+        let src = &head[this_base..this_base + length];
+        let (a, b) = src.split_at(half);
+        let partial_sum = &path.beta[bit_start..bit_start + half];
+        g_kernel(a, b, partial_sum, &mut tail[..half]);
     }
 
     scl_decode_recursive(
@@ -520,8 +697,15 @@ fn scl_decode_recursive(
         half,
         level + 1,
         list_size,
+        level_offsets,
         paths,
     );
+
+    // This node's own partial sum (needed by its parent, if any): combine
+    // the two children's already-transformed halves in place, per path.
+    for path in paths.iter_mut() {
+        beta_combine(&mut path.beta[bit_start..bit_start + length]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -627,16 +811,18 @@ impl PolarDecoder {
             });
         }
 
+        let levels = self.n.trailing_zeros() as usize;
         let mut decoded = vec![0u8; self.n];
-        let mut workspace: Vec<Vec<f32>> = Vec::new();
+        let mut scratch = ScScratch::new(self.n, levels);
         sc_decode_recursive(
             llr,
             &mut decoded,
+            &mut scratch.beta,
             &self.is_frozen,
             0,
             self.n,
-            &mut workspace,
-            0,
+            &mut scratch.llr,
+            self.n,
         );
 
         // Extract info bits.
@@ -687,14 +873,23 @@ impl PolarDecoder {
         }
 
         let levels = self.n.trailing_zeros() as usize;
+        let level_offsets = scl_level_offsets(self.n, levels);
         // Initialise one path.
-        let mut paths: Vec<ScPath> = vec![ScPath::new(self.n, levels, llr)];
+        let mut paths: Vec<ScPath> = vec![ScPath::new(self.n, llr, &level_offsets)];
 
         // Walk the decode tree once, forking/pruning the whole path list at
         // each information-bit leaf (see `scl_decode_recursive`'s doc for why
         // this must follow the same f/g/combine recursion as `decode_sc`
         // rather than a flat left-to-right bit scan).
-        scl_decode_recursive(&self.is_frozen, 0, self.n, 0, self.list_size, &mut paths);
+        scl_decode_recursive(
+            &self.is_frozen,
+            0,
+            self.n,
+            0,
+            self.list_size,
+            &level_offsets,
+            &mut paths,
+        );
 
         // Select the best CRC-passing path, or the best path if none pass.
         let best = if let Some(ref crc_eng) = self.crc {
