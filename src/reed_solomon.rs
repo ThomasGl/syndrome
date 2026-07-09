@@ -241,7 +241,7 @@ impl ReedSolomon {
     ///
     /// For each coefficient, decomposes the 256-byte GF multiply table into two
     /// 16-byte nibble tables and applies them 32 bytes at a time via VPSHUFB.
-    /// Falls back to [`encode_with_tables_chunked`] if AVX2 is not available or
+    /// Falls back to [`ReedSolomon::encode_with_tables_chunked`] if AVX2 is not available or
     /// `precompute_mul_tables` was not called.
     ///
     /// Requires `precompute_mul_tables()` to have been called first.
@@ -491,6 +491,29 @@ impl ReedSolomon {
     /// `Ok(())` is returned. Requires that the number of missing data shards
     /// is <= `parity_shards` and that at least that many parity shards are
     /// present.
+    ///
+    /// # Performance
+    ///
+    /// The $O(p^3)$ matrix inversion is negligible for the small erasure
+    /// counts this decoder targets ($p \le$ `parity_shards`, typically a
+    /// handful). The dominant cost is the reconstruction multiply, which is
+    /// $O(p^2 \cdot \text{shard\_len})$ GF(256) multiply-accumulates. That
+    /// step is routed through `Self::gf_muladd_bulk`, which — in order of
+    /// preference — uses the runtime-detected AVX2 VPSHUFB kernel (same
+    /// kernel [`Self::encode_with_avx2`] uses), falls back to the
+    /// precomputed 256×256 tables from [`Self::precompute_mul_tables`]
+    /// chunked 8 bytes at a time, and finally falls back to the plain
+    /// log/exp `mul` if tables were never precomputed. This mirrors the
+    /// table/SIMD machinery the encoder already uses instead of the
+    /// per-byte scalar loop the original implementation used.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `shards.len()` does not match `data_shards +
+    /// parity_shards`, if shard lengths are inconsistent, if too many data
+    /// shards are missing to recover, if not enough parity shards are
+    /// present, or if the erasure/parity selection yields a singular
+    /// recovery matrix.
     pub fn decode(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), &'static str> {
         let total = self.data_shards + self.parity_shards;
         if shards.len() != total {
@@ -545,23 +568,196 @@ impl ReedSolomon {
             }
         }
 
-        // invert A
+        // invert A. This is the only O(p^3) step and operates on a tiny m x m
+        // matrix (m <= parity_shards), so it is negligible next to the
+        // O(p^2 * shard_len) reconstruction multiply below.
         let inv_a = invert_matrix_gf(&a, m, &self.tables).ok_or("matrix not invertible")?;
 
-        // prepare buffers: known_contrib = for each selected parity row and each byte position,
-        // sum(coeff * known_data)
-        // then rhs = parity_row - known_contrib
+        // Bulk reconstruction, restructured as flat SoA buffers (m rows x
+        // shard_len) so the per-byte work happens inside `gf_muladd_bulk`
+        // (AVX2 / table / scalar) rather than a per-byte scalar loop with a
+        // heap allocation on every iteration. These two buffers are the only
+        // allocations in the whole reconstruction and are call-scoped
+        // scratch, not per-byte allocations.
+        let mut rhs = vec![0u8; m * shard_len];
+        for (r_idx, &pr) in parity_rows_sel.iter().enumerate() {
+            let row = &mut rhs[r_idx * shard_len..(r_idx + 1) * shard_len];
+            let parity_shard = shards[self.data_shards + pr].as_ref().unwrap();
+            row.copy_from_slice(parity_shard);
+            // subtract (== XOR, in GF(2^8)) known data contributions in bulk
+            for j in 0..self.data_shards {
+                if let Some(dj) = shards[j].as_ref() {
+                    let coef = self.coeffs[pr * self.data_shards + j];
+                    if coef != 0 {
+                        self.gf_muladd_bulk(dj, row, coef);
+                    }
+                }
+            }
+        }
 
-        // Create output buffers for missing shards
+        // outputs = invA * rhs, computed row-by-row as bulk multiply-accumulates
+        // instead of a per-byte dot product.
+        let mut outputs = vec![0u8; m * shard_len];
+        for c_idx in 0..m {
+            let out_row = &mut outputs[c_idx * shard_len..(c_idx + 1) * shard_len];
+            for r_idx in 0..m {
+                let coef = inv_a[c_idx * m + r_idx];
+                if coef == 0 {
+                    continue;
+                }
+                let rhs_row = &rhs[r_idx * shard_len..(r_idx + 1) * shard_len];
+                self.gf_muladd_bulk(rhs_row, out_row, coef);
+            }
+        }
+
+        // place outputs into shards
+        for (c_idx, &md) in missing_data.iter().enumerate() {
+            shards[md] = Some(outputs[c_idx * shard_len..(c_idx + 1) * shard_len].to_vec());
+        }
+
+        Ok(())
+    }
+
+    /// Bulk GF(256) multiply-accumulate: `dst[i] ^= GF_mul(coef, src[i])` for
+    /// all `i`, with zero heap allocation.
+    ///
+    /// Used by [`Self::decode`] to route its reconstruction multiply through
+    /// the same table/SIMD machinery [`Self::encode_with_avx2`] uses instead
+    /// of a per-byte scalar `mul` call. In order of preference:
+    ///
+    /// 1. Runtime-detected AVX2 VPSHUFB nibble kernel (requires
+    ///    [`Self::precompute_mul_tables`] to have been called and AVX2 to be
+    ///    available at runtime) — same kernel the encoder uses.
+    /// 2. Precomputed 256×256 multiplication tables, applied 8 bytes at a
+    ///    time (chunked for cache/ILP), when tables exist but AVX2 does not.
+    /// 3. Plain log/exp `mul`, byte by byte, when tables were never
+    ///    precomputed. This keeps `decode` correct and allocation-free even
+    ///    if the caller skipped `precompute_mul_tables`; call it first for
+    ///    the fast paths above.
+    ///
+    /// # Arguments
+    ///
+    /// * `src`  — source bytes.
+    /// * `dst`  — accumulator, XOR'd in place; must have the same length as `src`.
+    /// * `coef` — GF(256) coefficient to multiply by; a no-op if `0`.
+    #[inline]
+    fn gf_muladd_bulk(&self, src: &[u8], dst: &mut [u8], coef: u8) {
+        debug_assert_eq!(src.len(), dst.len());
+        if coef == 0 {
+            return;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(tables) = self.mul_tables.as_ref() {
+                if is_x86_feature_detected!("avx2") {
+                    let full_table = &tables[coef as usize];
+                    let mut lo_tbl = [0u8; 16];
+                    let mut hi_tbl = [0u8; 16];
+                    for v in 0usize..16 {
+                        lo_tbl[v] = full_table[v];
+                        hi_tbl[v] = full_table[v << 4];
+                    }
+                    // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
+                    unsafe {
+                        crate::simd_avx2::gf256_muladd_avx2(src, dst, &lo_tbl, &hi_tbl, full_table);
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Some(tables) = self.mul_tables.as_ref() {
+            let table = &tables[coef as usize];
+            let len = src.len();
+            let mut k = 0usize;
+            while k + 8 <= len {
+                let mut acc_bytes = [0u8; 8];
+                for t in 0..8 {
+                    acc_bytes[t] = table[src[k + t] as usize];
+                }
+                let acc_u64 = u64::from_ne_bytes(acc_bytes);
+                let d_u64 = u64::from_ne_bytes(dst[k..k + 8].try_into().unwrap());
+                let v = d_u64 ^ acc_u64;
+                dst[k..k + 8].copy_from_slice(&v.to_ne_bytes());
+                k += 8;
+            }
+            for t in k..len {
+                dst[t] ^= table[src[t] as usize];
+            }
+            return;
+        }
+
+        // No precomputed tables: fall back to plain log/exp multiply.
+        for k in 0..dst.len() {
+            dst[k] ^= self.tables.mul(coef, src[k]);
+        }
+    }
+
+    /// Reference erasure decoder kept for equivalence testing only: the
+    /// original per-byte scalar implementation (plain log/exp `mul`, no
+    /// tables, no SIMD) that [`Self::decode`] replaced. Semantics —
+    /// including error cases — are identical to `decode`; only the inner
+    /// multiply strategy differs.
+    #[cfg(test)]
+    fn decode_scalar_reference(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), &'static str> {
+        let total = self.data_shards + self.parity_shards;
+        if shards.len() != total {
+            return Err("shards length mismatch");
+        }
+
+        let shard_len = shards
+            .iter()
+            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        for s in shards.iter().filter_map(|s| s.as_ref()) {
+            if s.len() != shard_len {
+                return Err("shard size mismatch");
+            }
+        }
+
+        let mut missing_data = Vec::new();
+        for i in 0..self.data_shards {
+            if shards[i].is_none() {
+                missing_data.push(i);
+            }
+        }
+        if missing_data.is_empty() {
+            return Ok(());
+        }
+        let m = missing_data.len();
+        if m > self.parity_shards {
+            return Err("too many data erasures to recover");
+        }
+
+        let mut available_parity_idx = Vec::new();
+        for i in 0..self.parity_shards {
+            if shards[self.data_shards + i].is_some() {
+                available_parity_idx.push(i);
+            }
+        }
+        if available_parity_idx.len() < m {
+            return Err("not enough parity shards present");
+        }
+
+        let parity_rows_sel = &available_parity_idx[0..m];
+
+        let mut a = vec![0u8; m * m];
+        for (r_idx, &pr) in parity_rows_sel.iter().enumerate() {
+            for (c_idx, &md) in missing_data.iter().enumerate() {
+                a[r_idx * m + c_idx] = self.coeffs[pr * self.data_shards + md];
+            }
+        }
+
+        let inv_a = invert_matrix_gf(&a, m, &self.tables).ok_or("matrix not invertible")?;
+
         let mut outputs: Vec<Vec<u8>> = vec![vec![0u8; shard_len]; m];
 
-        // For each parity row r and byte k, compute rhs[r]
         for k in 0..shard_len {
             let mut rhs = vec![0u8; m];
             for (r_idx, &pr) in parity_rows_sel.iter().enumerate() {
                 let parity_shard = shards[self.data_shards + pr].as_ref().unwrap();
                 let mut acc = parity_shard[k];
-                // subtract known data contribution
                 for j in 0..self.data_shards {
                     if let Some(ref dj) = shards[j] {
                         let coef = self.coeffs[pr * self.data_shards + j];
@@ -574,14 +770,12 @@ impl ReedSolomon {
                 rhs[r_idx] = acc;
             }
 
-            // x = invA * rhs
             let x = multiply_matrix_vector_gf(&inv_a, m, &rhs, &self.tables);
             for (c_idx, val) in x.iter().enumerate() {
                 outputs[c_idx][k] = *val;
             }
         }
 
-        // place outputs into shards
         for (c_idx, &md) in missing_data.iter().enumerate() {
             shards[md] = Some(outputs[c_idx].clone());
         }
@@ -656,6 +850,9 @@ fn invert_matrix_gf(mat: &[u8], n: usize, tables: &GfTables) -> Option<Vec<u8>> 
     Some(inv)
 }
 
+/// Used only by [`ReedSolomon::decode_scalar_reference`], the pre-optimization
+/// reference implementation kept for equivalence testing.
+#[cfg(test)]
 fn multiply_matrix_vector_gf(mat: &[u8], n: usize, vecv: &[u8], tables: &GfTables) -> Vec<u8> {
     let mut out = vec![0u8; n];
     for r in 0..n {
@@ -715,5 +912,188 @@ mod tests {
             rs.decode(&mut shards).unwrap();
             assert_eq!(shards[0].as_ref().unwrap(), &data[0]);
         }
+    }
+
+    /// Deterministic xorshift PRNG byte stream (no external RNG dependency).
+    fn xorshift_bytes(len: usize, mut seed: u64) -> Vec<u8> {
+        if seed == 0 {
+            seed = 0xDEAD_BEEF_CAFE_F00D;
+        }
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 56) as u8
+            })
+            .collect()
+    }
+
+    /// Equivalence: the optimized `decode` (AVX2 / table / scalar bulk
+    /// multiply, per CLAUDE.md's zero-allocation-hot-path and flat-buffer
+    /// rules) must reproduce byte-for-byte both the pre-erasure data AND the
+    /// original per-byte scalar reference implementation, across many
+    /// (data, parity, shard_len, erasure-pattern, precompute) combinations.
+    #[test]
+    fn decode_matches_scalar_reference_and_original_data() {
+        let combos: &[(usize, usize, usize)] = &[
+            (4, 2, 1),
+            (4, 2, 7),
+            (2, 1, 3),
+            (3, 3, 33),
+            (6, 3, 1000),
+            (10, 4, 4096),
+            (10, 4, 4097), // not a multiple of 8/32: exercises SIMD/chunk tails
+            (1, 1, 5000),
+            (5, 5, 64),
+        ];
+
+        let mut seed = 0x1234_5678_9abc_def0u64;
+
+        for &(d, p, shard_len) in combos {
+            for precompute in [false, true] {
+                let mut rs = ReedSolomon::new(d, p);
+                if precompute {
+                    rs.precompute_mul_tables();
+                }
+
+                seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let data: Vec<Vec<u8>> = (0..d)
+                    .map(|j| {
+                        seed = seed.wrapping_add(j as u64 * 7 + 1);
+                        xorshift_bytes(shard_len, seed)
+                    })
+                    .collect();
+                let parity = rs.encode(&data);
+
+                // Try every erasure count from 1..=p, and a couple of index
+                // patterns per count (front-loaded and scattered).
+                for m in 1..=p {
+                    let patterns: Vec<Vec<usize>> = vec![
+                        (0..m).collect(),
+                        (0..m).map(|i| (i * 2) % d).collect(),
+                        (0..m).map(|i| d - 1 - (i % d)).collect(),
+                    ];
+                    for pattern in patterns {
+                        let mut missing: Vec<usize> = pattern;
+                        missing.sort_unstable();
+                        missing.dedup();
+                        if missing.len() != m || missing.iter().any(|&i| i >= d) {
+                            continue;
+                        }
+
+                        let build_shards = || -> Vec<Option<Vec<u8>>> {
+                            let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
+                            for dd in &data {
+                                shards.push(Some(dd.clone()));
+                            }
+                            for pp in &parity {
+                                shards.push(Some(pp.clone()));
+                            }
+                            for &i in &missing {
+                                shards[i] = None;
+                            }
+                            shards
+                        };
+
+                        let mut shards_new = build_shards();
+                        let mut shards_ref = build_shards();
+
+                        let res_new = rs.decode(&mut shards_new);
+                        let res_ref = rs.decode_scalar_reference(&mut shards_ref);
+
+                        assert!(
+                            res_new.is_ok(),
+                            "optimized decode failed for d={d} p={p} len={shard_len} missing={missing:?} precompute={precompute}"
+                        );
+                        assert!(
+                            res_ref.is_ok(),
+                            "reference decode failed for d={d} p={p} len={shard_len} missing={missing:?} precompute={precompute}"
+                        );
+
+                        for &i in &missing {
+                            assert_eq!(
+                                shards_new[i].as_ref().unwrap(),
+                                &data[i],
+                                "optimized decode mismatch vs original data: d={d} p={p} len={shard_len} missing={missing:?} precompute={precompute}"
+                            );
+                            assert_eq!(
+                                shards_new[i].as_ref().unwrap(),
+                                shards_ref[i].as_ref().unwrap(),
+                                "optimized decode mismatch vs scalar reference: d={d} p={p} len={shard_len} missing={missing:?} precompute={precompute}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Error-path parity: the optimized `decode` must return the same `Err`
+    /// cases as the scalar reference (length mismatch, too many erasures,
+    /// not enough parity shards present).
+    #[test]
+    fn decode_error_cases_match_reference() {
+        let rs = ReedSolomon::new(4, 2);
+        let data: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 1) as u8; 32]).collect();
+        let parity = rs.encode(&data);
+
+        // Wrong total length.
+        let mut too_short: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).take(3).collect();
+        assert_eq!(rs.decode(&mut too_short), Err("shards length mismatch"));
+        assert_eq!(
+            rs.decode_scalar_reference(&mut too_short),
+            Err("shards length mismatch")
+        );
+
+        // Too many data erasures (3 missing, only 2 parity shards).
+        let build = || -> Vec<Option<Vec<u8>>> {
+            let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
+            for d in &data {
+                shards.push(Some(d.clone()));
+            }
+            for p in &parity {
+                shards.push(Some(p.clone()));
+            }
+            shards[0] = None;
+            shards[1] = None;
+            shards[2] = None;
+            shards
+        };
+        let mut too_many_new = build();
+        let mut too_many_ref = build();
+        assert_eq!(
+            rs.decode(&mut too_many_new),
+            Err("too many data erasures to recover")
+        );
+        assert_eq!(
+            rs.decode_scalar_reference(&mut too_many_ref),
+            Err("too many data erasures to recover")
+        );
+
+        // Not enough parity shards present (2 data missing, only 1 parity present).
+        let build2 = || -> Vec<Option<Vec<u8>>> {
+            let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
+            for d in &data {
+                shards.push(Some(d.clone()));
+            }
+            for p in &parity {
+                shards.push(Some(p.clone()));
+            }
+            shards[0] = None;
+            shards[1] = None;
+            shards[4] = None; // drop one parity shard too
+            shards
+        };
+        let mut np_new = build2();
+        let mut np_ref = build2();
+        assert_eq!(
+            rs.decode(&mut np_new),
+            Err("not enough parity shards present")
+        );
+        assert_eq!(
+            rs.decode_scalar_reference(&mut np_ref),
+            Err("not enough parity shards present")
+        );
     }
 }
