@@ -33,7 +33,7 @@
 
 use crate::error::FecError;
 use crate::qc_ldpc::BaseGraph;
-use crate::rate_matching::rate_dematch_llr;
+use crate::rate_matching::RateMatchCache;
 
 /// HARQ soft-combining accumulator for one code block.
 ///
@@ -48,6 +48,12 @@ pub struct HarqBuffer {
     acc: Vec<f32>,
     /// Number of transmissions combined so far.
     tx_count: usize,
+    /// Rate-dematching index-table cache (see [`RateMatchCache`]): the
+    /// `(bg, z, qm, n_filler, e_bits)` key only changes across a retransmission
+    /// if the scheduler picks a new RV or modulation, so repeated `combine`
+    /// calls at a steady RV -- the common HARQ case -- reuse the same
+    /// scatter-index table instead of rebuilding it every call.
+    rm_cache: RateMatchCache,
 }
 
 impl HarqBuffer {
@@ -79,6 +85,7 @@ impl HarqBuffer {
             n_filler: 0,
             acc: vec![0.0f32; ncb],
             tx_count: 0,
+            rm_cache: RateMatchCache::new(),
         }
     }
 
@@ -101,8 +108,10 @@ impl HarqBuffer {
 
     /// Add a new received LLR vector into the accumulation buffer.
     ///
-    /// Internally calls [`rate_dematch_llr`] to scatter `e_llr` back to
-    /// circular-buffer positions, then adds into the accumulator.
+    /// Internally calls [`RateMatchCache::rate_dematch_llr_into`] (the
+    /// cached equivalent of [`crate::rate_matching::rate_dematch_llr`]) to
+    /// scatter `e_llr` back to circular-buffer positions, then adds into
+    /// the accumulator.
     ///
     /// # Arguments
     ///
@@ -114,7 +123,8 @@ impl HarqBuffer {
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`rate_dematch_llr`].
+    /// Propagates any error from [`RateMatchCache::rate_dematch_llr_into`]
+    /// (same conditions as [`crate::rate_matching::rate_dematch_llr`]).
     ///
     /// # Examples
     ///
@@ -140,7 +150,8 @@ impl HarqBuffer {
         } else {
             self.n_filler
         };
-        rate_dematch_llr(e_llr, &mut self.acc, rv, qm, self.bg, self.z, nf)?;
+        self.rm_cache
+            .rate_dematch_llr_into(e_llr, &mut self.acc, rv, qm, self.bg, self.z, nf)?;
         self.tx_count += 1;
         Ok(())
     }

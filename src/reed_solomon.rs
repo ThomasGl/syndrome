@@ -95,6 +95,16 @@ pub struct ReedSolomon {
     // optional multiplication tables indexed by coefficient value; stored as a
     // flat, contiguous Vec of fixed-size LUTs (no per-table heap indirection)
     mul_tables: Option<Vec<[u8; 256]>>,
+    // Companion 16-entry lo/hi nibble decompositions of `mul_tables`, one
+    // `[lo, hi]` pair per coefficient (256 x 32 B = 8 KiB total), consumed by
+    // the AVX2 VPSHUFB kernel. `nibbles[c][0][v] = GF_mul(c, v)` and
+    // `nibbles[c][1][v] = GF_mul(c, v << 4)` for `v` in `0..16`, exploiting
+    // GF(256) linearity: `GF_mul(c, x) = GF_mul(c, x & 0x0F) ^
+    // GF_mul(c, x & 0xF0)`. Previously these 32 bytes were re-derived from
+    // `mul_tables` inside `encode_with_avx2_inner`/`gf_muladd_bulk` on every
+    // (coefficient, row) pair per call; now they are built once alongside
+    // `mul_tables` and only indexed on the hot path.
+    nibble_tables: Option<Vec<[[u8; 16]; 2]>>,
 }
 
 impl ReedSolomon {
@@ -141,6 +151,7 @@ impl ReedSolomon {
             return;
         }
         let mut tables: Vec<[u8; 256]> = Vec::with_capacity(256);
+        let mut nibbles: Vec<[[u8; 16]; 2]> = Vec::with_capacity(256);
         for coef in 0u8..=255u8 {
             let mut tbl = [0u8; 256];
             if coef == 0 {
@@ -150,9 +161,21 @@ impl ReedSolomon {
                     tbl[v as usize] = self.tables.mul(coef, v);
                 }
             }
+            // Companion lo/hi nibble decomposition for the AVX2 VPSHUFB
+            // kernel (see the field doc on `nibble_tables`): built here,
+            // once per coefficient, instead of being re-derived from `tbl`
+            // on every hot-path call.
+            let mut lo = [0u8; 16];
+            let mut hi = [0u8; 16];
+            for v in 0usize..16 {
+                lo[v] = tbl[v];
+                hi[v] = tbl[v << 4];
+            }
             tables.push(tbl);
+            nibbles.push([lo, hi]);
         }
         self.mul_tables = Some(tables);
+        self.nibble_tables = Some(nibbles);
     }
 
     /// Encode using precomputed multiplication tables for coefficients.
@@ -363,6 +386,9 @@ impl ReedSolomon {
         let d = self.data_shards;
         let p = self.parity_shards;
         let tables = self.mul_tables.as_ref().unwrap();
+        // Built together with `mul_tables` in `precompute_mul_tables`, so
+        // this is always `Some` whenever `mul_tables` is.
+        let nibbles = self.nibble_tables.as_ref().unwrap();
         let shard_len = data[0].len();
         for b in parity_out.iter_mut().take(p * shard_len) {
             *b = 0;
@@ -376,21 +402,14 @@ impl ReedSolomon {
                     continue;
                 }
                 let full_table: &[u8; 256] = &tables[coef as usize];
+                // Precomputed 16-byte lo/hi nibble tables (see
+                // `nibble_tables`'s field doc) -- indexed, not rebuilt.
+                let [lo_tbl, hi_tbl] = &nibbles[coef as usize];
                 let parity_row = &mut parity_out[i * shard_len..i * shard_len + shard_len];
-
-                // Build 16-byte nibble tables from the full 256-byte GF table.
-                let mut lo_tbl = [0u8; 16];
-                let mut hi_tbl = [0u8; 16];
-                for v in 0usize..16 {
-                    lo_tbl[v] = full_table[v]; // GF_mul(coef, v)      for v in 0..16
-                    hi_tbl[v] = full_table[v << 4]; // GF_mul(coef, v<<4)   for v in 0..16
-                }
 
                 // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
                 unsafe {
-                    crate::simd_avx2::gf256_muladd_avx2(
-                        dj, parity_row, &lo_tbl, &hi_tbl, full_table,
-                    );
+                    crate::simd_avx2::gf256_muladd_avx2(dj, parity_row, lo_tbl, hi_tbl, full_table);
                 }
             }
         }
@@ -415,6 +434,7 @@ impl ReedSolomon {
             coeffs,
             tables,
             mul_tables: None,
+            nibble_tables: None,
         }
     }
 
@@ -751,15 +771,14 @@ impl ReedSolomon {
             if let Some(tables) = self.mul_tables.as_ref() {
                 if is_x86_feature_detected!("avx2") {
                     let full_table = &tables[coef as usize];
-                    let mut lo_tbl = [0u8; 16];
-                    let mut hi_tbl = [0u8; 16];
-                    for v in 0usize..16 {
-                        lo_tbl[v] = full_table[v];
-                        hi_tbl[v] = full_table[v << 4];
-                    }
+                    // Precomputed 16-byte lo/hi nibble tables (see
+                    // `nibble_tables`'s field doc) -- indexed, not rebuilt.
+                    // Always `Some` when `mul_tables` is (built together in
+                    // `precompute_mul_tables`).
+                    let [lo_tbl, hi_tbl] = &self.nibble_tables.as_ref().unwrap()[coef as usize];
                     // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
                     unsafe {
-                        crate::simd_avx2::gf256_muladd_avx2(src, dst, &lo_tbl, &hi_tbl, full_table);
+                        crate::simd_avx2::gf256_muladd_avx2(src, dst, lo_tbl, hi_tbl, full_table);
                     }
                     return;
                 }
@@ -1207,5 +1226,48 @@ mod tests {
             rs.decode_scalar_reference(&mut np_ref),
             Err(FecError::InvalidParam("not enough parity shards present"))
         );
+    }
+
+    /// Task-4 equivalence guard: `encode_with_avx2` (which consumes the
+    /// precomputed `nibble_tables` on AVX2 hosts) must produce parity
+    /// byte-identical to the plain scalar `encode_into` across many (data,
+    /// parity, shard_len) shapes, including lengths that are not multiples
+    /// of 32/8 (SIMD tail handling). On non-AVX2 hosts this still verifies
+    /// the table-chunked fallback against the scalar path.
+    #[test]
+    fn encode_avx2_nibble_tables_match_scalar() {
+        let combos: &[(usize, usize, usize)] = &[
+            (4, 2, 1),
+            (4, 2, 31),
+            (2, 1, 32),
+            (3, 3, 33),
+            (6, 3, 1000),
+            (10, 4, 4097), // not a multiple of 8/32: exercises SIMD tails
+            (5, 5, 64),
+        ];
+        let mut seed = 0xFEED_FACE_1234_5678u64;
+
+        for &(d, p, shard_len) in combos {
+            let mut rs = ReedSolomon::new(d, p);
+            rs.precompute_mul_tables();
+
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|_| {
+                    seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    xorshift_bytes(shard_len, seed)
+                })
+                .collect();
+            let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+
+            let mut parity_avx2 = vec![0u8; p * shard_len];
+            let mut parity_scalar = vec![0u8; p * shard_len];
+            rs.encode_with_avx2(&refs, &mut parity_avx2).unwrap();
+            rs.encode_into(&refs, &mut parity_scalar).unwrap();
+
+            assert_eq!(
+                parity_avx2, parity_scalar,
+                "AVX2 (precomputed nibble tables) vs scalar parity mismatch: d={d} p={p} shard_len={shard_len}"
+            );
+        }
     }
 }

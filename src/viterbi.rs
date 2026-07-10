@@ -98,6 +98,16 @@ struct ButterflyTables {
     out1_even: Vec<i32>,
     out0_odd: Vec<i32>,
     out1_odd: Vec<i32>,
+    /// $\pm 1$ branch-sign tables ($1 - 2 \cdot \mathrm{out}$) for the
+    /// soft-decision (max-log-MAP) AVX2 kernel, precomputed once here
+    /// (construction time) rather than once per [`ViterbiDecoder::decode_soft_avx2`]
+    /// call: they are a pure function of `out0_even`/`out1_even`/`out0_odd`/
+    /// `out1_odd`, which never change after construction, so recomputing
+    /// them on every decode call was pure waste.
+    sign0_even: Vec<f32>,
+    sign1_even: Vec<f32>,
+    sign0_odd: Vec<f32>,
+    sign1_odd: Vec<f32>,
 }
 
 impl ButterflyTables {
@@ -119,12 +129,22 @@ impl ButterflyTables {
                 out1_odd[b * half + j] = out1[s_odd * 2 + b] as i32;
             }
         }
+        let to_sign =
+            |out: &[i32]| -> Vec<f32> { out.iter().map(|&o| 1.0 - 2.0 * o as f32).collect() };
+        let sign0_even = to_sign(&out0_even);
+        let sign1_even = to_sign(&out1_even);
+        let sign0_odd = to_sign(&out0_odd);
+        let sign1_odd = to_sign(&out1_odd);
         ButterflyTables {
             half,
             out0_even,
             out1_even,
             out0_odd,
             out1_odd,
+            sign0_even,
+            sign1_even,
+            sign0_odd,
+            sign1_odd,
         }
     }
 }
@@ -420,6 +440,69 @@ fn default_generators(k: usize) -> (u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Decode scratch (preallocated, shared by all four decode paths)
+// ---------------------------------------------------------------------------
+
+/// Preallocated scratch shared by `decode_hard`/`decode_soft` (scalar and
+/// AVX2 variants), replacing the original per-call `vec![...; n_states]` /
+/// `vec![0u8; n_states * t_max]` allocations (mirrors the pattern already
+/// used by [`crate::turbo::TurboDecoder`]'s constructor-time scratch).
+///
+/// `cur_met_*`/`nxt_met_*` are exactly `n_states` long, fixed for the
+/// lifetime of a [`ViterbiDecoder`] (constraint length never changes after
+/// construction), so they are allocated once, here, and never resized.
+/// `traceback` is `n_states * t_max` long, and `t_max` (the frame's trellis
+/// length) varies call to call, so it instead **grows on demand**
+/// ([`ViterbiScratch::ensure_traceback`]): repeated calls at a steady frame
+/// length -- the common case for a streaming decoder processing same-size
+/// blocks -- allocate nothing after the first call; only a call needing a
+/// *longer* frame than any seen so far triggers a (one-time, amortized)
+/// growth.
+///
+/// Separate `u32`/`i32`/`f32` metric arrays are kept because the four
+/// decode paths use different metric domains (hard-decision Hamming
+/// distance is unsigned/`u32` in the scalar kernel and `i32` in the AVX2
+/// kernel -- see [`ViterbiDecoder::decode_hard_avx2`]'s doc comment for why
+/// they differ; soft-decision max-log-MAP is `f32` in both). `traceback` is
+/// `u8` in all four paths and is safe to share: only one decode call runs
+/// at a time (no concurrent aliasing) and each call fully overwrites every
+/// position it later reads before reading it.
+struct ViterbiScratch {
+    cur_met_u32: Vec<u32>,
+    nxt_met_u32: Vec<u32>,
+    cur_met_i32: Vec<i32>,
+    nxt_met_i32: Vec<i32>,
+    cur_met_f32: Vec<f32>,
+    nxt_met_f32: Vec<f32>,
+    traceback: Vec<u8>,
+}
+
+impl ViterbiScratch {
+    fn new(n_states: usize) -> Self {
+        Self {
+            cur_met_u32: vec![0u32; n_states],
+            nxt_met_u32: vec![0u32; n_states],
+            cur_met_i32: vec![0i32; n_states],
+            nxt_met_i32: vec![0i32; n_states],
+            cur_met_f32: vec![0.0f32; n_states],
+            nxt_met_f32: vec![0.0f32; n_states],
+            traceback: Vec::new(),
+        }
+    }
+
+    /// Ensure `traceback` holds at least `needed` bytes, growing (not
+    /// shrinking) it if the current call's frame is longer than any seen so
+    /// far. A no-op -- no allocation -- whenever `needed` is within the
+    /// buffer's already-grown length.
+    #[inline]
+    fn ensure_traceback(&mut self, needed: usize) {
+        if self.traceback.len() < needed {
+            self.traceback.resize(needed, 0u8);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public decoder struct
 // ---------------------------------------------------------------------------
 
@@ -432,6 +515,11 @@ pub struct ViterbiDecoder {
     /// Constraint length $K$.  The encoder register holds $K-1$ bits.
     pub constraint_length: usize,
     trellis: TrellisTable,
+    /// Preallocated ACS/traceback scratch (see [`ViterbiScratch`]). Behind a
+    /// `RefCell` because `decode_hard`/`decode_soft` take `&self` (preserving
+    /// their public signature); borrowing is uncontended (single-threaded,
+    /// non-reentrant use per call).
+    scratch: std::cell::RefCell<ViterbiScratch>,
 }
 
 impl ViterbiDecoder {
@@ -460,9 +548,12 @@ impl ViterbiDecoder {
     pub fn new(k: usize) -> Result<Self, FecError> {
         Self::check_k(k)?;
         let (g0, g1) = default_generators(k);
+        let trellis = TrellisTable::build(k, g0, g1);
+        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
-            trellis: TrellisTable::build(k, g0, g1),
+            trellis,
+            scratch,
         })
     }
 
@@ -480,9 +571,12 @@ impl ViterbiDecoder {
     /// `k > MAX_CONSTRAINT_LENGTH`.
     pub fn with_generators(k: usize, g0: u32, g1: u32) -> Result<Self, FecError> {
         Self::check_k(k)?;
+        let trellis = TrellisTable::build(k, g0, g1);
+        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
-            trellis: TrellisTable::build(k, g0, g1),
+            trellis,
+            scratch,
         })
     }
 
@@ -575,13 +669,19 @@ impl ViterbiDecoder {
         }
 
         const INF: u32 = u32::MAX / 2;
-        let mut cur_met = vec![INF; n_states];
-        let mut nxt_met = vec![INF; n_states];
-        cur_met[0] = 0;
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_u32.iter_mut().for_each(|m| *m = INF);
+        scratch.cur_met_u32[0] = 0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_u32,
+            nxt_met_u32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_u32.as_mut_slice(), nxt_met_u32.as_mut_slice());
 
         // traceback[t * n_states + s] = previous state that led to s at step t.
-        let mut traceback = vec![0u8; n_states * t_max];
-
         for t in 0..t_max {
             let r0 = coded[2 * t] & 1;
             let r1 = coded[2 * t + 1] & 1;
@@ -605,7 +705,7 @@ impl ViterbiDecoder {
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
-        self.traceback_from_zero(t_max, n_info, &traceback)
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
     /// AVX2-vectorised hard-decision decode for the K=7 (64-state) trellis.
@@ -639,11 +739,17 @@ impl ViterbiDecoder {
         // Generous headroom sentinel; see doc comment above for why `i32`
         // (not saturating, not `u16`) is safe here.
         const INF: i32 = i32::MAX / 4;
-        let mut cur_met = vec![INF; n_states];
-        let mut nxt_met = vec![INF; n_states];
-        cur_met[0] = 0;
-
-        let mut traceback = vec![0u8; n_states * t_max];
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_i32.iter_mut().for_each(|m| *m = INF);
+        scratch.cur_met_i32[0] = 0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_i32,
+            nxt_met_i32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_i32.as_mut_slice(), nxt_met_i32.as_mut_slice());
         let bfly = &self.trellis.bfly;
 
         for t in 0..t_max {
@@ -653,12 +759,12 @@ impl ViterbiDecoder {
             // SAFETY: caller guarantees AVX2 support (checked in
             // `decode_hard`/test callers); `bfly.half == 32` for n_states==64.
             unsafe {
-                avx2_acs::acs_step_hard(&cur_met, &mut nxt_met, row, bfly, r0, r1);
+                avx2_acs::acs_step_hard(cur_met, nxt_met, row, bfly, r0, r1);
             }
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
-        self.traceback_from_zero(t_max, n_info, &traceback)
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
     /// Soft-decision Viterbi decode (max-log-MAP branch metric).
@@ -706,11 +812,20 @@ impl ViterbiDecoder {
             return vec![];
         }
 
-        let mut cur_met = vec![f32::NEG_INFINITY; n_states];
-        let mut nxt_met = vec![f32::NEG_INFINITY; n_states];
-        cur_met[0] = 0.0;
-
-        let mut traceback = vec![0u8; n_states * t_max];
+        let mut scratch = self.scratch.borrow_mut();
+        scratch
+            .cur_met_f32
+            .iter_mut()
+            .for_each(|m| *m = f32::NEG_INFINITY);
+        scratch.cur_met_f32[0] = 0.0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
 
         for t in 0..t_max {
             let l0 = llr[2 * t];
@@ -736,7 +851,7 @@ impl ViterbiDecoder {
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
-        self.traceback_from_zero(t_max, n_info, &traceback)
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
     /// AVX2-vectorised soft-decision (max-log-MAP) decode for the K=7
@@ -767,21 +882,24 @@ impl ViterbiDecoder {
         }
 
         let bfly = &self.trellis.bfly;
-        // Precompute the +-1 branch-sign tables once per call (not once per
-        // bit): bm = sign0*l0 + sign1*l1 replaces the per-edge (1-2*out)*L
-        // scalar formula with a fused multiply-add over constant vectors.
-        let to_sign =
-            |out: &[i32]| -> Vec<f32> { out.iter().map(|&o| 1.0 - 2.0 * o as f32).collect() };
-        let sign0_even = to_sign(&bfly.out0_even);
-        let sign1_even = to_sign(&bfly.out1_even);
-        let sign0_odd = to_sign(&bfly.out0_odd);
-        let sign1_odd = to_sign(&bfly.out1_odd);
-
-        let mut cur_met = vec![f32::NEG_INFINITY; n_states];
-        let mut nxt_met = vec![f32::NEG_INFINITY; n_states];
-        cur_met[0] = 0.0;
-
-        let mut traceback = vec![0u8; n_states * t_max];
+        // bm = sign0*l0 + sign1*l1 replaces the per-edge (1-2*out)*L scalar
+        // formula with a fused multiply-add over constant vectors; the sign
+        // tables themselves are precomputed once at construction time (see
+        // `ButterflyTables::build`), not re-derived on every decode call.
+        let mut scratch = self.scratch.borrow_mut();
+        scratch
+            .cur_met_f32
+            .iter_mut()
+            .for_each(|m| *m = f32::NEG_INFINITY);
+        scratch.cur_met_f32[0] = 0.0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
 
         for t in 0..t_max {
             let l0 = llr[2 * t];
@@ -791,14 +909,14 @@ impl ViterbiDecoder {
             // `decode_soft`/test callers); `bfly.half == 32` for n_states==64.
             unsafe {
                 avx2_acs::acs_step_soft(
-                    &cur_met,
-                    &mut nxt_met,
+                    cur_met,
+                    nxt_met,
                     row,
                     bfly,
-                    &sign0_even,
-                    &sign1_even,
-                    &sign0_odd,
-                    &sign1_odd,
+                    &bfly.sign0_even,
+                    &bfly.sign1_even,
+                    &bfly.sign0_odd,
+                    &bfly.sign1_odd,
                     l0,
                     l1,
                 );
@@ -806,7 +924,7 @@ impl ViterbiDecoder {
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
-        self.traceback_from_zero(t_max, n_info, &traceback)
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
     /// Decode hard-decision coded bits (alias for [`ViterbiDecoder::decode_hard`]).

@@ -45,7 +45,7 @@ use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
 use crate::harq::HarqBuffer;
 use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
-use crate::rate_matching::rate_match;
+use crate::rate_matching::RateMatchCache;
 use crate::segmentation::{SegmentationParams, compute_segmentation, segment};
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,15 @@ pub struct DlSchEncoder {
     qm: usize,
     e_per_cb: usize,
     tb_size: usize,
+    /// Rate-matching index-table cache (see [`RateMatchCache`]). All `C`
+    /// code blocks of one `encode` call share the same `(bg, z, rv, qm,
+    /// n_filler, e_bits)` key, and repeated `encode` calls at a steady RV
+    /// (the common case between HARQ retransmissions) share it too, so this
+    /// is a struct member rather than a call-local temporary. `encode`
+    /// takes `&self` (preserving its public signature), so the cache lives
+    /// behind a `RefCell`; borrowing it is uncontended (single-threaded,
+    /// non-reentrant use) and adds no heap allocation of its own.
+    rm_cache: std::cell::RefCell<RateMatchCache>,
 }
 
 impl DlSchEncoder {
@@ -158,6 +167,7 @@ impl DlSchEncoder {
             qm,
             e_per_cb,
             tb_size,
+            rm_cache: std::cell::RefCell::new(RateMatchCache::new()),
         })
     }
 
@@ -215,13 +225,18 @@ impl DlSchEncoder {
         let n = enc.codeword_bit_count();
         let mut codeword = vec![0u8; n];
         let mut e_buf = vec![0u8; self.e_per_cb];
+        // All C code blocks share one (bg, z, rv, qm, n_filler, e_bits) key,
+        // so the rate-matching selection/interleave index table is built
+        // once (first iteration below) and reused verbatim for the rest --
+        // see `RateMatchCache`'s doc comment.
+        let mut rm_cache = self.rm_cache.borrow_mut();
 
         for (ci, cb) in cb_blocks.iter().enumerate() {
             // §5.3.2 — LDPC encode with filler padding.
             enc.encode_5g(cb, self.params.n_filler, &mut codeword)?;
 
             // §5.4.2 — rate match (E bits).
-            rate_match(
+            rm_cache.rate_match_into(
                 &codeword,
                 &mut e_buf,
                 rv,
@@ -290,6 +305,22 @@ pub struct DlSchDecoder {
     e_per_cb: usize,
     iterations: usize,
     tb_size: usize,
+    /// Per-CB LDPC decode scratch, all sized once here at construction (`n`,
+    /// the edge-buffer size, and the layer-buffer size are fixed for the
+    /// decoder's lifetime, since `bg`/`z` never change) instead of being
+    /// re-allocated on every [`Self::decode`] call, mirroring the pattern
+    /// already used by [`crate::turbo::TurboDecoder`]'s constructor-time
+    /// scratch and the LDPC pipeline's `FrameSlot`.
+    llr_cb: Vec<f32>,
+    edge_r: Vec<f32>,
+    layer_scratch: Vec<f32>,
+    hard: Vec<u8>,
+    /// Reconstructed transport-block info bits, accumulated across all `C`
+    /// code blocks; cleared (not reallocated) at the start of every
+    /// [`Self::decode`] call. (`cb_crc_results` is *not* struct scratch: it
+    /// is moved out into the returned [`DecodeReport::cb_crc`] every call,
+    /// so keeping it as reusable scratch would just add a clone back.)
+    all_info: Vec<u8>,
 }
 
 impl DlSchDecoder {
@@ -344,6 +375,17 @@ impl DlSchDecoder {
         let e_raw = g / params.c;
         let e_per_cb = (e_raw / qm) * qm;
 
+        let dec0 = &decoders[0];
+        let n = dec0.variable_node_count();
+        let edge_r = vec![0.0f32; dec0.required_edge_buffer()];
+        let layer_scratch = vec![0.0f32; dec0.required_layer_buffer()];
+        let info_per_cb = if params.has_cb_crc {
+            params.k_prime - 24
+        } else {
+            params.k_prime
+        };
+        let all_info_capacity = info_per_cb * params.c;
+
         Ok(Self {
             params,
             tb_crc,
@@ -354,6 +396,11 @@ impl DlSchDecoder {
             e_per_cb,
             iterations,
             tb_size,
+            llr_cb: vec![0.0f32; n],
+            edge_r,
+            layer_scratch,
+            hard: vec![0u8; n],
+            all_info: Vec::with_capacity(all_info_capacity),
         })
     }
 
@@ -396,35 +443,49 @@ impl DlSchDecoder {
             });
         }
 
-        let dec0 = &self.decoders[0];
-        let n = dec0.variable_node_count();
+        // Small Copy fields, read up front so the struct destructure below
+        // (needed to get disjoint `&mut` access to the scratch buffers
+        // alongside `harq_bufs`/`decoders`/`cb_crc`) doesn't have to thread
+        // borrows of `self.params`/`self.qm`/etc. through the loop.
+        let n_cb = self.params.c;
         let n_filler = self.params.n_filler;
-        let mut cb_crc_results = vec![false; self.params.c];
+        let z = self.params.z;
+        let has_cb_crc = self.params.has_cb_crc;
+        let k_prime = self.params.k_prime;
+        let qm = self.qm;
+        let e_per_cb = self.e_per_cb;
+        let iterations = self.iterations;
+        let tb_size = self.tb_size;
+
+        let mut cb_crc_results = vec![false; n_cb];
         let mut max_iters = 0usize;
-
-        // Allocate per-CB work buffers (setup path — one allocation each).
-        let mut llr_cb = vec![0.0f32; n];
-        let mut edge_r = vec![0.0f32; dec0.required_edge_buffer()];
-        let mut scratch = vec![0.0f32; dec0.required_layer_buffer()];
-        let mut hard = vec![0u8; n];
-
-        // Collect info bits from all CBs.
-        let info_per_cb = if self.params.has_cb_crc {
-            self.params.k_prime - 24
-        } else {
-            self.params.k_prime
-        };
-        let mut all_info: Vec<u8> = Vec::with_capacity(info_per_cb * self.params.c);
-
         let harq_tx = self.harq_bufs[0].tx_count() + 1;
 
-        for ci in 0..self.params.c {
+        // Per-CB LDPC scratch (`llr_cb`/`edge_r`/`layer_scratch`/`hard`) and
+        // `all_info` are struct-owned (sized once in `new`, see their doc
+        // comments) rather than allocated here; `all_info` is cleared (not
+        // reallocated) at the start of every call.
+        self.all_info.clear();
+        let Self {
+            harq_bufs,
+            decoders,
+            llr_cb,
+            edge_r,
+            layer_scratch,
+            hard,
+            all_info,
+            cb_crc,
+            ..
+        } = self;
+        let n = llr_cb.len();
+
+        for ci in 0..n_cb {
             // Slice this CB's E received LLRs.
-            let e_start = ci * self.e_per_cb;
-            let e_llr = &rx_llr[e_start..e_start + self.e_per_cb];
+            let e_start = ci * e_per_cb;
+            let e_llr = &rx_llr[e_start..e_start + e_per_cb];
 
             // HARQ: scatter + accumulate into the circular buffer.
-            self.harq_bufs[ci].combine(e_llr, rv, self.qm, 0)?;
+            harq_bufs[ci].combine(e_llr, rv, qm, 0)?;
 
             // Copy accumulated LLR into the full-N decode buffer with correct alignment.
             //
@@ -436,41 +497,39 @@ impl DlSchDecoder {
             //
             // Correct mapping: harq_buf[0..N-2Z] → llr_cb[2Z..N]
             //                  llr_cb[0..2Z] stays 0.0 (decode_5g enforces this anyway).
-            let two_z = 2 * self.params.z;
-            let ncb = self.harq_bufs[ci].ncb();
+            let two_z = 2 * z;
+            let ncb = harq_bufs[ci].ncb();
             let valid_len = ncb.saturating_sub(two_z);
             llr_cb[..n].iter_mut().for_each(|v| *v = 0.0); // zero the full buffer first
             {
-                let harq_data = self.harq_bufs[ci].llr_buffer();
+                let harq_data = harq_bufs[ci].llr_buffer();
                 llr_cb[two_z..two_z + valid_len].copy_from_slice(&harq_data[..valid_len]);
             }
 
             // decode_5g sets filler LLRs + punctured LLRs correctly.
-            let cb_iters = self.decoders[ci].decode_5g(
-                &mut llr_cb,
+            let cb_iters = decoders[ci].decode_5g(
+                llr_cb,
                 n_filler,
-                &mut edge_r,
-                &mut scratch,
-                &mut hard,
-                self.iterations,
+                edge_r,
+                layer_scratch,
+                hard,
+                iterations,
             )?;
             max_iters = max_iters.max(cb_iters);
 
             // Extract K' info bits (systematic only, no filler).
-            let k_prime = self.params.k_prime;
-            let _k = self.params.k_b * self.params.z;
             let k_prime_sys = k_prime; // without filler
             let info_bits = &hard[..k_prime_sys];
 
             // CRC-24B check (if segmented).
-            if self.params.has_cb_crc {
-                cb_crc_results[ci] = self.cb_crc.check(info_bits);
+            if has_cb_crc {
+                cb_crc_results[ci] = cb_crc.check(info_bits);
             } else {
                 cb_crc_results[ci] = true;
             }
 
             // Collect info payload (strip CRC-24B if present).
-            let payload_len = if self.params.has_cb_crc {
+            let payload_len = if has_cb_crc {
                 k_prime_sys.saturating_sub(24)
             } else {
                 k_prime_sys
@@ -479,15 +538,14 @@ impl DlSchDecoder {
         }
 
         // §5.1 — CRC-24A check on reconstructed TB.
-        let tb_bits = &all_info[..self.tb_size.min(all_info.len())];
-        let _tb_check = tb_bits.to_vec();
+        let tb_bits = &all_info[..tb_size.min(all_info.len())];
         // Re-compute what CRC-24A should be.
         let tb_crc_ok = {
             let expected_crc = self.tb_crc.compute(tb_bits);
             // Reconstruct: compare against what the received TB contained.
             // If segmentation included CRC-24A as part of the last CB's payload,
             // it's in all_info after the info bits.
-            let crc_bits_start = self.tb_size;
+            let crc_bits_start = tb_size;
             if all_info.len() >= crc_bits_start + 24 {
                 let received_crc = all_info[crc_bits_start..crc_bits_start + 24]
                     .iter()
@@ -500,10 +558,10 @@ impl DlSchDecoder {
 
         if crc_ok(&cb_crc_results) && tb_crc_ok {
             // Copy TB bits to output.
-            let copy_len = self.tb_size.min(all_info.len());
+            let copy_len = tb_size.min(all_info.len());
             tb_out[..copy_len].copy_from_slice(&all_info[..copy_len]);
             // Flush HARQ on success.
-            for buf in &mut self.harq_bufs {
+            for buf in harq_bufs.iter_mut() {
                 buf.flush();
             }
         }

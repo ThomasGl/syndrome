@@ -351,14 +351,18 @@ fn beta_combine(block: &mut [u8]) {
     }
 }
 
-/// Preallocated per-`decode_sc`-call scratch: a single flat LLR buffer
-/// covering every recursion level below the root, plus the flat partial-sum
-/// ("beta") byte array -- both allocated **once per decode call** instead of
-/// once per recursion node. The previous implementation allocated three
-/// `Vec`s (`left_llr`, `right_llr`, `partial_sum`) at *every* internal node;
-/// profiling `decode_sc` at $(N,K)=(1024,512)$ showed that allocation churn
-/// alone accounted for roughly half of total decode time (see the module's
-/// perf notes), dwarfing the actual $f$/$g$/partial-sum arithmetic.
+/// Preallocated scratch for [`PolarDecoder::decode_sc`]: a single flat LLR
+/// buffer covering every recursion level below the root, the flat
+/// partial-sum ("beta") byte array, and the decoded-bit output buffer --
+/// all built **once, at [`PolarDecoder::new`] time** (this decoder's `n`
+/// and recursion depth never change afterward) instead of once per decode
+/// call. The original implementation allocated three `Vec`s (`left_llr`,
+/// `right_llr`, `partial_sum`) at *every internal recursion node*; profiling
+/// `decode_sc` at $(N,K)=(1024,512)$ showed that allocation churn alone
+/// accounted for roughly half of total decode time (see the module's perf
+/// notes), dwarfing the actual $f$/$g$/partial-sum arithmetic. Hoisting the
+/// single per-call allocation (`ScScratch::new` below) up further, to
+/// construction time, removes it entirely from the decode call path.
 struct ScScratch {
     /// Flat LLR scratch for recursion levels `1..=levels` (the root's own
     /// level-0 LLRs are the caller-supplied `llr` slice, held separately).
@@ -370,6 +374,9 @@ struct ScScratch {
     /// Flat, in-place bottom-up partial-sum ("beta") byte array, `n` bytes,
     /// addressed directly by absolute bit position (not peeled).
     beta: Vec<u8>,
+    /// Decoded-bit output buffer, `n` bytes (info bits are extracted from
+    /// this into the caller's `out` slice once decoding finishes).
+    decoded: Vec<u8>,
 }
 
 impl ScScratch {
@@ -377,6 +384,7 @@ impl ScScratch {
         Self {
             llr: vec![0.0f32; n * levels],
             beta: vec![0u8; n],
+            decoded: vec![0u8; n],
         }
     }
 }
@@ -542,7 +550,6 @@ fn scl_level_offsets(n: usize, levels: usize) -> Vec<usize> {
 /// scheme it implements), addressed directly by absolute bit position (it
 /// is *not* reused across siblings -- ancestors need a subtree's beta long
 /// after that subtree has returned).
-#[derive(Clone)]
 struct ScPath {
     decoded: Vec<u8>,
     beta: Vec<u8>,
@@ -571,6 +578,159 @@ impl ScPath {
     fn llr_at(&self, level_offsets: &[usize], level: usize, length: usize) -> &[f32] {
         let base = level_offsets[level];
         &self.llr_flat[base..base + length]
+    }
+}
+
+/// Manual `Clone` impl so that `clone_from` can be overridden (the derived
+/// impl only provides `clone`, and its inherited default `clone_from` is
+/// just `*self = source.clone()` -- a fresh allocation, defeating the whole
+/// point of [`SclArena`]).
+impl Clone for ScPath {
+    fn clone(&self) -> Self {
+        Self {
+            decoded: self.decoded.clone(),
+            beta: self.beta.clone(),
+            path_metric: self.path_metric,
+            llr_flat: self.llr_flat.clone(),
+        }
+    }
+
+    /// Overwrite `self` with `source`'s contents **reusing `self`'s existing
+    /// heap allocations**. `Vec<T>::clone_from` is specialized (see its
+    /// std docs) to `clone_from_slice` into the existing buffer instead of
+    /// allocating when lengths already match -- which they always do here,
+    /// since every [`ScPath`] built for one `decode_scl` call shares the
+    /// same `n`/level layout. This is the operation [`SclArena`] forks
+    /// through: no `Vec::new`/`Vec::with_capacity` runs on this path.
+    fn clone_from(&mut self, source: &Self) {
+        self.decoded.clone_from(&source.decoded);
+        self.beta.clone_from(&source.beta);
+        self.path_metric = source.path_metric;
+        self.llr_flat.clone_from(&source.llr_flat);
+    }
+}
+
+/// Fixed-capacity, allocation-free arena for [`ScPath`] forking, replacing
+/// the original scheme of forking every surviving path via two full
+/// `path.clone()` calls per info bit (3 heap allocations apiece --
+/// `decoded`, `beta`, `llr_flat` -- for `O(list_size * k_info)` total
+/// allocation/deallocation churn per `decode_scl` call; see
+/// `scl_decode_recursive_reference`, kept for the equivalence test, for that
+/// original code).
+///
+/// This holds **two** fixed-size `Vec<ScPath>` buffers ("ping-pong"
+/// buffers), each with `2 * list_size` slots built once via [`ScPath::new`]
+/// so every slot's `decoded`/`beta`/`llr_flat` `Vec`s are already correctly
+/// sized. Forking at an information-bit leaf writes the (up to) `2 *
+/// list_size` candidate paths into the *inactive* buffer's slots via
+/// [`ScPath::clone_from`] (reusing each destination slot's existing
+/// allocation) rather than [`Clone::clone`] (which would allocate fresh
+/// `Vec`s), sorts by path metric, keeps the best `list_size`, and flips
+/// which buffer is active. Only the logical path count (`len`) and the
+/// active-buffer flag change per fork -- no heap (de)allocation happens
+/// anywhere after [`SclArena::new`] returns.
+struct SclArena {
+    buf_a: Vec<ScPath>,
+    buf_b: Vec<ScPath>,
+    active_is_a: bool,
+    len: usize,
+}
+
+impl SclArena {
+    /// Build the arena for one `decode_scl` call: one live path (the root),
+    /// backed by `2 * list_size`-slot buffers on both sides so any sequence
+    /// of forks (each at most doubling, then pruned back to `list_size`)
+    /// always has room in the currently-inactive buffer.
+    fn new(n: usize, initial_llr: &[f32], level_offsets: &[usize], list_size: usize) -> Self {
+        let cap = 2 * list_size;
+        let seed = ScPath::new(n, initial_llr, level_offsets);
+        let buf_a: Vec<ScPath> = (0..cap).map(|_| seed.clone()).collect();
+        let buf_b: Vec<ScPath> = (0..cap).map(|_| seed.clone()).collect();
+        Self {
+            buf_a,
+            buf_b,
+            active_is_a: true,
+            len: 1,
+        }
+    }
+
+    /// Currently-live path list (read-only).
+    #[inline]
+    fn active(&self) -> &[ScPath] {
+        if self.active_is_a {
+            &self.buf_a[..self.len]
+        } else {
+            &self.buf_b[..self.len]
+        }
+    }
+
+    /// Currently-live path list (mutable) -- used by the non-forking
+    /// (frozen-bit leaf, $f$-branch, $g$-branch, beta-combine) steps, which
+    /// mutate paths in place without changing how many there are.
+    #[inline]
+    fn active_mut(&mut self) -> &mut [ScPath] {
+        if self.active_is_a {
+            &mut self.buf_a[..self.len]
+        } else {
+            &mut self.buf_b[..self.len]
+        }
+    }
+
+    /// Fork every live path into a `bit=0` and `bit=1` candidate at
+    /// `bit_pos`, written into the inactive buffer via `clone_from` (no
+    /// allocation), then sort by path metric and keep the best
+    /// `list_size` survivors. Flips the active buffer.
+    fn fork_at_leaf(
+        &mut self,
+        bit_pos: usize,
+        level_offsets: &[usize],
+        level: usize,
+        list_size: usize,
+    ) {
+        let old_len = self.len;
+        let new_len = 2 * old_len; // <= 2*list_size == capacity, since old_len <= list_size always.
+        if self.active_is_a {
+            let (src, dst) = (&self.buf_a, &mut self.buf_b);
+            Self::fork_into(&src[..old_len], dst, level_offsets, level, bit_pos);
+        } else {
+            let (src, dst) = (&self.buf_b, &mut self.buf_a);
+            Self::fork_into(&src[..old_len], dst, level_offsets, level, bit_pos);
+        }
+        let dst = if self.active_is_a {
+            &mut self.buf_b
+        } else {
+            &mut self.buf_a
+        };
+        dst[..new_len].sort_by(|a, b| a.path_metric.partial_cmp(&b.path_metric).unwrap());
+        self.len = new_len.min(list_size);
+        self.active_is_a = !self.active_is_a;
+    }
+
+    /// Write `src[i]`'s two forked candidates into `dst[2*i]`/`dst[2*i+1]`
+    /// via `clone_from`, in the same relative order the original
+    /// clone-per-fork implementation pushed them in (bit=0 then bit=1 per
+    /// source path, in source order) so the subsequent stable sort produces
+    /// a bit-identical survivor list.
+    fn fork_into(
+        src: &[ScPath],
+        dst: &mut [ScPath],
+        level_offsets: &[usize],
+        level: usize,
+        bit_pos: usize,
+    ) {
+        for (i, path) in src.iter().enumerate() {
+            let bit_llr = path.llr_at(level_offsets, level, 1)[0];
+
+            dst[2 * i].clone_from(path);
+            dst[2 * i].decoded[bit_pos] = 0;
+            dst[2 * i].beta[bit_pos] = 0;
+            dst[2 * i].path_metric += 0.0_f32.max(-bit_llr);
+
+            dst[2 * i + 1].clone_from(path);
+            dst[2 * i + 1].decoded[bit_pos] = 1;
+            dst[2 * i + 1].beta[bit_pos] = 1;
+            dst[2 * i + 1].path_metric += 0.0_f32.max(bit_llr);
+        }
     }
 }
 
@@ -609,6 +769,97 @@ impl ScPath {
 ///   folded together with one `beta_combine` XOR pass, maintaining the
 ///   invariant for this node's parent.
 fn scl_decode_recursive(
+    is_frozen: &[bool],
+    bit_start: usize,
+    length: usize,
+    level: usize,
+    list_size: usize,
+    level_offsets: &[usize],
+    arena: &mut SclArena,
+) {
+    if length == 1 {
+        let bit_pos = bit_start;
+        if is_frozen[bit_pos] {
+            for path in arena.active_mut() {
+                let bit_llr = path.llr_at(level_offsets, level, 1)[0];
+                path.decoded[bit_pos] = 0;
+                path.beta[bit_pos] = 0;
+                path.path_metric += 0.0_f32.max(-bit_llr); // ln(1 + e^-|llr|) ≈ 0
+            }
+        } else {
+            // Info bit: fork every path into bit=0 and bit=1 candidates
+            // (see `SclArena::fork_at_leaf` -- no heap allocation here).
+            arena.fork_at_leaf(bit_pos, level_offsets, level, list_size);
+        }
+        return;
+    }
+
+    let half = length / 2;
+    let this_base = level_offsets[level];
+    let next_base = level_offsets[level + 1];
+
+    // f-branch, computed per path (a path may already have forked away
+    // from its siblings deeper in an earlier subtree). Local addressing:
+    // this level's block starts at `this_base`, spans `length`; the next
+    // level's block starts at `next_base`, spans `half` (reused below for
+    // the g-branch once the left recursion has fully consumed it).
+    for path in arena.active_mut() {
+        let (head, tail) = path.llr_flat.split_at_mut(next_base);
+        let src = &head[this_base..this_base + length];
+        let (a, b) = src.split_at(half);
+        f_kernel(a, b, &mut tail[..half]);
+    }
+
+    scl_decode_recursive(
+        is_frozen,
+        bit_start,
+        half,
+        level + 1,
+        list_size,
+        level_offsets,
+        arena,
+    );
+
+    // g-branch: needs each surviving path's own partial sum from the left
+    // subtree -- see doc comment above. `path.beta[bit_start..+half]` is
+    // already correct by the recursive invariant, and level `level`'s LLR
+    // block is untouched by the recursion above (which only ever writes to
+    // level `level + 1` and deeper), so it's still valid here for every
+    // surviving (possibly forked) path.
+    for path in arena.active_mut() {
+        let (head, tail) = path.llr_flat.split_at_mut(next_base);
+        let src = &head[this_base..this_base + length];
+        let (a, b) = src.split_at(half);
+        let partial_sum = &path.beta[bit_start..bit_start + half];
+        g_kernel(a, b, partial_sum, &mut tail[..half]);
+    }
+
+    scl_decode_recursive(
+        is_frozen,
+        bit_start + half,
+        half,
+        level + 1,
+        list_size,
+        level_offsets,
+        arena,
+    );
+
+    // This node's own partial sum (needed by its parent, if any): combine
+    // the two children's already-transformed halves in place, per path.
+    for path in arena.active_mut() {
+        beta_combine(&mut path.beta[bit_start..bit_start + length]);
+    }
+}
+
+/// Reference (pre-optimization) CA-SCL recursion, kept only for the
+/// equivalence test [`tests::scl_arena_matches_reference_random_noisy`].
+/// Structurally identical to [`scl_decode_recursive`] except that path
+/// forking uses a plain `Vec<ScPath>` and two `path.clone()` calls per
+/// surviving path per info bit -- the O(list_size * k_info) heap
+/// allocation/deallocation churn [`SclArena`] was written to eliminate. Not
+/// on the hot path; not built into non-test binaries.
+#[cfg(test)]
+fn scl_decode_recursive_reference(
     is_frozen: &[bool],
     bit_start: usize,
     length: usize,
@@ -655,11 +906,6 @@ fn scl_decode_recursive(
     let this_base = level_offsets[level];
     let next_base = level_offsets[level + 1];
 
-    // f-branch, computed per path (a path may already have forked away
-    // from its siblings deeper in an earlier subtree). Local addressing:
-    // this level's block starts at `this_base`, spans `length`; the next
-    // level's block starts at `next_base`, spans `half` (reused below for
-    // the g-branch once the left recursion has fully consumed it).
     for path in paths.iter_mut() {
         let (head, tail) = path.llr_flat.split_at_mut(next_base);
         let src = &head[this_base..this_base + length];
@@ -667,7 +913,7 @@ fn scl_decode_recursive(
         f_kernel(a, b, &mut tail[..half]);
     }
 
-    scl_decode_recursive(
+    scl_decode_recursive_reference(
         is_frozen,
         bit_start,
         half,
@@ -677,12 +923,6 @@ fn scl_decode_recursive(
         paths,
     );
 
-    // g-branch: needs each surviving path's own partial sum from the left
-    // subtree -- see doc comment above. `path.beta[bit_start..+half]` is
-    // already correct by the recursive invariant, and level `level`'s LLR
-    // block is untouched by the recursion above (which only ever writes to
-    // level `level + 1` and deeper), so it's still valid here for every
-    // surviving (possibly forked) path.
     for path in paths.iter_mut() {
         let (head, tail) = path.llr_flat.split_at_mut(next_base);
         let src = &head[this_base..this_base + length];
@@ -691,7 +931,7 @@ fn scl_decode_recursive(
         g_kernel(a, b, partial_sum, &mut tail[..half]);
     }
 
-    scl_decode_recursive(
+    scl_decode_recursive_reference(
         is_frozen,
         bit_start + half,
         half,
@@ -701,8 +941,6 @@ fn scl_decode_recursive(
         paths,
     );
 
-    // This node's own partial sum (needed by its parent, if any): combine
-    // the two children's already-transformed halves in place, per path.
     for path in paths.iter_mut() {
         beta_combine(&mut path.beta[bit_start..bit_start + length]);
     }
@@ -745,6 +983,11 @@ pub struct PolarDecoder {
     list_size: usize,
     is_frozen: Vec<bool>,
     crc: Option<Crc24>,
+    /// Preallocated [`decode_sc`](Self::decode_sc) scratch (see
+    /// [`ScScratch`]'s doc comment). Behind a `RefCell` because `decode_sc`
+    /// takes `&self` (preserving its public signature); borrowing is
+    /// uncontended (single-threaded, non-reentrant use per call).
+    sc_scratch: std::cell::RefCell<ScScratch>,
 }
 
 impl PolarDecoder {
@@ -783,12 +1026,15 @@ impl PolarDecoder {
         }
         let is_frozen = frozen_mask(n, k);
         let crc = crc_kind.map(Crc24::new);
+        let levels = n.trailing_zeros() as usize;
+        let sc_scratch = std::cell::RefCell::new(ScScratch::new(n, levels));
         Ok(Self {
             n,
             k,
             list_size,
             is_frozen,
             crc,
+            sc_scratch,
         })
     }
 
@@ -817,12 +1063,11 @@ impl PolarDecoder {
             });
         }
 
-        let levels = self.n.trailing_zeros() as usize;
-        let mut decoded = vec![0u8; self.n];
-        let mut scratch = ScScratch::new(self.n, levels);
+        let mut scratch_ref = self.sc_scratch.borrow_mut();
+        let scratch = &mut *scratch_ref;
         sc_decode_recursive(
             llr,
-            &mut decoded,
+            &mut scratch.decoded,
             &mut scratch.beta,
             &self.is_frozen,
             0,
@@ -835,7 +1080,7 @@ impl PolarDecoder {
         let mut info_idx = 0;
         for i in 0..self.n {
             if !self.is_frozen[i] {
-                out[info_idx] = decoded[i];
+                out[info_idx] = scratch.decoded[i];
                 info_idx += 1;
             }
         }
@@ -880,8 +1125,10 @@ impl PolarDecoder {
 
         let levels = self.n.trailing_zeros() as usize;
         let level_offsets = scl_level_offsets(self.n, levels);
-        // Initialise one path.
-        let mut paths: Vec<ScPath> = vec![ScPath::new(self.n, llr, &level_offsets)];
+        // Build the fork arena once for this call: one live path (the
+        // root), backed by allocation-free ping-pong buffers for every
+        // subsequent fork (see `SclArena`'s doc comment).
+        let mut arena = SclArena::new(self.n, llr, &level_offsets, self.list_size);
 
         // Walk the decode tree once, forking/pruning the whole path list at
         // each information-bit leaf (see `scl_decode_recursive`'s doc for why
@@ -894,9 +1141,10 @@ impl PolarDecoder {
             0,
             self.list_size,
             &level_offsets,
-            &mut paths,
+            &mut arena,
         );
 
+        let paths = arena.active();
         // Select the best CRC-passing path, or the best path if none pass.
         let best = if let Some(ref crc_eng) = self.crc {
             // Collect info bits for each path and CRC-check.
@@ -915,6 +1163,76 @@ impl PolarDecoder {
         };
 
         // Extract info bits from the best path.
+        let mut info_idx = 0;
+        for i in 0..self.n {
+            if !self.is_frozen[i] {
+                out[info_idx] = best.decoded[i];
+                info_idx += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reference (pre-optimization) CA-SCL decode: identical to
+    /// [`Self::decode_scl`] except it forks paths via
+    /// [`scl_decode_recursive_reference`]'s plain `Vec<ScPath>` +
+    /// `path.clone()` scheme instead of [`SclArena`]. Kept only to give
+    /// [`tests::scl_arena_matches_reference_random_noisy`] an independent
+    /// ground truth for bit-identity; not part of the public API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::BufferTooSmall`] on size mismatch (mirrors
+    /// [`Self::decode_scl`]).
+    #[cfg(test)]
+    fn decode_scl_reference(&self, llr: &[f32], out: &mut [u8]) -> Result<(), FecError> {
+        if llr.len() != self.n {
+            return Err(FecError::BufferTooSmall {
+                required: self.n,
+                provided: llr.len(),
+            });
+        }
+        if out.len() != self.k {
+            return Err(FecError::BufferTooSmall {
+                required: self.k,
+                provided: out.len(),
+            });
+        }
+
+        if self.list_size == 1 {
+            return self.decode_sc(llr, out);
+        }
+
+        let levels = self.n.trailing_zeros() as usize;
+        let level_offsets = scl_level_offsets(self.n, levels);
+        let mut paths: Vec<ScPath> = vec![ScPath::new(self.n, llr, &level_offsets)];
+
+        scl_decode_recursive_reference(
+            &self.is_frozen,
+            0,
+            self.n,
+            0,
+            self.list_size,
+            &level_offsets,
+            &mut paths,
+        );
+
+        let best = if let Some(ref crc_eng) = self.crc {
+            let crc_pass = paths.iter().find(|p| {
+                let mut info = Vec::with_capacity(self.k);
+                for i in 0..self.n {
+                    if !self.is_frozen[i] {
+                        info.push(p.decoded[i]);
+                    }
+                }
+                crc_eng.check(&info)
+            });
+            crc_pass.unwrap_or(&paths[0])
+        } else {
+            &paths[0]
+        };
+
         let mut info_idx = 0;
         for i in 0..self.n {
             if !self.is_frozen[i] {
@@ -1199,5 +1517,85 @@ mod tests {
             ca_successes >= 15,
             "CA-SCL success rate too low: {ca_successes}/{trials}"
         );
+    }
+
+    /// Task-1 equivalence guard: `decode_scl` (arena-based forking, no
+    /// per-fork heap allocation -- see [`SclArena`]) must produce
+    /// byte-identical output to `decode_scl_reference` (the retained
+    /// pre-optimization `Vec<ScPath>` + `path.clone()` implementation, see
+    /// [`scl_decode_recursive_reference`]) across many random noisy frames,
+    /// several (N, K, list_size, CRC) configurations, both with and without
+    /// a CRC winner actually present in the list (low SNR exercises the
+    /// "no path passes CRC, fall back to best metric" branch too).
+    #[test]
+    fn scl_arena_matches_reference_random_noisy() {
+        struct Cfg {
+            n: usize,
+            k: usize,
+            list_size: usize,
+            crc: Option<CrcKind>,
+            ebno_db: f32,
+            seed: u64,
+        }
+        let configs = [
+            Cfg {
+                n: 64,
+                k: 32,
+                list_size: 4,
+                crc: None,
+                ebno_db: 2.0,
+                seed: 0xA11C_E000,
+            },
+            Cfg {
+                n: 128,
+                k: 64,
+                list_size: 8,
+                crc: Some(CrcKind::Crc24A),
+                ebno_db: 1.0,
+                seed: 0xA11C_E001,
+            },
+            Cfg {
+                n: 256,
+                k: 128,
+                list_size: 16,
+                crc: Some(CrcKind::Crc11),
+                ebno_db: 0.0,
+                seed: 0xA11C_E002,
+            },
+            Cfg {
+                n: 1024,
+                k: 512,
+                list_size: 8,
+                crc: Some(CrcKind::Crc24A),
+                ebno_db: (-1.0),
+                seed: 0xA11C_E003,
+            },
+        ];
+
+        for cfg in configs {
+            let rate = cfg.k as f32 / cfg.n as f32;
+            let enc = PolarEncoder::new(cfg.n, cfg.k).unwrap();
+            let dec = PolarDecoder::new(cfg.n, cfg.k, cfg.list_size, cfg.crc).unwrap();
+            let mut rng = Xorshift64::new(cfg.seed);
+            let mut channel = AwgnChannel::new(cfg.ebno_db, rate, cfg.seed ^ 0x5EED);
+
+            for trial in 0..40 {
+                let info = random_bits(&mut rng, cfg.k);
+                let mut cw = vec![0u8; cfg.n];
+                enc.encode(&info, &mut cw).unwrap();
+                let llr = channel.transmit(&cw);
+
+                let mut out_arena = vec![0u8; cfg.k];
+                let mut out_reference = vec![0u8; cfg.k];
+                dec.decode_scl(&llr, &mut out_arena).unwrap();
+                dec.decode_scl_reference(&llr, &mut out_reference).unwrap();
+
+                assert_eq!(
+                    out_arena, out_reference,
+                    "arena vs reference SCL decode mismatch: n={}, k={}, list_size={}, trial={trial}",
+                    cfg.n, cfg.k, cfg.list_size
+                );
+            }
+        }
     }
 }

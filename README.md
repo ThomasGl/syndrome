@@ -3,7 +3,7 @@
 [![CI](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-200%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-258%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -23,7 +23,7 @@
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 200 total — 131 unit · 7 integration · 4 media reconstruction · 58 doctests |
+| **Tests** | 258 total — 144 unit · 7 integration · 4 media reconstruction · 14 reference vectors · 30 robustness · 59 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~82/64 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
@@ -353,14 +353,26 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (200 tests total)
+### 4.1 Component coverage (258 tests total)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 131 | embedded in `src/*.rs` |
+| Unit tests | 144 | embedded in `src/*.rs` |
 | LDPC integration (encode→decode round-trips) | 7 | `tests/ldpc_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
-| Doctests | 58 | `///` examples in all public API |
+| Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
+| Robustness (hostile/degenerate inputs, no panics) | 30 | `tests/robustness.rs` |
+| Doctests | 59 | `///` examples in all public API |
+
+Two suites deserve a note. The **reference-vector suite** pins each codec to
+*external* ground truth — CRC polynomials against the reveng catalogue,
+Reed-Solomon against CCSDS conventions, Hamming/Golay/BCH against published
+generator and parity-check matrices — so a refactor that silently changes the
+algorithm fails loudly even when every round-trip test still passes. The
+**robustness suite** drives every public API with adversarial byte streams and
+degenerate parameters; every panic it originally discovered is now fixed and
+kept as a regression test asserting a typed `FecError`. Six libFuzzer targets
+in [`fuzz/`](fuzz/) extend the same idea to coverage-guided input generation.
 
 Highlights of what the tests actually *prove* (not just exercise):
 

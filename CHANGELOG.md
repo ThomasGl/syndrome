@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **All 8 panics discovered by the robustness suite are eliminated.** The
+  severe one: `compute_segmentation` asserted $B' \bmod C = 0$, which panicked
+  for a large fraction of multi-code-block transport-block sizes and broke
+  `DlSchEncoder`/`DlSchDecoder` for most large TBs. Segmentation now follows
+  TS 38.212 §5.2.2 filler-bit semantics ($K' = \lceil B'/C \rceil$, slack
+  zero-padded like filler bits), proven by end-to-end round-trips over a
+  sweep of awkward TB sizes. Also fixed: `usize` overflow near the TB-size
+  ceiling (explicit `MAX_TB_SIZE_BITS` bound), unbounded Viterbi constraint
+  length (`new`/`with_generators` now return `Result`, `k ≤ 16`),
+  division-by-zero in `rate_match`/`rate_dematch_llr` for `qm = 0` or
+  `z = 0` (also reachable through `HarqBuffer`), and `PolarDecoder::new`
+  accepting `list_size = 0`.
+- Reed-Solomon benchmark chart: the three Rust encode variants were drawn in
+  the same hue and indistinguishable; series colors are now CVD-validated
+  distinct per (language, implementation) and the throughput axis is
+  log-scaled so the pure-Python baselines remain visible.
+
+### Added
+- `tests/reference_vectors.rs` — 14 known-answer conformance tests pinning
+  codecs to external ground truth (reveng CRC catalogue, CCSDS Reed-Solomon
+  conventions, published Hamming/Golay/BCH generator and parity-check
+  matrices).
+- `tests/robustness.rs` — 30 adversarial-input tests over every public API;
+  each formerly-discovered panic is retained as a typed-error regression
+  test.
+- `fuzz/` — six libFuzzer targets covering the decoder entry points; they
+  build on stable without instrumentation so CI can smoke-test them.
+- `RateMatchCache` — memoized TS 38.212 §5.4.2 bit-selection/interleave
+  index tables keyed on $(BG, Z, rv, Q_m, F, E)$, with `rate_match_into` /
+  `rate_dematch_llr_into` allocation-free variants.
+
+### Changed
+- **Error handling unified on `FecError`** (now implementing
+  `std::error::Error`): all public APIs that previously returned bare
+  `&'static str` errors or panicked on degenerate input return
+  `Result<_, FecError>`. Breaking signatures: `ViterbiDecoder::new` and
+  `with_generators` return `Result`; Reed-Solomon `encode_*` return
+  `Result` and reject zero-data-shard geometry; `SegmentationParams` gained
+  a `b` field.
+- Cargo.toml: added the `repository` field; dropped the `no-std` category
+  (the crate currently requires `std` — the category will return only when a
+  real `#![no_std]` core build exists).
+
 ### Performance
+- **Polar CA-SCL decode ~1.63× faster** (N=1024, K=512, L=8: 2.51 ms →
+  1.54 ms) — per-fork deep clones of the path buffers replaced by a fixed
+  ping-pong arena of $2L$ slots reused via `clone_from`; zero heap
+  allocation per information bit. Bit-identical to the retained reference
+  implementation across seeded noisy frames.
+- **Transport-block encode ~3.3× faster** (20 kbit TB, BG1, C=3: 152 µs →
+  46.5 µs) — the rate-matching selection walk and interleave permutation are
+  computed once per key and shared across all $C$ code blocks instead of
+  re-derived per block.
+- **Reed-Solomon AVX2 encode ~2.5× faster on short shards** (~8% at 4 KiB) —
+  the 256 lo/hi nibble decompositions for the VPSHUFB kernel are precomputed
+  once (8 KiB) instead of re-derived per (coefficient, row) on every call.
+- Steady-state decode calls in Viterbi, Polar SC, and `DlSchDecoder` no
+  longer heap-allocate: metric/traceback/scratch buffers moved into the
+  codec structs (1–6% gains, honestly near noise — the point is the
+  zero-allocation invariant, matching the Turbo and pipeline convention).
 - **QC-LDPC encode: 2.75 Mbit/s → ~1.66 Gbit/s (~590×)** — replaced the dense
   generator-matrix multiply with the standard sparse structured encoding: the
   double-diagonal core-parity solve is derived programmatically from the 3GPP
