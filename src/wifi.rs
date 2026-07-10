@@ -1,10 +1,14 @@
-//! IEEE 802.11ax / 802.11be Wi-Fi 6/6E/7 LDPC metadata and MCS tables.
+//! IEEE 802.11ax / 802.11be Wi-Fi 6/6E/7 LDPC parameters, MCS tables, and
+//! full-codeword encode/decode.
 //!
 //! This module provides the LDPC code parameters defined in IEEE 802.11-2020
 //! Annex R and the corresponding Wi-Fi 6/6E/7 Modulation and Coding Scheme
-//! (MCS) tables.  It is intentionally metadata-only: it does not implement the
-//! LOMS kernel (which is shared with 5G NR in `qc_ldpc`) but instead supplies
-//! the structural parameters needed to instantiate that kernel for Wi-Fi frames.
+//! (MCS) tables. As of this crate's Wi-Fi LDPC integration, it is no longer
+//! metadata-only: `crate::wifi_ldpc_tables` supplies the real 802.11 Annex
+//! R/F shift matrices, so a genuine 802.11 codeword can be encoded and
+//! decoded end-to-end with the same [`crate::qc_ldpc`] LOMS kernel used for
+//! 5G NR — see [`crate::wifi_ldpc_tables::wifi_ldpc_encoder`]/
+//! [`crate::wifi_ldpc_tables::wifi_ldpc_decoder`].
 //!
 //! # 802.11 LDPC structure
 //!
@@ -16,9 +20,30 @@
 //! where $R \in \{1/2,\, 2/3,\, 3/4,\, 5/6\}$ and the parity row-block count is
 //! $M / Z$.
 //!
-//! The LOMS decoding algorithm is structurally identical to 5G NR QC-LDPC; only
-//! the shift matrices (from IEEE 802.11-2020 Annex R, IEEE member access
-//! required) differ.
+//! The LOMS decoding algorithm is structurally identical to 5G NR QC-LDPC;
+//! only the shift matrices differ, and those real matrices (all 12 $(Z, R)$
+//! combinations, cross-validated against the IEEE 802.11n-2009 standard text
+//! itself) now live in [`crate::wifi_ldpc_tables`].
+//!
+//! # What is real vs. still planned
+//!
+//! **Real today:** full, unshortened, unpunctured codeword encode/decode
+//! ($K$ info bits exactly filling $N = 24Z$ coded bits) for all 12 $(Z, R)$
+//! combinations, using the actual IEEE 802.11 Annex R/F shift matrices —
+//! see `tests/wifi_ldpc_integration.rs` for encode -> AWGN -> decode
+//! round-trips.
+//!
+//! **Still planned (not in this pass):**
+//! * **Shortening** — padding a payload smaller than $K$ before encoding.
+//! * **Puncturing / rate-matching** — the per-MCS coded-bit selection that
+//!   maps a full codeword onto the actual transmitted bit count.
+//! * The rest of the 802.11 PHY chain (scrambling, interleaving, OFDM
+//!   subcarrier mapping) — out of scope for this FEC-only crate.
+//!
+//! See [`crate::wifi_ldpc_tables`] module docs for the full sourcing note
+//! and cross-validation methodology for the 12 matrices.
+
+use crate::error::FecError;
 
 /// Wi-Fi generation identifier.
 ///
@@ -93,6 +118,72 @@ impl WifiLdpcParams {
     /// ```
     pub fn rate(&self) -> f32 {
         self.rate_num as f32 / self.rate_den as f32
+    }
+
+    /// Build a ready-to-use [`crate::qc_ldpc::QcLdpcEncoder`] for this
+    /// $(Z, R)$ combination, backed by the real IEEE 802.11 Annex R/F shift
+    /// matrix (see [`crate::wifi_ldpc_tables`] for sourcing).
+    ///
+    /// Handles exactly one full, unshortened, unpunctured codeword: `K`
+    /// info bits in, `N = 24*z` coded bits out. Shortening/puncturing are
+    /// not implemented — see the module doc.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if this instance's `(z, rate_num,
+    /// rate_den)` is not one of the 12 supported 802.11 LDPC combinations
+    /// (this should not happen for a `WifiLdpcParams` obtained from
+    /// [`select_wifi_ldpc`] or [`wifi_ldpc_params_for_mcs`], since those
+    /// only ever select `z in {27, 54, 81}` and one of the four standard
+    /// rates).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::wifi::{select_wifi_ldpc, WifiStandard};
+    ///
+    /// let p = select_wifi_ldpc(20, WifiStandard::WiFi6, 0.5);
+    /// let enc = p.build_encoder().unwrap();
+    /// assert_eq!(enc.codeword_bit_count(), p.n);
+    /// ```
+    pub fn build_encoder(&self) -> Result<crate::qc_ldpc::QcLdpcEncoder, FecError> {
+        crate::wifi_ldpc_tables::wifi_ldpc_encoder(self.z, self.rate_num, self.rate_den)
+    }
+
+    /// Build a ready-to-use [`crate::qc_ldpc::QcLdpcDecoder`] for this
+    /// $(Z, R)$ combination, backed by the real IEEE 802.11 Annex R/F shift
+    /// matrix (see [`crate::wifi_ldpc_tables`] for sourcing).
+    ///
+    /// # Arguments
+    ///
+    /// * `offset_beta` - Offset correction $\beta$ for the LOMS min-sum
+    ///   update (0.25 is a reasonable default; see the 5G NR usage in
+    ///   [`crate::qc_ldpc`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] under the same condition as
+    /// [`WifiLdpcParams::build_encoder`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::wifi::{select_wifi_ldpc, WifiStandard};
+    ///
+    /// let p = select_wifi_ldpc(20, WifiStandard::WiFi6, 0.5);
+    /// let dec = p.build_decoder(0.25).unwrap();
+    /// assert_eq!(dec.variable_node_count(), p.n);
+    /// ```
+    pub fn build_decoder(
+        &self,
+        offset_beta: f32,
+    ) -> Result<crate::qc_ldpc::QcLdpcDecoder, FecError> {
+        crate::wifi_ldpc_tables::wifi_ldpc_decoder(
+            self.z,
+            self.rate_num,
+            self.rate_den,
+            offset_beta,
+        )
     }
 }
 

@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   log-scaled so the pure-Python baselines remain visible.
 
 ### Added
+- **Real IEEE 802.11 Wi-Fi LDPC encode/decode** (`src/wifi_ldpc_tables.rs`):
+  all 12 real 802.11 Annex R/F parity-check shift matrices ($Z \in \{27, 54,
+  81\} \times R \in \{1/2, 2/3, 3/4, 5/6\}$), cross-validated against the
+  IEEE 802.11n-2009 standard text itself (Annex R, Tables R.1–R.3) plus two
+  independent open-source transcriptions. `wifi_ldpc_encoder`/
+  `wifi_ldpc_decoder` (and `WifiLdpcParams::build_encoder`/
+  `build_decoder`) build a real, working `QcLdpcEncoder`/`QcLdpcDecoder`
+  for any of the 12 combinations — the same LOMS kernel used for 5G NR,
+  proven by `tests/wifi_ldpc_integration.rs` (encode → AWGN → decode
+  round-trips, all 12 combinations, at high and 1-bit-error SNR). Previously
+  `src/wifi.rs` only derived LDPC *parameters* (N/K/M, row/col block
+  counts); it did not contain the actual matrices and could not encode or
+  decode a real 802.11 codeword. `QcLdpcParams::from_raw_edges` (and the
+  matching `QcLdpcEncoder`/`QcLdpcDecoder::from_raw_edges`) generalizes
+  construction to accept any flat `(row, col, shift)` edge list, bypassing
+  the 3GPP-specific `ils_for_z`/modulo-scaling path entirely, without
+  touching the existing BG1/BG2 construction or its tests. **Out of scope
+  for this pass** (real 802.11 mechanics beyond matrix lookup, documented in
+  the `wifi`/`wifi_ldpc_tables` module docs): shortening (payloads smaller
+  than $K$) and puncturing/rate-matching (the per-MCS coded-bit selection).
 - `tests/reference_vectors.rs` — 14 known-answer conformance tests pinning
   codecs to external ground truth (reveng CRC catalogue, CCSDS Reed-Solomon
   conventions, published Hamming/Golay/BCH generator and parity-check

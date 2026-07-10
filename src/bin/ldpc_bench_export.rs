@@ -4,8 +4,8 @@
 //! Usage: `cargo run --release --bin ldpc_bench_export`
 //! Output: `bench/results/ldpc_rust.json`
 
-use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 use std::time::Instant;
+use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 
 const Z: usize = 384;
 const DECODE_ITERS: usize = 10;

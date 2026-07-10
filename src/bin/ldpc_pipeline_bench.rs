@@ -6,8 +6,8 @@
 //!
 //! Outputs bench/results/ldpc_pipeline_rust.json.
 
-use syndrome::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
 use std::time::Instant;
+use syndrome::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
 
 const DECODE_ITERS: usize = 10;
 const BENCH_FRAMES: usize = 500; // total frames submitted for timing

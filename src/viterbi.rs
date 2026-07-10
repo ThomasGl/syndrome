@@ -67,6 +67,12 @@ struct TrellisTable {
     out0: Vec<u8>,
     out1: Vec<u8>,
     /// Butterfly-reorganised branch tables used by the AVX2 ACS kernel.
+    /// Built on every target (cheap, construction-time only) but only read
+    /// by the x86_64 kernels.
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     bfly: ButterflyTables,
 }
 
@@ -91,6 +97,12 @@ struct TrellisTable {
 /// $2j+1$.  Built for any even `n_states`, but only consumed by the AVX2
 /// kernel when `n_states == 64` (K=7); other constraint lengths use the
 /// scalar fallback and never read these tables.
+// Only the x86_64 ACS kernels read these tables; other targets build them at
+// construction time but decode via the scalar path.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 struct ButterflyTables {
     /// `n_states / 2` (0 when `n_states == 1`, i.e. K=1).
     half: usize,
@@ -409,6 +421,178 @@ mod avx2_acs {
 }
 
 // ---------------------------------------------------------------------------
+// NEON add-compare-select kernel (AArch64, K=7 / 64-state specific)
+// ---------------------------------------------------------------------------
+//
+// NEON counterpart of `avx2_acs`, vectorising the same butterfly recursion
+// (see [`ButterflyTables`]) at 4-wide (`float32x4_t`/`int32x4_t`) instead of
+// AVX2's 8-wide, so `half = 32` splits into 8 groups of 4 instead of 4
+// groups of 8. NEON is mandatory on AArch64, so no runtime detection is
+// required (unlike the AVX2 kernel, which is gated behind
+// `is_x86_feature_detected!`).
+//
+// # Deinterleave
+//
+// AVX2 deinterleaves the even/odd predecessor-metric pairs with
+// `_mm256_permutevar8x32_*` + `_mm256_insertf128_*` (no native gather).
+// NEON's structured load `vld2q_{f32,s32}` performs the same even/odd
+// deinterleave directly in one instruction: loading 8 consecutive elements
+// as `vld2q_f32` yields `(even, odd)` where `even[i] = src[2*i]` and
+// `odd[i] = src[2*i + 1]`, exactly the layout this recursion needs.
+#[cfg(target_arch = "aarch64")]
+mod neon_acs {
+    use super::ButterflyTables;
+    use core::arch::aarch64::*;
+
+    /// Number of butterfly groups processed for K=7 (`half = 32`, 8 lanes of 4).
+    const N_CHUNKS: usize = 8;
+
+    /// One NEON trellis step of the soft-decision (max-log-MAP) ACS
+    /// recursion. Mirrors [`super::avx2_acs::acs_step_soft`] at 4-wide.
+    ///
+    /// # Safety
+    ///
+    /// NEON is guaranteed on AArch64; no runtime detection is required.
+    /// `bfly.half` must equal `N_CHUNKS * 4` (K=7 / 64 states); all slice
+    /// arguments must have the lengths documented on
+    /// [`super::avx2_acs::acs_step_soft`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn acs_step_soft(
+        cur_met: &[f32],
+        nxt_met: &mut [f32],
+        traceback_row: &mut [u8],
+        bfly: &ButterflyTables,
+        sign0_even: &[f32],
+        sign1_even: &[f32],
+        sign0_odd: &[f32],
+        sign1_odd: &[f32],
+        l0: f32,
+        l1: f32,
+    ) {
+        // Rust 2024: explicit unsafe block required even inside `unsafe fn`.
+        unsafe {
+            debug_assert_eq!(bfly.half, N_CHUNKS * 4);
+            let half = bfly.half;
+            let l0v = vdupq_n_f32(l0);
+            let l1v = vdupq_n_f32(l1);
+            let one = vdupq_n_s32(1);
+            let iota4 = [0i32, 1, 2, 3];
+            let iota = vld1q_s32(iota4.as_ptr());
+
+            for c in 0..N_CHUNKS {
+                let base8 = c * 8;
+                let deint = vld2q_f32(cur_met.as_ptr().add(base8));
+                let even_v = deint.0;
+                let odd_v = deint.1;
+                let j_base = vaddq_s32(iota, vdupq_n_s32((c * 4) as i32));
+                let state_base = vshlq_n_s32::<1>(j_base); // 2*j
+
+                for b in 0..2usize {
+                    let off = b * half + c * 4;
+                    let s0e = vld1q_f32(sign0_even[off..].as_ptr());
+                    let s1e = vld1q_f32(sign1_even[off..].as_ptr());
+                    let s0o = vld1q_f32(sign0_odd[off..].as_ptr());
+                    let s1o = vld1q_f32(sign1_odd[off..].as_ptr());
+
+                    let bm_even = vaddq_f32(vmulq_f32(s0e, l0v), vmulq_f32(s1e, l1v));
+                    let bm_odd = vaddq_f32(vmulq_f32(s0o, l0v), vmulq_f32(s1o, l1v));
+
+                    let cand_even = vaddq_f32(even_v, bm_even);
+                    let cand_odd = vaddq_f32(odd_v, bm_odd);
+
+                    // Strict '>' matches the scalar tie-break: the even (2j)
+                    // predecessor always arrives first, so ties keep it.
+                    let mask = vcgtq_f32(cand_odd, cand_even);
+                    let winner = vbslq_f32(mask, cand_odd, cand_even);
+
+                    let dest = b * half + c * 4;
+                    vst1q_f32(nxt_met[dest..].as_mut_ptr(), winner);
+
+                    let mask_i = vreinterpretq_s32_u32(mask);
+                    let winner_bit = vandq_s32(mask_i, one);
+                    let pred_state = vaddq_s32(state_base, winner_bit);
+
+                    let mut tmp = [0i32; 4];
+                    vst1q_s32(tmp.as_mut_ptr(), pred_state);
+                    for i in 0..4 {
+                        traceback_row[dest + i] = tmp[i] as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One NEON trellis step of the hard-decision (Hamming-metric) ACS
+    /// recursion. Mirrors [`super::avx2_acs::acs_step_hard`] at 4-wide:
+    /// branch metrics are `(r ^ out)` summed (values in `{0, 1, 2}`), and the
+    /// merge picks the *smaller* candidate (min, not max), again breaking
+    /// ties toward the even predecessor to match the scalar reference.
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`acs_step_soft`].
+    pub(super) unsafe fn acs_step_hard(
+        cur_met: &[i32],
+        nxt_met: &mut [i32],
+        traceback_row: &mut [u8],
+        bfly: &ButterflyTables,
+        r0: i32,
+        r1: i32,
+    ) {
+        // Rust 2024: explicit unsafe block required even inside `unsafe fn`.
+        unsafe {
+            debug_assert_eq!(bfly.half, N_CHUNKS * 4);
+            let half = bfly.half;
+            let r0v = vdupq_n_s32(r0);
+            let r1v = vdupq_n_s32(r1);
+            let one = vdupq_n_s32(1);
+            let iota4 = [0i32, 1, 2, 3];
+            let iota = vld1q_s32(iota4.as_ptr());
+
+            for c in 0..N_CHUNKS {
+                let base8 = c * 8;
+                let deint = vld2q_s32(cur_met.as_ptr().add(base8));
+                let even_v = deint.0;
+                let odd_v = deint.1;
+                let j_base = vaddq_s32(iota, vdupq_n_s32((c * 4) as i32));
+                let state_base = vshlq_n_s32::<1>(j_base);
+
+                for b in 0..2usize {
+                    let off = b * half + c * 4;
+                    let o0e = vld1q_s32(bfly.out0_even[off..].as_ptr());
+                    let o1e = vld1q_s32(bfly.out1_even[off..].as_ptr());
+                    let o0o = vld1q_s32(bfly.out0_odd[off..].as_ptr());
+                    let o1o = vld1q_s32(bfly.out1_odd[off..].as_ptr());
+
+                    let bm_even = vaddq_s32(veorq_s32(r0v, o0e), veorq_s32(r1v, o1e));
+                    let bm_odd = vaddq_s32(veorq_s32(r0v, o0o), veorq_s32(r1v, o1o));
+
+                    let cand_even = vaddq_s32(even_v, bm_even);
+                    let cand_odd = vaddq_s32(odd_v, bm_odd);
+
+                    // odd wins only if strictly smaller (min-metric, tie -> even).
+                    let mask = vcgtq_s32(cand_even, cand_odd);
+                    let winner = vbslq_s32(mask, cand_odd, cand_even);
+
+                    let dest = b * half + c * 4;
+                    vst1q_s32(nxt_met[dest..].as_mut_ptr(), winner);
+
+                    let mask_i = vreinterpretq_s32_u32(mask);
+                    let winner_bit = vandq_s32(mask_i, one);
+                    let pred_state = vaddq_s32(state_base, winner_bit);
+
+                    let mut tmp = [0i32; 4];
+                    vst1q_s32(tmp.as_mut_ptr(), pred_state);
+                    for i in 0..4 {
+                        traceback_row[dest + i] = tmp[i] as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Generator polynomial defaults
 // ---------------------------------------------------------------------------
 
@@ -470,7 +654,17 @@ fn default_generators(k: usize) -> (u32, u32) {
 struct ViterbiScratch {
     cur_met_u32: Vec<u32>,
     nxt_met_u32: Vec<u32>,
+    // i32 metrics feed only the x86_64 AVX2 hard-decision kernel; other
+    // targets allocate them (tiny: n_states elements) but never read them.
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     cur_met_i32: Vec<i32>,
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     nxt_met_i32: Vec<i32>,
     cur_met_f32: Vec<f32>,
     nxt_met_f32: Vec<f32>,
@@ -652,6 +846,10 @@ impl ViterbiDecoder {
         if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
             return self.decode_hard_avx2(coded);
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.trellis.n_states == 64 {
+            return self.decode_hard_neon(coded);
+        }
         self.decode_hard_scalar(coded)
     }
 
@@ -767,6 +965,62 @@ impl ViterbiDecoder {
         self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
+    /// NEON-vectorised hard-decision decode for the K=7 (64-state) trellis.
+    ///
+    /// AArch64 counterpart of [`decode_hard_avx2`](Self::decode_hard_avx2);
+    /// same `i32` metric domain and rationale (see that method's doc
+    /// comment). See [`neon_acs::acs_step_hard`] and [`ButterflyTables`] for
+    /// the vectorisation strategy.
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_hard`](Self::decode_hard) after checking
+    /// `n_states == 64`; exposed as `pub(crate)` for the equivalence tests,
+    /// which perform the same check. NEON is mandatory on AArch64, so no
+    /// runtime feature check is needed here (unlike the AVX2 path).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn decode_hard_neon(&self, coded: &[u8]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "NEON ACS path requires K=7");
+        let k = self.constraint_length;
+        let n_states = self.trellis.n_states;
+        let t_max = coded.len() / 2;
+        let tail = k.saturating_sub(1);
+        let n_info = t_max.saturating_sub(tail);
+        if n_info == 0 {
+            return vec![];
+        }
+
+        // Generous headroom sentinel; see `decode_hard_avx2`'s doc comment
+        // for why `i32` (not saturating, not `u16`) is safe here.
+        const INF: i32 = i32::MAX / 4;
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_i32.iter_mut().for_each(|m| *m = INF);
+        scratch.cur_met_i32[0] = 0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_i32,
+            nxt_met_i32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_i32.as_mut_slice(), nxt_met_i32.as_mut_slice());
+        let bfly = &self.trellis.bfly;
+
+        for t in 0..t_max {
+            let r0 = (coded[2 * t] & 1) as i32;
+            let r1 = (coded[2 * t + 1] & 1) as i32;
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            // SAFETY: NEON is mandatory on AArch64; `bfly.half == 32` for
+            // n_states==64.
+            unsafe {
+                neon_acs::acs_step_hard(cur_met, nxt_met, row, bfly, r0, r1);
+            }
+            core::mem::swap(&mut cur_met, &mut nxt_met);
+        }
+
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
+    }
+
     /// Soft-decision Viterbi decode (max-log-MAP branch metric).
     ///
     /// `llr` contains paired LLR values `[L0, L1, L0, L1, …]` where
@@ -795,6 +1049,10 @@ impl ViterbiDecoder {
         #[cfg(target_arch = "x86_64")]
         if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
             return self.decode_soft_avx2(llr);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.trellis.n_states == 64 {
+            return self.decode_soft_neon(llr);
         }
         self.decode_soft_scalar(llr)
     }
@@ -909,6 +1167,72 @@ impl ViterbiDecoder {
             // `decode_soft`/test callers); `bfly.half == 32` for n_states==64.
             unsafe {
                 avx2_acs::acs_step_soft(
+                    cur_met,
+                    nxt_met,
+                    row,
+                    bfly,
+                    &bfly.sign0_even,
+                    &bfly.sign1_even,
+                    &bfly.sign0_odd,
+                    &bfly.sign1_odd,
+                    l0,
+                    l1,
+                );
+            }
+            core::mem::swap(&mut cur_met, &mut nxt_met);
+        }
+
+        self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
+    }
+
+    /// NEON-vectorised soft-decision (max-log-MAP) decode for the K=7
+    /// (64-state) trellis.
+    ///
+    /// AArch64 counterpart of [`decode_soft_avx2`](Self::decode_soft_avx2);
+    /// same fused branch-metric strategy (see that method's doc comment).
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_soft`](Self::decode_soft) after checking
+    /// `n_states == 64`; exposed as `pub(crate)` for the equivalence tests,
+    /// which perform the same check. NEON is mandatory on AArch64, so no
+    /// runtime feature check is needed here (unlike the AVX2 path).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn decode_soft_neon(&self, llr: &[f32]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "NEON ACS path requires K=7");
+        let k = self.constraint_length;
+        let n_states = self.trellis.n_states;
+        let t_max = llr.len() / 2;
+        let tail = k.saturating_sub(1);
+        let n_info = t_max.saturating_sub(tail);
+        if n_info == 0 {
+            return vec![];
+        }
+
+        let bfly = &self.trellis.bfly;
+        let mut scratch = self.scratch.borrow_mut();
+        scratch
+            .cur_met_f32
+            .iter_mut()
+            .for_each(|m| *m = f32::NEG_INFINITY);
+        scratch.cur_met_f32[0] = 0.0;
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
+
+        for t in 0..t_max {
+            let l0 = llr[2 * t];
+            let l1 = llr[2 * t + 1];
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            // SAFETY: NEON is mandatory on AArch64; `bfly.half == 32` for
+            // n_states==64.
+            unsafe {
+                neon_acs::acs_step_soft(
                     cur_met,
                     nxt_met,
                     row,
@@ -1137,6 +1461,71 @@ mod tests {
             assert_eq!(
                 scalar, avx2,
                 "trial {trial} (len={len}) hard decode mismatch between scalar and AVX2"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NEON vs. scalar equivalence (K=7 / 64-state ACS kernel)
+    // -----------------------------------------------------------------------
+    //
+    // NEON is mandatory on AArch64 (no runtime detection to skip), so these
+    // tests run unconditionally there and are entirely absent on other
+    // architectures — mirrors the AVX2 equivalence tests above.
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn decode_soft_neon_matches_scalar_on_random_noisy_llrs() {
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0xC0FF_EE00_1234_5678u64;
+        for trial in 0..50 {
+            let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let coded = dec.encode(&info);
+            // Noisy soft channel: correct-sign LLR plus continuous noise in
+            // [-1.2, 1.2), occasionally flipping the sign outright so both
+            // decoders see genuinely ambiguous (tie-adjacent) metrics.
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| {
+                    let base = if b == 0 { 3.0 } else { -3.0 };
+                    let noise = (splitmix64(&mut seed) % 2401) as f32 / 1000.0 - 1.2;
+                    base + noise
+                })
+                .collect();
+            let scalar = dec.decode_soft_scalar(&llr);
+            let neon = dec.decode_soft_neon(&llr);
+            assert_eq!(
+                scalar, neon,
+                "trial {trial} (len={len}) soft decode mismatch between scalar and NEON"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn decode_hard_neon_matches_scalar_on_random_bit_flips() {
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0x1357_9BDF_2468_ACE0u64;
+        for trial in 0..50 {
+            let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let mut coded = dec.encode(&info);
+            // Flip roughly 5% of coded bits at pseudo-random positions.
+            for bit in coded.iter_mut() {
+                if splitmix64(&mut seed) % 20 == 0 {
+                    *bit ^= 1;
+                }
+            }
+            let scalar = dec.decode_hard_scalar(&coded);
+            let neon = dec.decode_hard_neon(&coded);
+            assert_eq!(
+                scalar, neon,
+                "trial {trial} (len={len}) hard decode mismatch between scalar and NEON"
             );
         }
     }

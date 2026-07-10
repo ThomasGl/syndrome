@@ -1,5 +1,5 @@
-use syndrome::ReedSolomon;
 use std::time::Instant;
+use syndrome::ReedSolomon;
 
 fn bench<F: Fn(&ReedSolomon, &[&[u8]], &mut [u8])>(
     name: &str,

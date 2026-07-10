@@ -259,8 +259,15 @@ impl DlSchEncoder {
 impl Clone for QcLdpcEncoder {
     fn clone(&self) -> Self {
         // Rebuild from the stored (bg, z) — a setup path, allocation intended.
-        QcLdpcEncoder::new(self.base_graph(), self.lifting_size())
-            .expect("clone: original encoder was valid")
+        // `base_graph()` is `None` only for encoders built via
+        // `QcLdpcEncoder::from_raw_edges` (e.g. Wi-Fi — see
+        // `crate::wifi_ldpc_tables`); the DL-SCH/UL-SCH transport-block
+        // pipeline in this module is 3GPP-only and never holds one of those,
+        // so rebuilding from `(bg, z)` is always valid here.
+        let bg = self
+            .base_graph()
+            .expect("clone: transport_block encoders are always 3GPP-constructed (Some(bg))");
+        QcLdpcEncoder::new(bg, self.lifting_size()).expect("clone: original encoder was valid")
     }
 }
 

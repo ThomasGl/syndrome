@@ -5,8 +5,8 @@
 //! Usage: cargo run --release --bin bench_export
 //! Output: bench/results/rust.json, bench/results/rust.checksum
 
-use syndrome::ReedSolomon;
 use std::time::Instant;
+use syndrome::ReedSolomon;
 
 const DATA_SHARDS: usize = 10;
 const PARITY_SHARDS: usize = 4;

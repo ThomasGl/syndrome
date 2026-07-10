@@ -259,8 +259,12 @@ fn process_z_positions_simd(
 /// only borrows slices into these `Vec`s — no allocation during decode.
 #[derive(Clone)]
 pub struct QcLdpcParams {
-    /// Base graph these parameters were expanded from.
-    pub bg: BaseGraph,
+    /// Base graph these parameters were expanded from, if constructed via
+    /// [`QcLdpcParams::new`] (the 3GPP `ils_for_z`/`entry_col_shift` path).
+    /// `None` for parameters built via [`QcLdpcParams::from_raw_edges`]
+    /// (e.g. IEEE 802.11 LDPC tables — see `crate::wifi_ldpc_tables`), which
+    /// are not tied to a 3GPP base graph at all.
+    pub bg: Option<BaseGraph>,
     /// Lifting size $Z$.
     pub z: usize,
     /// Number of check-node block rows.
@@ -275,6 +279,71 @@ pub struct QcLdpcParams {
     pub submatrix_shifts: Vec<i16>,
     /// Maximum degree across all layers (used for scratch sizing).
     pub max_layer_degree: usize,
+}
+
+/// Largest lifting size this crate's fixed-size stack scratch buffers are
+/// sized for (see `Z_MAX` in the decoder/encoder hot paths below). Shared by
+/// both construction paths so `from_raw_edges` rejects an oversized `z`
+/// with the same bound the 3GPP path already respects implicitly (384 is
+/// the largest valid 3GPP lifting size).
+const PARAMS_Z_MAX: usize = 384;
+
+/// Shared edge-list -> layered layout construction used by both the 3GPP
+/// (`ils_for_z`-scaled) construction path in [`QcLdpcParams::new`] and the
+/// raw-edge (e.g. Wi-Fi) path in [`QcLdpcParams::from_raw_edges`]. Groups
+/// edges by row block, producing the prefix-sum `layer_offsets` and the
+/// per-edge `(col, shift)` arrays sorted by row — the only part of
+/// [`QcLdpcParams`] construction that does not depend on how a given
+/// edge's shift value was computed.
+///
+/// # Arguments
+///
+/// * `edges` - Iterator of `(row_block, col_block, shift)` triples, in any
+///   order; `shift` must already be the final cyclic shift (no further
+///   scaling is applied here).
+/// * `num_row_blocks` - Number of check-node block rows.
+///
+/// # Returns
+///
+/// `(layer_offsets, submatrix_cols, submatrix_shifts, max_layer_degree)`.
+fn build_layout(
+    edges: impl Iterator<Item = (usize, usize, i16)> + Clone,
+    num_row_blocks: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<i16>, usize) {
+    // Count edges per row block.
+    let mut row_degrees = vec![0usize; num_row_blocks];
+    for (r, _, _) in edges.clone() {
+        row_degrees[r] += 1;
+    }
+
+    // Build layer_offsets (prefix sum).
+    let mut layer_offsets = vec![0usize; num_row_blocks + 1];
+    for r in 0..num_row_blocks {
+        layer_offsets[r + 1] = layer_offsets[r] + row_degrees[r];
+    }
+    let total_edges = layer_offsets[num_row_blocks];
+
+    // Build submatrix_cols and submatrix_shifts sorted by row then by
+    // entry order.  We fill each row's slice in a second pass.
+    let mut submatrix_cols = vec![0usize; total_edges];
+    let mut submatrix_shifts = vec![0i16; total_edges];
+    let mut row_fill = vec![0usize; num_row_blocks];
+
+    for (r, col, shift) in edges {
+        let pos = layer_offsets[r] + row_fill[r];
+        submatrix_cols[pos] = col;
+        submatrix_shifts[pos] = shift;
+        row_fill[r] += 1;
+    }
+
+    let max_layer_degree = row_degrees.iter().copied().max().unwrap_or(0);
+
+    (
+        layer_offsets,
+        submatrix_cols,
+        submatrix_shifts,
+        max_layer_degree,
+    )
 }
 
 impl QcLdpcParams {
@@ -292,39 +361,105 @@ impl QcLdpcParams {
             BaseGraph::Bg2 => (BG2_ROWS, BG2_COLS, BG2_ENTRIES.as_ref(), BG2_ENTRY_COUNT),
         };
 
-        // Count edges per row block.
-        let mut row_degrees = vec![0usize; num_row_blocks];
-        for ei in 0..entry_count {
-            let r = entries[ei].0 as usize;
-            row_degrees[r] += 1;
-        }
-
-        // Build layer_offsets (prefix sum).
-        let mut layer_offsets = vec![0usize; num_row_blocks + 1];
-        for r in 0..num_row_blocks {
-            layer_offsets[r + 1] = layer_offsets[r] + row_degrees[r];
-        }
-        let total_edges = layer_offsets[num_row_blocks];
-
-        // Build submatrix_cols and submatrix_shifts sorted by row then by
-        // entry order.  We fill each row's slice in a second pass.
-        let mut submatrix_cols = vec![0usize; total_edges];
-        let mut submatrix_shifts = vec![0i16; total_edges];
-        let mut row_fill = vec![0usize; num_row_blocks];
-
-        for ei in 0..entry_count {
+        let edge_iter = (0..entry_count).map(|ei| {
             let r = entries[ei].0 as usize;
             let (col, shift) = entry_col_shift(&entries[ei], ils, z);
-            let pos = layer_offsets[r] + row_fill[r];
-            submatrix_cols[pos] = col;
-            submatrix_shifts[pos] = shift as i16;
-            row_fill[r] += 1;
-        }
-
-        let max_layer_degree = row_degrees.iter().copied().max().unwrap_or(0);
+            (r, col, shift as i16)
+        });
+        let (layer_offsets, submatrix_cols, submatrix_shifts, max_layer_degree) =
+            build_layout(edge_iter, num_row_blocks);
 
         Ok(Self {
-            bg,
+            bg: Some(bg),
+            z,
+            num_row_blocks,
+            num_col_blocks,
+            layer_offsets,
+            submatrix_cols,
+            submatrix_shifts,
+            max_layer_degree,
+        })
+    }
+
+    /// Build [`QcLdpcParams`] directly from a flat `(row_block, col_block,
+    /// shift)` edge list, bypassing the 3GPP-specific lifting-size-*set*
+    /// scaling (`ils_for_z`/`entry_col_shift`) entirely.
+    ///
+    /// This is the generic entry point for any QC-LDPC base graph whose
+    /// shift values are already absolute, literal, per-`z` numbers rather
+    /// than 3GPP's per-iLS scaled table — e.g. the IEEE 802.11 LDPC
+    /// matrices in `crate::wifi_ldpc_tables`, where each of the 3 lifting
+    /// sizes has its own complete, independent shift table (no modulo-`z`
+    /// reduction is applied here; callers must supply shifts that are
+    /// already `< z`).
+    ///
+    /// The same internal `build_layout` routine used by [`QcLdpcParams::new`]
+    /// builds the layered layout here, so the LOMS decoder and the sparse
+    /// structured encoder (`CoreLayout`/`EncodeStrategy`) work identically
+    /// on top of either construction path — same algorithm, different base
+    /// graph.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - Sparse edges `(row_block, col_block, shift)`. `shift`
+    ///   must be `< z`.
+    /// * `num_row_blocks` - Number of check-node block rows ($m_b$).
+    /// * `num_col_blocks` - Number of variable-node block columns ($n_b$).
+    /// * `z` - Lifting size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `z` is zero or exceeds the
+    /// fixed-size stack scratch buffers used by the encoder/decoder hot
+    /// paths (384, the largest valid 3GPP lifting size), or if any entry's
+    /// `row_block`/`col_block`/`shift` is out of range for the given shape.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::QcLdpcParams;
+    ///
+    /// // A tiny 2-row, 3-col toy code: two edges.
+    /// let entries: [(u8, u8, i16); 2] = [(0, 0, 0), (1, 2, 1)];
+    /// let params = QcLdpcParams::from_raw_edges(&entries, 2, 3, 4).unwrap();
+    /// assert_eq!(params.num_row_blocks, 2);
+    /// assert_eq!(params.num_col_blocks, 3);
+    /// ```
+    pub fn from_raw_edges(
+        entries: &[(u8, u8, i16)],
+        num_row_blocks: usize,
+        num_col_blocks: usize,
+        z: usize,
+    ) -> Result<Self, FecError> {
+        if z == 0 || z > PARAMS_Z_MAX {
+            return Err(FecError::InvalidParam(
+                "z must be in 1..=384 (the fixed-size stack scratch buffers used by the LOMS hot path are sized for Z_MAX=384)",
+            ));
+        }
+        for &(r, c, s) in entries {
+            if r as usize >= num_row_blocks {
+                return Err(FecError::InvalidParam(
+                    "raw edge row_block is out of range for num_row_blocks",
+                ));
+            }
+            if c as usize >= num_col_blocks {
+                return Err(FecError::InvalidParam(
+                    "raw edge col_block is out of range for num_col_blocks",
+                ));
+            }
+            if s < 0 || s as usize >= z {
+                return Err(FecError::InvalidParam(
+                    "raw edge shift must satisfy 0 <= shift < z",
+                ));
+            }
+        }
+
+        let edge_iter = entries.iter().map(|&(r, c, s)| (r as usize, c as usize, s));
+        let (layer_offsets, submatrix_cols, submatrix_shifts, max_layer_degree) =
+            build_layout(edge_iter, num_row_blocks);
+
+        Ok(Self {
+            bg: None,
             z,
             num_row_blocks,
             num_col_blocks,
@@ -397,6 +532,32 @@ impl QcLdpcDecoder {
     /// Returns [`FecError::InvalidParam`] if `z` is not a valid 3GPP lifting size.
     pub fn with_lifting_size(bg: BaseGraph, z: usize, offset_beta: f32) -> Result<Self, FecError> {
         let params = QcLdpcParams::new(bg, z)?;
+        Ok(Self {
+            params,
+            offset_beta,
+        })
+    }
+
+    /// Create a decoder directly from a flat `(row, col, shift)` edge list,
+    /// bypassing the 3GPP-specific construction path.
+    ///
+    /// See [`QcLdpcParams::from_raw_edges`] for the argument semantics; this
+    /// is the constructor used by `crate::wifi_ldpc_tables` to build a
+    /// decoder for a real IEEE 802.11 LDPC code. The LOMS algorithm itself
+    /// is unchanged — only the base-graph edge list differs from the 3GPP
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FecError`] from [`QcLdpcParams::from_raw_edges`].
+    pub fn from_raw_edges(
+        entries: &[(u8, u8, i16)],
+        num_row_blocks: usize,
+        num_col_blocks: usize,
+        z: usize,
+        offset_beta: f32,
+    ) -> Result<Self, FecError> {
+        let params = QcLdpcParams::from_raw_edges(entries, num_row_blocks, num_col_blocks, z)?;
         Ok(Self {
             params,
             offset_beta,
@@ -587,11 +748,10 @@ impl QcLdpcDecoder {
         let mut sxor_buf = [0u32; Z_MAX];
 
         // Detect SIMD capability once per call (is_x86_feature_detected! is a
-        // single cached atomic read — negligible overhead per call).
+        // single cached atomic read — negligible overhead per call). Only
+        // bound on x86_64: every use site is behind the same cfg.
         #[cfg(target_arch = "x86_64")]
         let use_avx2 = is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_avx2 = false;
 
         let mut iters_used = 0usize;
         for _ in 0..iterations {
@@ -677,66 +837,70 @@ impl QcLdpcDecoder {
                     continue;
                 }
 
-                // Scalar fallback (non-x86_64/aarch64 or no AVX2 at runtime).
-                //
-                // Pass 1: accumulate min1, min2, sign-XOR across edges.
-                // The inner loop over z is the vectorisation axis (Z=384 trips,
-                // independent across z_idx). LLVM emits AVX2 on x86-64 without
-                // explicit intrinsics when AVX2 is the compile-time target.
-                min1.iter_mut().for_each(|v| *v = f32::MAX);
-                min2.iter_mut().for_each(|v| *v = f32::MAX);
-                sxor.iter_mut().for_each(|v| *v = 0);
+                // Scalar fallback (non-x86_64/aarch64, or no AVX2 at runtime).
+                // Compiled out on aarch64, where the NEON block above always
+                // takes the layer and this code would be unreachable.
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    // Pass 1: accumulate min1, min2, sign-XOR across edges.
+                    // The inner loop over z is the vectorisation axis (Z=384 trips,
+                    // independent across z_idx). LLVM emits AVX2 on x86-64 without
+                    // explicit intrinsics when AVX2 is the compile-time target.
+                    min1.iter_mut().for_each(|v| *v = f32::MAX);
+                    min2.iter_mut().for_each(|v| *v = f32::MAX);
+                    sxor.iter_mut().for_each(|v| *v = 0);
 
-                for edge in 0..row_degree {
-                    let q_base = edge * z;
-                    for z_idx in 0..z {
-                        let bits = q_row[q_base + z_idx].to_bits();
-                        let abs_q = f32::from_bits(bits & 0x7FFF_FFFF);
-                        sxor[z_idx] ^= bits & 0x8000_0000;
-                        let m1 = min1[z_idx];
-                        if abs_q <= m1 {
-                            min2[z_idx] = m1;
-                            min1[z_idx] = abs_q;
-                        } else if abs_q < min2[z_idx] {
-                            min2[z_idx] = abs_q;
+                    for edge in 0..row_degree {
+                        let q_base = edge * z;
+                        for z_idx in 0..z {
+                            let bits = q_row[q_base + z_idx].to_bits();
+                            let abs_q = f32::from_bits(bits & 0x7FFF_FFFF);
+                            sxor[z_idx] ^= bits & 0x8000_0000;
+                            let m1 = min1[z_idx];
+                            if abs_q <= m1 {
+                                min2[z_idx] = m1;
+                                min1[z_idx] = abs_q;
+                            } else if abs_q < min2[z_idx] {
+                                min2[z_idx] = abs_q;
+                            }
                         }
                     }
-                }
 
-                for z_idx in 0..z {
-                    if min1[z_idx] == f32::MAX {
-                        min1[z_idx] = 0.0;
-                    }
-                    if min2[z_idx] == f32::MAX {
-                        min2[z_idx] = min1[z_idx];
-                    }
-                }
-
-                // Pass 2: update edge_r and LLR.
-                for edge in 0..row_degree {
-                    let col_block = self.params.submatrix_cols[layer_begin + edge];
-                    let shift = self.params.submatrix_shifts[layer_begin + edge] as usize;
-                    let base_edge = (layer_begin + edge) * z;
-                    let q_base = edge * z;
                     for z_idx in 0..z {
-                        let q_bits = q_row[q_base + z_idx].to_bits();
-                        let abs_q = f32::from_bits(q_bits & 0x7FFF_FFFF);
-                        let sign_excl_bit = sxor[z_idx] ^ (q_bits & 0x8000_0000);
-                        let min_excl = if abs_q == min1[z_idx] {
-                            min2[z_idx]
-                        } else {
-                            min1[z_idx]
-                        };
-                        let mag = min_excl - offset_beta;
-                        let mag = if mag < 0.0 { 0.0 } else { mag };
-                        let new_r = f32::from_bits(mag.to_bits() | sign_excl_bit);
-                        let old_r = edge_r[base_edge + z_idx];
-                        edge_r[base_edge + z_idx] = new_r;
-                        let s = z_idx + shift;
-                        let var_idx = col_block * z + if s >= z { s - z } else { s };
-                        llr[var_idx] += new_r - old_r;
+                        if min1[z_idx] == f32::MAX {
+                            min1[z_idx] = 0.0;
+                        }
+                        if min2[z_idx] == f32::MAX {
+                            min2[z_idx] = min1[z_idx];
+                        }
                     }
-                }
+
+                    // Pass 2: update edge_r and LLR.
+                    for edge in 0..row_degree {
+                        let col_block = self.params.submatrix_cols[layer_begin + edge];
+                        let shift = self.params.submatrix_shifts[layer_begin + edge] as usize;
+                        let base_edge = (layer_begin + edge) * z;
+                        let q_base = edge * z;
+                        for z_idx in 0..z {
+                            let q_bits = q_row[q_base + z_idx].to_bits();
+                            let abs_q = f32::from_bits(q_bits & 0x7FFF_FFFF);
+                            let sign_excl_bit = sxor[z_idx] ^ (q_bits & 0x8000_0000);
+                            let min_excl = if abs_q == min1[z_idx] {
+                                min2[z_idx]
+                            } else {
+                                min1[z_idx]
+                            };
+                            let mag = min_excl - offset_beta;
+                            let mag = if mag < 0.0 { 0.0 } else { mag };
+                            let new_r = f32::from_bits(mag.to_bits() | sign_excl_bit);
+                            let old_r = edge_r[base_edge + z_idx];
+                            edge_r[base_edge + z_idx] = new_r;
+                            let s = z_idx + shift;
+                            let var_idx = col_block * z + if s >= z { s - z } else { s };
+                            llr[var_idx] += new_r - old_r;
+                        }
+                    }
+                } // end cfg(not(aarch64)) scalar fallback
             }
 
             // Early termination: all parity checks satisfied → quit.
@@ -1258,6 +1422,38 @@ impl QcLdpcEncoder {
     /// fallback only) if the parity matrix is singular.
     pub fn new(bg: BaseGraph, z: usize) -> Result<Self, FecError> {
         let params = QcLdpcParams::new(bg, z)?;
+        Self::from_params(params)
+    }
+
+    /// Create an encoder directly from a flat `(row, col, shift)` edge list,
+    /// bypassing the 3GPP-specific construction path.
+    ///
+    /// See [`QcLdpcParams::from_raw_edges`] for the argument semantics; this
+    /// is the constructor used by `crate::wifi_ldpc_tables` to build an
+    /// encoder for a real IEEE 802.11 LDPC code. The sparse structured
+    /// solve (`CoreLayout`) / dense generator fallback logic below is
+    /// exactly the same code path as [`QcLdpcEncoder::new`] — only the
+    /// base-graph edge list differs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FecError`] from [`QcLdpcParams::from_raw_edges`], or
+    /// (dense fallback only) if the resulting parity matrix is singular.
+    pub fn from_raw_edges(
+        entries: &[(u8, u8, i16)],
+        num_row_blocks: usize,
+        num_col_blocks: usize,
+        z: usize,
+    ) -> Result<Self, FecError> {
+        let params = QcLdpcParams::from_raw_edges(entries, num_row_blocks, num_col_blocks, z)?;
+        Self::from_params(params)
+    }
+
+    /// Shared tail of [`QcLdpcEncoder::new`]/[`QcLdpcEncoder::from_raw_edges`]:
+    /// pick the sparse structured solve if the base graph's core matches the
+    /// expected double-diagonal pattern, else fall back to the dense GF(2)
+    /// generator.
+    fn from_params(params: QcLdpcParams) -> Result<Self, FecError> {
         let k_b_blocks = params.num_col_blocks - params.num_row_blocks;
         let k_bits = k_b_blocks * params.z;
         let strategy = match CoreLayout::derive(&params, k_b_blocks) {
@@ -1289,8 +1485,11 @@ impl QcLdpcEncoder {
         self.params.num_col_blocks * self.params.z
     }
 
-    /// Base graph this encoder was constructed for.
-    pub fn base_graph(&self) -> BaseGraph {
+    /// Base graph this encoder was constructed for, or `None` if it was
+    /// built via [`QcLdpcEncoder::from_raw_edges`] (e.g. an IEEE 802.11
+    /// LDPC code — see `crate::wifi_ldpc_tables`), which is not tied to a
+    /// 3GPP base graph.
+    pub fn base_graph(&self) -> Option<BaseGraph> {
         self.params.bg
     }
 

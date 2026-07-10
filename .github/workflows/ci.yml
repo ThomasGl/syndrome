@@ -40,6 +40,36 @@ jobs:
       - name: Run doctests
         run: cargo test --doc
 
+  test-arm:
+    name: Test Suite (AArch64 / NEON)
+    # GitHub's free arm64 runners for public repos: the full suite executes
+    # natively on ARM, so the NEON kernels are run, not just compiled.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-arm-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm-cargo-
+
+      - name: Run unit + integration tests (native NEON)
+        run: cargo test --all
+
+      - name: Clippy (zero warnings on AArch64)
+        run: cargo clippy --all-targets -- -D warnings
+
   clippy:
     name: Clippy Lint
     runs-on: ubuntu-latest

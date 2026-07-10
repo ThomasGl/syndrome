@@ -95,8 +95,10 @@ impl GfTables {
 ///    that unlocks the fast encode/decode paths; skip it only if memory is
 ///    tighter than throughput.
 /// 3. [`ReedSolomon::encode_with_avx2`] — the fast path: runtime-detects
-///    AVX2 and falls back to portable table/scalar code, so it is safe to
-///    call unconditionally on any hardware.
+///    AVX2 on x86_64 (NEON on AArch64 is used unconditionally — it is
+///    mandatory on that architecture) and falls back to portable
+///    table/scalar code, so it is safe to call unconditionally on any
+///    hardware.
 /// 4. [`ReedSolomon::encode_into`] (zero-allocation, caller buffer) or
 ///    [`ReedSolomon::encode`] (convenience, allocates) — portable scalar
 ///    paths that need no precomputed tables.
@@ -362,18 +364,16 @@ impl ReedSolomon {
         }
         Ok(())
     }
-    /// Encode using AVX2 VPSHUFB for all non-zero coefficients.
+    /// Encode using the fastest SIMD kernel available for the running
+    /// architecture, applied to all non-zero coefficients.
     ///
     /// For each coefficient, decomposes the 256-byte GF multiply table into two
-    /// 16-byte nibble tables and applies them 32 bytes at a time via VPSHUFB.
-    /// Falls back to the portable chunked-table path (or, if
+    /// 16-byte nibble tables and applies them via a native SIMD table lookup:
+    /// AVX2 VPSHUFB (32 bytes/iteration) on x86_64, or NEON `vqtbl1q_u8` (16
+    /// bytes/iteration) on AArch64 (selected by a private per-architecture
+    /// dispatcher). Falls back to the portable chunked-table path (or, if
     /// `precompute_mul_tables` was never called, a plain scalar encode) when
-    /// AVX2 is not available at runtime.
-    ///
-    /// # Returns
-    ///
-    /// Throughput is typically 3–4× higher than the scalar chunked path on
-    /// x86_64 with AVX2 (VPSHUFB: 32 bytes / cycle vs. 8 bytes / cycle).
+    /// no SIMD kernel is available at runtime.
     ///
     /// # Errors
     ///
@@ -383,36 +383,62 @@ impl ReedSolomon {
     /// here — this method falls back to a scalar encode instead.
     pub fn encode_with_avx2(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let shard_len = self.validate_encode_inputs(data, parity_out)?;
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && self.mul_tables.is_some() {
-                self.encode_with_avx2_inner(data, parity_out);
+        if self.mul_tables.is_some() {
+            if self.encode_simd_dispatch(data, parity_out) {
                 return Ok(());
             }
+            // No SIMD kernel available for this target/runtime.
+            return self.encode_with_tables_chunked(data, parity_out);
         }
-        // Fallback: no AVX2 or tables not yet precomputed.
-        if self.mul_tables.is_some() {
-            self.encode_with_tables_chunked(data, parity_out)
-        } else {
-            // Defensive: tables not ready; use scalar path via encode_into.
-            let d = self.data_shards;
-            let p = self.parity_shards;
-            for b in parity_out.iter_mut().take(p * shard_len) {
-                *b = 0;
-            }
-            for j in 0..d {
-                for i in 0..p {
-                    let coef = self.coeffs[i * d + j];
-                    if coef == 0 {
-                        continue;
-                    }
-                    let pr = &mut parity_out[i * shard_len..i * shard_len + shard_len];
-                    for k in 0..shard_len {
-                        pr[k] ^= self.tables.mul(coef, data[j][k]);
-                    }
+        // Defensive: tables not ready; use scalar path via encode_into.
+        let d = self.data_shards;
+        let p = self.parity_shards;
+        for b in parity_out.iter_mut().take(p * shard_len) {
+            *b = 0;
+        }
+        for j in 0..d {
+            for i in 0..p {
+                let coef = self.coeffs[i * d + j];
+                if coef == 0 {
+                    continue;
+                }
+                let pr = &mut parity_out[i * shard_len..i * shard_len + shard_len];
+                for k in 0..shard_len {
+                    pr[k] ^= self.tables.mul(coef, data[j][k]);
                 }
             }
-            Ok(())
+        }
+        Ok(())
+    }
+
+    /// Private dispatcher: picks the fastest SIMD encode kernel for the
+    /// running architecture. Requires `self.mul_tables`/`nibble_tables` to
+    /// already be built (caller-checked).
+    ///
+    /// # Returns
+    ///
+    /// `true` if a SIMD kernel ran (and wrote all of `parity_out`); `false`
+    /// if none is available (no AVX2 at runtime on x86_64, or a target that
+    /// is neither x86_64 nor aarch64), in which case the caller must fall
+    /// back to a portable path itself.
+    fn encode_simd_dispatch(&self, data: &[&[u8]], parity_out: &mut [u8]) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                self.encode_with_avx2_inner(data, parity_out);
+                return true;
+            }
+        }
+        // AArch64: NEON is mandatory, so no runtime detection is needed.
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.encode_with_neon_inner(data, parity_out);
+            return true;
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (data, parity_out);
+            false
         }
     }
 
@@ -445,6 +471,43 @@ impl ReedSolomon {
                 // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
                 unsafe {
                     crate::simd_avx2::gf256_muladd_avx2(dj, parity_row, lo_tbl, hi_tbl, full_table);
+                }
+            }
+        }
+    }
+
+    /// NEON counterpart of [`Self::encode_with_avx2_inner`]. NEON is
+    /// mandatory on AArch64, so this is unconditionally safe to call (no
+    /// runtime feature check needed).
+    #[cfg(target_arch = "aarch64")]
+    fn encode_with_neon_inner(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+        let d = self.data_shards;
+        let p = self.parity_shards;
+        let tables = self.mul_tables.as_ref().unwrap();
+        // Built together with `mul_tables` in `precompute_mul_tables`, so
+        // this is always `Some` whenever `mul_tables` is.
+        let nibbles = self.nibble_tables.as_ref().unwrap();
+        let shard_len = data[0].len();
+        for b in parity_out.iter_mut().take(p * shard_len) {
+            *b = 0;
+        }
+
+        for j in 0..d {
+            let dj = data[j];
+            for i in 0..p {
+                let coef = self.coeffs[i * d + j];
+                if coef == 0 {
+                    continue;
+                }
+                let full_table: &[u8; 256] = &tables[coef as usize];
+                // Precomputed 16-byte lo/hi nibble tables (see
+                // `nibble_tables`'s field doc) -- indexed, not rebuilt.
+                let [lo_tbl, hi_tbl] = &nibbles[coef as usize];
+                let parity_row = &mut parity_out[i * shard_len..i * shard_len + shard_len];
+
+                // SAFETY: NEON is mandatory on AArch64.
+                unsafe {
+                    crate::simd_neon::gf256_muladd_neon(dj, parity_row, lo_tbl, hi_tbl, full_table);
                 }
             }
         }
@@ -787,11 +850,14 @@ impl ReedSolomon {
     /// the same table/SIMD machinery [`Self::encode_with_avx2`] uses instead
     /// of a per-byte scalar `mul` call. In order of preference:
     ///
-    /// 1. Runtime-detected AVX2 VPSHUFB nibble kernel (requires
+    /// 1. Runtime-detected AVX2 VPSHUFB nibble kernel on x86_64 (requires
     ///    [`Self::precompute_mul_tables`] to have been called and AVX2 to be
-    ///    available at runtime) — same kernel the encoder uses.
+    ///    available at runtime), or the NEON `vqtbl1q_u8` nibble kernel on
+    ///    AArch64 (NEON is mandatory there, so no runtime check is needed) —
+    ///    same kernels the encoder uses.
     /// 2. Precomputed 256×256 multiplication tables, applied 8 bytes at a
-    ///    time (chunked for cache/ILP), when tables exist but AVX2 does not.
+    ///    time (chunked for cache/ILP), when tables exist but no SIMD kernel
+    ///    ran (no AVX2 at runtime on x86_64, or a non-x86_64/aarch64 target).
     /// 3. Plain log/exp `mul`, byte by byte, when tables were never
     ///    precomputed. This keeps `decode` correct and allocation-free even
     ///    if the caller skipped `precompute_mul_tables`; call it first for
@@ -825,6 +891,21 @@ impl ReedSolomon {
                     }
                     return;
                 }
+            }
+        }
+
+        // AArch64: NEON is mandatory, so no runtime feature check is needed
+        // (mirrors the x86_64 AVX2 branch above).
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(tables) = self.mul_tables.as_ref() {
+                let full_table = &tables[coef as usize];
+                let [lo_tbl, hi_tbl] = &self.nibble_tables.as_ref().unwrap()[coef as usize];
+                // SAFETY: NEON is mandatory on AArch64.
+                unsafe {
+                    crate::simd_neon::gf256_muladd_neon(src, dst, lo_tbl, hi_tbl, full_table);
+                }
+                return;
             }
         }
 
@@ -1272,11 +1353,12 @@ mod tests {
     }
 
     /// Task-4 equivalence guard: `encode_with_avx2` (which consumes the
-    /// precomputed `nibble_tables` on AVX2 hosts) must produce parity
-    /// byte-identical to the plain scalar `encode_into` across many (data,
-    /// parity, shard_len) shapes, including lengths that are not multiples
-    /// of 32/8 (SIMD tail handling). On non-AVX2 hosts this still verifies
-    /// the table-chunked fallback against the scalar path.
+    /// precomputed `nibble_tables` on AVX2 hosts, or the NEON `vqtbl1q_u8`
+    /// kernel on AArch64 hosts) must produce parity byte-identical to the
+    /// plain scalar `encode_into` across many (data, parity, shard_len)
+    /// shapes, including lengths that are not multiples of 32/16/8 (SIMD
+    /// tail handling). On hosts with no SIMD kernel this still verifies the
+    /// table-chunked fallback against the scalar path.
     #[test]
     fn encode_avx2_nibble_tables_match_scalar() {
         let combos: &[(usize, usize, usize)] = &[
@@ -1311,6 +1393,55 @@ mod tests {
                 parity_avx2, parity_scalar,
                 "AVX2 (precomputed nibble tables) vs scalar parity mismatch: d={d} p={p} shard_len={shard_len}"
             );
+        }
+    }
+
+    /// NEON-specific equivalence guard: [`crate::simd_neon::gf256_muladd_neon`]
+    /// must produce output byte-identical to the plain scalar
+    /// `full_table[data[i]]` reference across random coefficients and
+    /// lengths, including lengths that are not multiples of 16 (SIMD tail
+    /// handling). Only compiled on AArch64; runs unconditionally there since
+    /// NEON is mandatory (no runtime detection to skip).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn gf256_muladd_neon_matches_scalar_full_table() {
+        let mut rs = ReedSolomon::new(1, 1);
+        rs.precompute_mul_tables();
+        let mul_tables = rs.mul_tables.as_ref().unwrap();
+        let nibbles = rs.nibble_tables.as_ref().unwrap();
+
+        let mut seed = 0xABCD_EF01_2345_6789u64;
+        let lens: &[usize] = &[0, 1, 5, 15, 16, 17, 31, 32, 33, 200, 4097];
+        for &len in lens {
+            for trial in 0..8 {
+                seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                let coef = (seed >> 32) as u8;
+                let data = xorshift_bytes(len, seed);
+
+                let full_table = &mul_tables[coef as usize];
+                let [lo_tbl, hi_tbl] = &nibbles[coef as usize];
+
+                let mut parity_neon = vec![0u8; len];
+                let mut parity_scalar = vec![0u8; len];
+                // SAFETY: NEON is mandatory on AArch64.
+                unsafe {
+                    crate::simd_neon::gf256_muladd_neon(
+                        &data,
+                        &mut parity_neon,
+                        lo_tbl,
+                        hi_tbl,
+                        full_table,
+                    );
+                }
+                for i in 0..len {
+                    parity_scalar[i] ^= full_table[data[i] as usize];
+                }
+
+                assert_eq!(
+                    parity_neon, parity_scalar,
+                    "trial {trial} coef={coef} len={len}: NEON vs scalar full-table mismatch"
+                );
+            }
         }
     }
 }

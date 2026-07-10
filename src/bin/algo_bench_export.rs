@@ -9,6 +9,7 @@
 //!
 //! All numbers are measured on this machine at run time — never hand-written.
 
+use std::time::Instant;
 use syndrome::channel_sim::AwgnChannel;
 use syndrome::crc::{Crc24, CrcKind};
 use syndrome::hamming::encode_hamming_7_4;
@@ -18,7 +19,6 @@ use syndrome::{
     BaseGraph, BchCode, GolayCode, QcLdpcDecoder, QcLdpcEncoder, ReedSolomon, TurboDecoder,
     TurboEncoder,
 };
-use std::time::Instant;
 
 /// Timing harness: warm-up then averaged wall-clock ns per call.
 fn time_ns<F: FnMut()>(mut f: F, warmup: u32, iters: u32) -> f64 {

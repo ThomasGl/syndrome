@@ -3,7 +3,7 @@
 [![CI](https://github.com/thomas-glezer/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-258%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-272%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -19,11 +19,11 @@
 
 | What | Detail |
 |---|---|
-| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), 802.11ax/be (Wi-Fi 6/7), IMT-2030 (6G research) |
+| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G research) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 258 total — 144 unit · 7 integration · 4 media reconstruction · 14 reference vectors · 30 robustness · 59 doctests |
+| **Tests** | 272 total on x86-64 (273 on AArch64, +1 NEON-only) — 150 unit · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 30 robustness · 64 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~82/64 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
@@ -43,6 +43,24 @@
 | **CRC-24A/B/C, 16/11/6** | 1961 | Detection only | $O(n)$ | Every 3GPP standard, Ethernet, ZIP | Peterson & Brown 1961 |
 
 Reading the table top-to-bottom is a history of coding theory: from hand-decodable classics, through the algebraic era, to the capacity-approaching iterative codes that power 4G/5G. This library implements all of them behind one consistent, allocation-disciplined API — the same progression a communications curriculum follows.
+
+**Why no separate Wi-Fi 7 or 6G rows?** Because neither standard defines new
+FEC. Wi-Fi 7 (802.11be) reuses the 802.11ax LDPC codes and the K=7 BCC —
+i.e. the QC-LDPC and Viterbi rows above; [`wifi.rs`](src/wifi.rs) supplies
+its MCS 0–13 tables (up to 4096-QAM) and LDPC parameter selection, and
+[`wifi_ldpc_tables.rs`](src/wifi_ldpc_tables.rs) now carries the real
+802.11 Annex R/F shift matrices for all 12 $(Z, R)$ combinations
+($Z \in \{27, 54, 81\}$, $R \in \{1/2, 2/3, 3/4, 5/6\}$), cross-validated
+against the IEEE 802.11n-2009 standard text itself — so a full,
+unshortened, unpunctured 802.11 codeword now genuinely encodes and decodes
+through the same LOMS kernel as 5G NR (`tests/wifi_ldpc_integration.rs`).
+Shortening and puncturing/rate-matching (the per-MCS coded-bit selection)
+are not implemented yet — see the `wifi`/`wifi_ldpc_tables` module docs. 6G
+(IMT-2030) is still in the requirements phase: every serious candidate is an
+evolution of the LDPC/polar families already in this table, and
+[`sixg.rs`](src/sixg.rs) models the research-profile transport-block
+parameters (modulation up to 4096-QAM, rate targets) on top of the same
+decoders. When either standard ratifies a genuinely new code, it gets a row.
 
 ---
 
@@ -115,6 +133,7 @@ syndrome/
 │   │
 │   │   ── Wi-Fi 6 / 7 and 6G ─────────────────────────────────────────
 │   ├── wifi.rs             — 802.11ax/be MCS tables, LDPC parameter selection
+│   ├── wifi_ldpc_tables.rs — Real 802.11 Annex R/F shift matrices, all 12 (Z,R)
 │   ├── sixg.rs             — IMT-2030 profiles, AMC ladder, 4096-QAM, 8 Mbit TB
 │   │
 │   │   ── Channel simulation ───────────────────────────────────────────
@@ -355,16 +374,17 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (258 tests total)
+### 4.1 Component coverage (272 tests total on x86-64; 273 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 144 | embedded in `src/*.rs` |
-| LDPC integration (encode→decode round-trips) | 7 | `tests/ldpc_integration.rs` |
+| Unit tests | 150 (x86-64) / 151 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
+| Wi-Fi LDPC integration (encode→AWGN→decode, all 12 (Z,R)) | 3 | `tests/wifi_ldpc_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 30 | `tests/robustness.rs` |
-| Doctests | 59 | `///` examples in all public API |
+| Doctests | 64 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
@@ -578,7 +598,7 @@ This implementation uses $\beta = 0.25$, a standard operating point for 5G NR BG
 | LOMS offset $\beta$ | `offset_beta: f32` | 0.25 default |
 | LOMS inner loop | `process_layer_all_z()` | Z-inner; vectorised by LLVM |
 
-### 6.5 Wi-Fi 6 / 7 (802.11ax/be) LDPC parameters
+### 6.5 Wi-Fi 6 / 7 (802.11ax/be) LDPC parameters and real codeword encode/decode
 
 802.11ax/be use the same LOMS algorithm with lifting sizes $Z \in \{27, 54, 81\}$ and $N = 24Z$ always. The `wifi` module provides the full MCS parameter table:
 
@@ -586,6 +606,19 @@ This implementation uses $\beta = 0.25$, a standard operating point for 5G NR BG
 |---|---|---|---|
 | Wi-Fi 6 / 6E (802.11ax) | MCS 0–11 | BPSK → 1024-QAM | 5/6 |
 | Wi-Fi 7 (802.11be) | MCS 0–13 | BPSK → **4096-QAM** | 5/6 |
+
+`wifi_ldpc_tables` supplies the real IEEE 802.11 Annex R/F shift matrices for
+all 12 $(Z, R)$ combinations, obtained from the IEEE 802.11n-2009 standard
+text (Annex R, Tables R.1–R.3) and cross-validated against two independent
+open-source transcriptions — see that module's doc comment for the full
+sourcing note. `wifi_ldpc_encoder(z, rate_num, rate_den)` /
+`wifi_ldpc_decoder(z, rate_num, rate_den, offset_beta)` (or
+`WifiLdpcParams::build_encoder`/`build_decoder`) build a real
+`QcLdpcEncoder`/`QcLdpcDecoder` — a genuine 802.11 codeword now encodes,
+survives an AWGN channel, and decodes bit-exact through the identical LOMS
+kernel used for 5G NR. This covers the full, unshortened, unpunctured
+codeword case only; 802.11 shortening (payloads smaller than $K$) and
+puncturing/rate-matching (per-MCS coded-bit selection) are not implemented.
 
 ### 6.6 6G NR Research Module (IMT-2030)
 
@@ -839,7 +872,7 @@ cover whole processor families:
 | Path | Instruction set | Common hardware | Status |
 |---|---|---|---|
 | x86-64 AVX2 | AVX2 + VPSHUFB | Intel Core (Haswell 2013 →), Intel Xeon, AMD Ryzen / Threadripper / EPYC | Runtime-detected; proven bit-identical to scalar by seeded equivalence tests |
-| AArch64 NEON | ASIMD | Raspberry Pi 4/5, Apple Silicon (M1–M4), AWS Graviton, Ampere Altra, Qualcomm Snapdragon | Compiled path, wired into the LDPC decoder |
+| AArch64 NEON | ASIMD | Raspberry Pi 4/5, Apple Silicon (M1–M4), AWS Graviton, Ampere Altra, Qualcomm Snapdragon | Compiled path, wired into the LDPC, Reed–Solomon, Viterbi, and Turbo codecs; proven bit-identical to scalar by ARM-executed seeded equivalence tests |
 | Portable scalar | none | Everything else Rust targets | Reference implementation; every SIMD path is tested bit-identical against it |
 | Bare-metal ARM Cortex-M | Thumb-2, `no_std` | STM32, Nordic nRF52, Arduino boards | **Planned** — the crate currently requires `std` |
 

@@ -594,17 +594,19 @@ impl TurboDecoder {
 /// Which SISO kernel implementation to run.
 ///
 /// `Auto` (used by the public [`TurboDecoder::decode`] through
-/// [`TurboDecoder::decode_with_backend`]) picks the AVX2 kernel when the
-/// running CPU supports it, falling back to the scalar reference otherwise.
-/// `Scalar` and `Avx2` force one specific backend; they exist only so the
-/// test suite can assert equivalence between the two kernels on identical
-/// inputs and are never selected by production code.
+/// [`TurboDecoder::decode_with_backend`]) picks the AVX2 kernel on x86_64
+/// when the running CPU supports it, or the NEON kernel unconditionally on
+/// AArch64 (NEON is mandatory there), falling back to the scalar reference
+/// otherwise. `Scalar`, `Avx2`, and `Neon` force one specific backend; they
+/// exist only so the test suite can assert equivalence between the kernels
+/// on identical inputs and are never selected by production code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum SisoBackend {
     Auto,
     Scalar,
     Avx2,
+    Neon,
 }
 
 /// Renormalization period (in trellis steps) for the forward/backward metric
@@ -744,6 +746,19 @@ fn siso_max_log_map(
                 siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
             }
         }
+        SisoBackend::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: NEON is mandatory on AArch64.
+                unsafe {
+                    neon_kernel::siso_max_log_map_neon(k, gamma_a, gamma_p, alpha, beta, llr_out);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
+            }
+        }
         SisoBackend::Auto => {
             #[cfg(target_arch = "x86_64")]
             {
@@ -757,6 +772,16 @@ fn siso_max_log_map(
                     return;
                 }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // NEON is mandatory on AArch64; no runtime check needed.
+                // SAFETY: see above.
+                unsafe {
+                    neon_kernel::siso_max_log_map_neon(k, gamma_a, gamma_p, alpha, beta, llr_out);
+                }
+                return;
+            }
+            #[allow(unreachable_code)]
             siso_max_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
         }
     }
@@ -1140,6 +1165,367 @@ mod avx2_kernel {
 }
 
 // ---------------------------------------------------------------------------
+// NEON vectorized SISO kernel (AArch64 only)
+// ---------------------------------------------------------------------------
+//
+// NEON counterpart of [`avx2_kernel`]: the 8 trellis states for one time
+// step are split across two `float32x4_t` registers instead of AVX2's
+// single `f32x8`. NEON is mandatory on AArch64, so no runtime detection is
+// required (unlike the AVX2 kernel, which is gated behind
+// `is_x86_feature_detected!`).
+//
+// CRITICAL: mirrors the AVX2 kernel's deliberate avoidance of FMA
+// (`vfmaq_f32`) to stay bit-identical with the scalar reference — the sign
+// multiplier (`alpha_sign0`/`beta_sign0`) is always exactly `+-1.0`, so a
+// plain `vmulq_f32` + `vaddq_f32` rounds identically to the scalar `+`/`-`
+// formula (single rounding step, same as an FMA would give, without
+// requiring FMA).
+#[cfg(target_arch = "aarch64")]
+mod neon_kernel {
+    use super::{NEG_INF, NORM_PERIOD, RSC_TRELLIS};
+    use core::arch::aarch64::*;
+
+    /// Fixed lookup tables for the NEON recursions, derived once (at compile
+    /// time) from [`RSC_TRELLIS`] — the same topology [`super::avx2_kernel::Tables`]
+    /// derives, just laid out for NEON's 2x4-lane split.
+    ///
+    /// AVX2 gathers a permuted row with a single `_mm256_permutevar8x32_*`
+    /// (native 8-wide permute). NEON has no direct 8-wide `f32` permute, so
+    /// the 8-state row is instead treated as a 32-byte table (two
+    /// `float32x4_t` registers bit-cast to `uint8x16_t`) and gathered with
+    /// `vqtbl2q_u8` (a 2-register, 32-entry byte-table lookup): each output
+    /// lane's state index is expanded here, at compile time, into its 4
+    /// constituent byte offsets (`4*state + 0..=3`), split into the low
+    /// 4 output lanes (`_lo`) and high 4 output lanes (`_hi`) — see
+    /// [`gather8`].
+    struct Tables {
+        pred_b0_idx_lo: [u8; 16],
+        pred_b0_idx_hi: [u8; 16],
+        pred_b1_idx_lo: [u8; 16],
+        pred_b1_idx_hi: [u8; 16],
+        succ0_idx_lo: [u8; 16],
+        succ0_idx_hi: [u8; 16],
+        succ1_idx_lo: [u8; 16],
+        succ1_idx_hi: [u8; 16],
+        alpha_sign0_lo: [f32; 4],
+        alpha_sign0_hi: [f32; 4],
+        beta_sign0_lo: [f32; 4],
+        beta_sign0_hi: [f32; 4],
+        /// All-ones (`u32` bit pattern, as `i32`) where the forced
+        /// termination input bit for source state `s` is `0`, else
+        /// all-zero; split lo/hi as above. See
+        /// [`super::avx2_kernel::Tables::beta_tail_mask0`].
+        beta_tail_mask0_lo: [i32; 4],
+        beta_tail_mask0_hi: [i32; 4],
+    }
+
+    /// Expand an 8-entry state-index table into `vqtbl2q_u8` byte indices:
+    /// `out[lane*4 + k] = 4*states[lane] + k` for `k` in `0..4`, split into
+    /// the low 4 lanes (`lo`) and high 4 lanes (`hi`).
+    const fn expand_byte_idx(states: &[i32; 8]) -> ([u8; 16], [u8; 16]) {
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        let mut lane = 0usize;
+        while lane < 4 {
+            let base = (states[lane] as usize) * 4;
+            let mut k = 0usize;
+            while k < 4 {
+                lo[lane * 4 + k] = (base + k) as u8;
+                k += 1;
+            }
+            lane += 1;
+        }
+        while lane < 8 {
+            let base = (states[lane] as usize) * 4;
+            let mut k = 0usize;
+            while k < 4 {
+                hi[(lane - 4) * 4 + k] = (base + k) as u8;
+                k += 1;
+            }
+            lane += 1;
+        }
+        (lo, hi)
+    }
+
+    const fn split4(v: &[f32; 8]) -> ([f32; 4], [f32; 4]) {
+        ([v[0], v[1], v[2], v[3]], [v[4], v[5], v[6], v[7]])
+    }
+
+    const fn split4i(v: &[i32; 8]) -> ([i32; 4], [i32; 4]) {
+        ([v[0], v[1], v[2], v[3]], [v[4], v[5], v[6], v[7]])
+    }
+
+    const fn build_tables() -> Tables {
+        let (next_state, out_z) = RSC_TRELLIS;
+        let mut pred_b0 = [0i32; 8];
+        let mut pred_b1 = [0i32; 8];
+        let mut succ0 = [0i32; 8];
+        let mut succ1 = [0i32; 8];
+        let mut alpha_sign0 = [0f32; 8];
+        let mut beta_sign0 = [0f32; 8];
+        let mut beta_tail_mask0 = [0i32; 8];
+        let mut s = 0usize;
+        while s < 8 {
+            let ns0 = next_state[s * 2] as usize;
+            let z0 = out_z[s * 2];
+            let ns1 = next_state[s * 2 + 1] as usize;
+            succ0[s] = ns0 as i32;
+            succ1[s] = ns1 as i32;
+            let sign0 = 1.0 - 2.0 * (z0 as f32);
+            beta_sign0[s] = sign0;
+            pred_b0[ns0] = s as i32;
+            pred_b1[ns1] = s as i32;
+            alpha_sign0[ns0] = sign0;
+
+            let s1 = (s >> 1) & 1;
+            let s2 = (s >> 2) & 1;
+            let forced_b = s1 ^ s2;
+            beta_tail_mask0[s] = if forced_b == 0 { -1i32 } else { 0i32 };
+            s += 1;
+        }
+
+        let (pred_b0_idx_lo, pred_b0_idx_hi) = expand_byte_idx(&pred_b0);
+        let (pred_b1_idx_lo, pred_b1_idx_hi) = expand_byte_idx(&pred_b1);
+        let (succ0_idx_lo, succ0_idx_hi) = expand_byte_idx(&succ0);
+        let (succ1_idx_lo, succ1_idx_hi) = expand_byte_idx(&succ1);
+        let (alpha_sign0_lo, alpha_sign0_hi) = split4(&alpha_sign0);
+        let (beta_sign0_lo, beta_sign0_hi) = split4(&beta_sign0);
+        let (beta_tail_mask0_lo, beta_tail_mask0_hi) = split4i(&beta_tail_mask0);
+
+        Tables {
+            pred_b0_idx_lo,
+            pred_b0_idx_hi,
+            pred_b1_idx_lo,
+            pred_b1_idx_hi,
+            succ0_idx_lo,
+            succ0_idx_hi,
+            succ1_idx_lo,
+            succ1_idx_hi,
+            alpha_sign0_lo,
+            alpha_sign0_hi,
+            beta_sign0_lo,
+            beta_sign0_hi,
+            beta_tail_mask0_lo,
+            beta_tail_mask0_hi,
+        }
+    }
+
+    const TABLES: Tables = build_tables();
+
+    /// Gather 8 lanes of `f32` (split across `row_lo`/`row_hi`) into a new
+    /// `(lo, hi)` pair using two 16-byte `vqtbl2q_u8` byte-index tables. See
+    /// [`Tables`]'s doc comment for why a byte-table lookup replaces AVX2's
+    /// native 8-wide permute.
+    ///
+    /// # Safety
+    ///
+    /// NEON is guaranteed on AArch64; no runtime detection is required.
+    #[inline(always)]
+    unsafe fn gather8(
+        row_lo: float32x4_t,
+        row_hi: float32x4_t,
+        idx_lo: uint8x16_t,
+        idx_hi: uint8x16_t,
+    ) -> (float32x4_t, float32x4_t) {
+        unsafe {
+            let table = uint8x16x2_t(vreinterpretq_u8_f32(row_lo), vreinterpretq_u8_f32(row_hi));
+            let out_lo = vqtbl2q_u8(table, idx_lo);
+            let out_hi = vqtbl2q_u8(table, idx_hi);
+            (vreinterpretq_f32_u8(out_lo), vreinterpretq_f32_u8(out_hi))
+        }
+    }
+
+    /// Horizontal max of 8 lanes split across two `float32x4_t` registers.
+    /// Order-independent for the non-NaN finite values used here (same
+    /// argument as [`super::avx2_kernel::hmax`]).
+    ///
+    /// # Safety
+    ///
+    /// NEON is guaranteed on AArch64; no runtime detection is required.
+    #[inline(always)]
+    unsafe fn hmax8(lo: float32x4_t, hi: float32x4_t) -> f32 {
+        unsafe { vmaxvq_f32(vmaxq_f32(lo, hi)) }
+    }
+
+    /// Subtract the row max from all 8 lanes, split across `(lo, hi)`
+    /// (NEON counterpart of [`super::normalize_row`]; see that function's
+    /// docs for the numerical safety argument, which applies identically
+    /// here).
+    ///
+    /// # Safety
+    ///
+    /// NEON is guaranteed on AArch64; no runtime detection is required.
+    #[inline(always)]
+    unsafe fn normalize_row_neon(lo: float32x4_t, hi: float32x4_t) -> (float32x4_t, float32x4_t) {
+        unsafe {
+            let m = hmax8(lo, hi);
+            if m > NEG_INF * 0.5 {
+                let mv = vdupq_n_f32(m);
+                (vsubq_f32(lo, mv), vsubq_f32(hi, mv))
+            } else {
+                (lo, hi)
+            }
+        }
+    }
+
+    /// NEON SISO kernel. See [`super::siso_max_log_map`] for the shared
+    /// contract; `gamma_a`/`gamma_p` (length `k + 3`) must already be filled
+    /// by the caller.
+    ///
+    /// # Safety
+    ///
+    /// NEON is guaranteed on AArch64; no runtime detection is required.
+    pub(super) unsafe fn siso_max_log_map_neon(
+        k: usize,
+        gamma_a: &[f32],
+        gamma_p: &[f32],
+        alpha: &mut [f32],
+        beta: &mut [f32],
+        llr_out: &mut [f32],
+    ) {
+        // SAFETY: every intrinsic below is unconditionally available on
+        // AArch64 (NEON is mandatory); all slice indices are in-bounds
+        // given the length contracts documented on `siso_max_log_map`.
+        unsafe {
+            let n_ext = k + 3;
+            let sign_bit = vdupq_n_u32(0x8000_0000u32);
+
+            let pred_b0_lo = vld1q_u8(TABLES.pred_b0_idx_lo.as_ptr());
+            let pred_b0_hi = vld1q_u8(TABLES.pred_b0_idx_hi.as_ptr());
+            let pred_b1_lo = vld1q_u8(TABLES.pred_b1_idx_lo.as_ptr());
+            let pred_b1_hi = vld1q_u8(TABLES.pred_b1_idx_hi.as_ptr());
+            let succ0_lo = vld1q_u8(TABLES.succ0_idx_lo.as_ptr());
+            let succ0_hi = vld1q_u8(TABLES.succ0_idx_hi.as_ptr());
+            let succ1_lo = vld1q_u8(TABLES.succ1_idx_lo.as_ptr());
+            let succ1_hi = vld1q_u8(TABLES.succ1_idx_hi.as_ptr());
+            let alpha_sign0_lo = vld1q_f32(TABLES.alpha_sign0_lo.as_ptr());
+            let alpha_sign0_hi = vld1q_f32(TABLES.alpha_sign0_hi.as_ptr());
+            let beta_sign0_lo = vld1q_f32(TABLES.beta_sign0_lo.as_ptr());
+            let beta_sign0_hi = vld1q_f32(TABLES.beta_sign0_hi.as_ptr());
+            let tail_mask0_lo =
+                vreinterpretq_u32_s32(vld1q_s32(TABLES.beta_tail_mask0_lo.as_ptr()));
+            let tail_mask0_hi =
+                vreinterpretq_u32_s32(vld1q_s32(TABLES.beta_tail_mask0_hi.as_ptr()));
+
+            // ── Forward (alpha) recursion: info steps only (t = 0..k). ────
+            // Tail rows are dead code — see the scalar kernel's comment.
+            {
+                let init_lo_arr = [0.0f32, NEG_INF, NEG_INF, NEG_INF];
+                vst1q_f32(alpha.as_mut_ptr(), vld1q_f32(init_lo_arr.as_ptr()));
+                vst1q_f32(alpha[4..].as_mut_ptr(), vdupq_n_f32(NEG_INF));
+            }
+            for t in 0..k {
+                let a_v = vdupq_n_f32(gamma_a[t]);
+                let p_v = vdupq_n_f32(gamma_p[t]);
+                // Not an FMA — see this module's doc comment for why plain
+                // mul+add is bit-identical to an FMA here.
+                let gamma0_lo = vaddq_f32(vmulq_f32(p_v, alpha_sign0_lo), a_v);
+                let gamma0_hi = vaddq_f32(vmulq_f32(p_v, alpha_sign0_hi), a_v);
+                let gamma1_lo =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_lo), sign_bit));
+                let gamma1_hi =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_hi), sign_bit));
+
+                let row_lo = vld1q_f32(alpha[t * 8..].as_ptr());
+                let row_hi = vld1q_f32(alpha[t * 8 + 4..].as_ptr());
+                let (g0_lo, g0_hi) = gather8(row_lo, row_hi, pred_b0_lo, pred_b0_hi);
+                let (g1_lo, g1_hi) = gather8(row_lo, row_hi, pred_b1_lo, pred_b1_hi);
+
+                let cand0_lo = vaddq_f32(g0_lo, gamma0_lo);
+                let cand0_hi = vaddq_f32(g0_hi, gamma0_hi);
+                let cand1_lo = vaddq_f32(g1_lo, gamma1_lo);
+                let cand1_hi = vaddq_f32(g1_hi, gamma1_hi);
+
+                let mut new_lo = vmaxq_f32(cand0_lo, cand1_lo);
+                let mut new_hi = vmaxq_f32(cand0_hi, cand1_hi);
+                if (t + 1) % NORM_PERIOD == 0 {
+                    (new_lo, new_hi) = normalize_row_neon(new_lo, new_hi);
+                }
+                vst1q_f32(alpha[(t + 1) * 8..].as_mut_ptr(), new_lo);
+                vst1q_f32(alpha[(t + 1) * 8 + 4..].as_mut_ptr(), new_hi);
+            }
+
+            // ── Backward (beta) recursion: full sweep, n_ext-1 downto 0. ──
+            {
+                let base = n_ext * 8;
+                let init_lo_arr = [0.0f32, NEG_INF, NEG_INF, NEG_INF];
+                vst1q_f32(beta[base..].as_mut_ptr(), vld1q_f32(init_lo_arr.as_ptr()));
+                vst1q_f32(beta[base + 4..].as_mut_ptr(), vdupq_n_f32(NEG_INF));
+            }
+            for t in (0..n_ext).rev() {
+                let is_tail = t >= k;
+                let a_v = vdupq_n_f32(gamma_a[t]);
+                let p_v = vdupq_n_f32(gamma_p[t]);
+                // Not an FMA — see this module's doc comment.
+                let gamma0_lo = vaddq_f32(vmulq_f32(p_v, beta_sign0_lo), a_v);
+                let gamma0_hi = vaddq_f32(vmulq_f32(p_v, beta_sign0_hi), a_v);
+                let gamma1_lo =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_lo), sign_bit));
+                let gamma1_hi =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_hi), sign_bit));
+
+                let next_lo = vld1q_f32(beta[(t + 1) * 8..].as_ptr());
+                let next_hi = vld1q_f32(beta[(t + 1) * 8 + 4..].as_ptr());
+                let (s0_lo, s0_hi) = gather8(next_lo, next_hi, succ0_lo, succ0_hi);
+                let (s1_lo, s1_hi) = gather8(next_lo, next_hi, succ1_lo, succ1_hi);
+
+                let cand0_lo = vaddq_f32(gamma0_lo, s0_lo);
+                let cand0_hi = vaddq_f32(gamma0_hi, s0_hi);
+                let cand1_lo = vaddq_f32(gamma1_lo, s1_lo);
+                let cand1_hi = vaddq_f32(gamma1_hi, s1_hi);
+
+                let (mut new_lo, mut new_hi) = if is_tail {
+                    // Forced termination: exactly one of the two candidates
+                    // is legal per source-state lane; select it directly
+                    // instead of maxing (the illegal candidate must not
+                    // participate at all).
+                    (
+                        vbslq_f32(tail_mask0_lo, cand0_lo, cand1_lo),
+                        vbslq_f32(tail_mask0_hi, cand0_hi, cand1_hi),
+                    )
+                } else {
+                    (vmaxq_f32(cand0_lo, cand1_lo), vmaxq_f32(cand0_hi, cand1_hi))
+                };
+                if t % NORM_PERIOD == 0 {
+                    (new_lo, new_hi) = normalize_row_neon(new_lo, new_hi);
+                }
+                vst1q_f32(beta[t * 8..].as_mut_ptr(), new_lo);
+                vst1q_f32(beta[t * 8 + 4..].as_mut_ptr(), new_hi);
+            }
+
+            // ── LLR extraction: two masked max reductions per step. ───────
+            for t in 0..k {
+                let a_v = vdupq_n_f32(gamma_a[t]);
+                let p_v = vdupq_n_f32(gamma_p[t]);
+                // Not an FMA — see this module's doc comment.
+                let gamma0_lo = vaddq_f32(vmulq_f32(p_v, beta_sign0_lo), a_v);
+                let gamma0_hi = vaddq_f32(vmulq_f32(p_v, beta_sign0_hi), a_v);
+                let gamma1_lo =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_lo), sign_bit));
+                let gamma1_hi =
+                    vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(gamma0_hi), sign_bit));
+
+                let alpha_lo = vld1q_f32(alpha[t * 8..].as_ptr());
+                let alpha_hi = vld1q_f32(alpha[t * 8 + 4..].as_ptr());
+                let beta_next_lo = vld1q_f32(beta[(t + 1) * 8..].as_ptr());
+                let beta_next_hi = vld1q_f32(beta[(t + 1) * 8 + 4..].as_ptr());
+                let (s0_lo, s0_hi) = gather8(beta_next_lo, beta_next_hi, succ0_lo, succ0_hi);
+                let (s1_lo, s1_hi) = gather8(beta_next_lo, beta_next_hi, succ1_lo, succ1_hi);
+
+                let val0_lo = vaddq_f32(vaddq_f32(alpha_lo, gamma0_lo), s0_lo);
+                let val0_hi = vaddq_f32(vaddq_f32(alpha_hi, gamma0_hi), s0_hi);
+                let val1_lo = vaddq_f32(vaddq_f32(alpha_lo, gamma1_lo), s1_lo);
+                let val1_hi = vaddq_f32(vaddq_f32(alpha_hi, gamma1_hi), s1_hi);
+
+                let best0 = hmax8(val0_lo, val0_hi);
+                let best1 = hmax8(val1_lo, val1_hi);
+                llr_out[t] = best0 - best1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1319,6 +1705,14 @@ mod tests {
         assert!(dec.decode(&llr, &mut short_out, 4).is_err());
     }
 
+    /// Whether this CPU can actually run the NEON SISO kernel; the
+    /// equivalence tests below are skipped (not failed) when it can't, so
+    /// the suite stays green on non-AArch64 CI runners. NEON is mandatory
+    /// on AArch64 (no runtime feature check needed, unlike AVX2).
+    fn neon_available() -> bool {
+        cfg!(target_arch = "aarch64")
+    }
+
     /// Whether this CPU can actually run the AVX2 SISO kernel; the
     /// equivalence tests below are skipped (not failed) when it can't, so
     /// the suite stays green on non-x86_64 CI runners or old x86_64 CPUs.
@@ -1453,6 +1847,106 @@ mod tests {
             assert_eq!(
                 out, info,
                 "K={k}: AVX2-forced noiseless round-trip must be bit-exact"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NEON vs. scalar equivalence (AArch64 SISO kernel)
+    // -----------------------------------------------------------------------
+    //
+    // NEON is mandatory on AArch64 (no runtime detection to skip), so these
+    // tests run unconditionally there and are entirely absent on other
+    // architectures — mirrors the AVX2 equivalence tests above.
+
+    /// NEON counterpart of [`simd_scalar_equivalence_100_trials`]: the NEON
+    /// restructuring in [`neon_kernel`] is designed to be bit-identical to
+    /// the scalar reference for the same reasons documented on that test
+    /// (fixed compile-time gather tables, exact +-1.0 sign multipliers so
+    /// mul+add rounds identically to an FMA, order-independent max/hmax).
+    #[test]
+    fn simd_scalar_equivalence_100_trials_neon() {
+        if !neon_available() {
+            eprintln!("skipping simd_scalar_equivalence_100_trials_neon: not AArch64");
+            return;
+        }
+        const TRIALS: u64 = 100;
+        const MAX_ITERS: usize = 8;
+
+        for &k in &[40usize, 1024, 6144] {
+            let enc = TurboEncoder::new(k).unwrap();
+            let mut dec_scalar = TurboDecoder::new(k).unwrap();
+            let mut dec_neon = TurboDecoder::new(k).unwrap();
+
+            for trial in 0..TRIALS {
+                let snr_db = 1.0f32 + 1.5f32 * (trial as f32) / (TRIALS as f32 - 1.0);
+                let info = xorshift_bits(k, 0xD1B5_4A32 ^ (k as u64) << 32 ^ trial);
+                let mut coded = vec![0u8; enc.output_len()];
+                enc.encode(&info, &mut coded).unwrap();
+
+                let mut ch = AwgnChannel::new(snr_db, 1.0 / 3.0, 10_000 + trial);
+                let llr = ch.transmit(&coded);
+
+                let mut out_scalar = vec![0u8; k];
+                let mut out_neon = vec![0u8; k];
+                let iters_scalar = dec_scalar
+                    .decode_with_backend(&llr, &mut out_scalar, MAX_ITERS, SisoBackend::Scalar)
+                    .unwrap();
+                let iters_neon = dec_neon
+                    .decode_with_backend(&llr, &mut out_neon, MAX_ITERS, SisoBackend::Neon)
+                    .unwrap();
+
+                assert_eq!(
+                    iters_scalar, iters_neon,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: iteration counts differ \
+                     (scalar={iters_scalar}, neon={iters_neon})"
+                );
+                assert_eq!(
+                    out_scalar, out_neon,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: hard decisions differ between backends"
+                );
+
+                let max_abs_diff = dec_scalar
+                    .llr_total1
+                    .iter()
+                    .zip(dec_neon.llr_total1.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs_diff < 1e-3,
+                    "K={k} trial={trial} snr={snr_db:.3}dB: max abs extrinsic/LLR diff \
+                     {max_abs_diff} >= 1e-3"
+                );
+            }
+        }
+    }
+
+    /// NEON counterpart of [`avx2_noiseless_roundtrip_all_sizes`]: forcing
+    /// the NEON backend on noiseless input (perfect LLRs) must still
+    /// round-trip exactly, for every supported block length.
+    #[test]
+    fn neon_noiseless_roundtrip_all_sizes() {
+        if !neon_available() {
+            eprintln!("skipping neon_noiseless_roundtrip_all_sizes: not AArch64");
+            return;
+        }
+        for &(k, _, _) in QPP_TABLE {
+            let enc = TurboEncoder::new(k).unwrap();
+            let mut dec = TurboDecoder::new(k).unwrap();
+            let info = xorshift_bits(k, 0x1234_5678 ^ (k as u64));
+            let mut coded = vec![0u8; enc.output_len()];
+            enc.encode(&info, &mut coded).unwrap();
+
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 0 { 12.0 } else { -12.0 })
+                .collect();
+            let mut out = vec![0u8; k];
+            dec.decode_with_backend(&llr, &mut out, 8, SisoBackend::Neon)
+                .unwrap();
+            assert_eq!(
+                out, info,
+                "K={k}: NEON-forced noiseless round-trip must be bit-exact"
             );
         }
     }
