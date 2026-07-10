@@ -8,7 +8,7 @@ use crate::error::FecError;
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::encode_hamming_7_4;
+/// use syndrome::encode_hamming_7_4;
 /// let code = encode_hamming_7_4(0b1010);
 /// // encoded 7-bit value for 0b1010 is 0b0101101 (decimal 45)
 /// assert_eq!(code & 0x7F, 0b0101101);

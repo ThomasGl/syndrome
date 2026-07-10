@@ -80,7 +80,7 @@
 //! # Examples
 //!
 //! ```
-//! use glezer_rsv::GolayCode;
+//! use syndrome::GolayCode;
 //!
 //! let golay = GolayCode::new();
 //! let info: [u8; 12] = [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0];
@@ -318,7 +318,7 @@ impl GolayCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::GolayCode;
+    /// use syndrome::GolayCode;
     /// let golay = GolayCode::new();
     /// let info = [0u8; 12];
     /// let mut codeword = [0u8; 24];
@@ -397,7 +397,7 @@ impl GolayCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::GolayCode;
+    /// use syndrome::GolayCode;
     /// let golay = GolayCode::new();
     /// let info = [1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0];
     /// let mut codeword = [0u8; 24];
@@ -448,7 +448,7 @@ impl GolayCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::GolayCode;
+    /// use syndrome::GolayCode;
     /// let golay = GolayCode::new();
     /// let info = [0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0];
     /// let mut codeword = [0u8; 24];

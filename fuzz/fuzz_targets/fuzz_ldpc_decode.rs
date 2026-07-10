@@ -10,8 +10,8 @@
 
 #![no_main]
 
-use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 use libfuzzer_sys::fuzz_target;
+use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 
 fn byte_pair_to_llr(hi: u8, lo: u8) -> f32 {
     match hi % 8 {
@@ -76,8 +76,8 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // 5G wrapper with an adversarial n_filler (including > K).
-    let n_filler = (rest.first().copied().unwrap_or(0) as usize)
-        % (dec.info_bit_count_5g().saturating_add(8));
+    let n_filler =
+        (rest.first().copied().unwrap_or(0) as usize) % (dec.info_bit_count_5g().saturating_add(8));
     let mut llr_5g = llr;
     let _ = dec.decode_5g(
         &mut llr_5g,

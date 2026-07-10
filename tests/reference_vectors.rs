@@ -50,11 +50,11 @@
 //!   myself), so that specific number is left untested rather than
 //!   hardcoded on secondhand authority.
 
-use glezer_rsv::bch::BchCode;
-use glezer_rsv::crc::{Crc24, CrcKind};
-use glezer_rsv::golay::GolayCode;
-use glezer_rsv::viterbi::ViterbiDecoder;
-use glezer_rsv::{decode_hamming_7_4, encode_hamming_7_4};
+use syndrome::bch::BchCode;
+use syndrome::crc::{Crc24, CrcKind};
+use syndrome::golay::GolayCode;
+use syndrome::viterbi::ViterbiDecoder;
+use syndrome::{decode_hamming_7_4, encode_hamming_7_4};
 
 // =============================================================================
 // Shared helpers (independent of src/, used only to *build inputs* or as

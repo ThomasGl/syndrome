@@ -8,8 +8,8 @@
 
 #![no_main]
 
-use glezer_rsv::crc::{Crc24, CrcKind};
 use libfuzzer_sys::fuzz_target;
+use syndrome::crc::{Crc24, CrcKind};
 
 const KINDS: [CrcKind; 6] = [
     CrcKind::Crc24A,

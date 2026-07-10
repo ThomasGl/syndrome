@@ -5,7 +5,7 @@
 //! Usage: cargo run --release --bin bench_export
 //! Output: bench/results/rust.json, bench/results/rust.checksum
 
-use glezer_rsv::ReedSolomon;
+use syndrome::ReedSolomon;
 use std::time::Instant;
 
 const DATA_SHARDS: usize = 10;

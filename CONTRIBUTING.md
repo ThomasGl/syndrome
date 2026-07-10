@@ -1,4 +1,4 @@
-# Contributing to glezer-rsv
+# Contributing to syndrome
 
 Thanks for your interest. This document describes how to build, test, and submit
 changes to the library.

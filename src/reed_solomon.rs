@@ -86,6 +86,29 @@ impl GfTables {
     }
 }
 
+/// Systematic Reed-Solomon erasure codec over GF(256).
+///
+/// The recommended API surface is small:
+///
+/// 1. [`ReedSolomon::new`] — build the codec for a `(data, parity)` geometry.
+/// 2. [`ReedSolomon::precompute_mul_tables`] — one-time table build (64 KiB)
+///    that unlocks the fast encode/decode paths; skip it only if memory is
+///    tighter than throughput.
+/// 3. [`ReedSolomon::encode_with_avx2`] — the fast path: runtime-detects
+///    AVX2 and falls back to portable table/scalar code, so it is safe to
+///    call unconditionally on any hardware.
+/// 4. [`ReedSolomon::encode_into`] (zero-allocation, caller buffer) or
+///    [`ReedSolomon::encode`] (convenience, allocates) — portable scalar
+///    paths that need no precomputed tables.
+/// 5. [`ReedSolomon::decode`] — erasure repair; automatically uses the same
+///    table/SIMD machinery as the encoder.
+///
+/// The crate also ships several `#[doc(hidden)]` encode variants
+/// (`encode_with_tables`, `encode_with_tables_chunked`, `encode_simd`,
+/// `encode_optimized`, `encode_soa`). They are intermediate steps of the
+/// reproducible optimization study in `bench/` — kept public so the
+/// benchmark harness and its published numbers stay honest — but they are
+/// not part of the supported API and may change without notice.
 pub struct ReedSolomon {
     pub data_shards: usize,
     pub parity_shards: usize,
@@ -180,12 +203,16 @@ impl ReedSolomon {
 
     /// Encode using precomputed multiplication tables for coefficients.
     ///
+    /// Benchmark-study step (see the struct-level docs); prefer
+    /// [`ReedSolomon::encode_with_avx2`] or [`ReedSolomon::encode_into`].
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if [`ReedSolomon::precompute_mul_tables`]
     /// has not been called yet, or if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
     /// too small.
+    #[doc(hidden)]
     pub fn encode_with_tables(
         &self,
         data: &[&[u8]],
@@ -225,12 +252,17 @@ impl ReedSolomon {
     /// overhead. This combines table lookups (fast mul) with chunked
     /// word-wise XOR to approach the speed of pure XOR paths.
     ///
+    /// Benchmark-study step (see the struct-level docs); prefer
+    /// [`ReedSolomon::encode_with_avx2`], which falls back to this exact
+    /// path when AVX2 is unavailable.
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if [`ReedSolomon::precompute_mul_tables`]
     /// has not been called yet, or if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
     /// too small.
+    #[doc(hidden)]
     pub fn encode_with_tables_chunked(
         &self,
         data: &[&[u8]],
@@ -281,11 +313,15 @@ impl ReedSolomon {
     /// Encode using SIMD for XOR-case (coef==1) to accelerate pure XOR
     /// accumulation. Other coefficients currently fall back to scalar mul.
     ///
+    /// Benchmark-study step (see the struct-level docs); prefer
+    /// [`ReedSolomon::encode_with_avx2`] or [`ReedSolomon::encode_into`].
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
     /// too small.
+    #[doc(hidden)]
     pub fn encode_simd(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         // Use stable word-sized XOR (u64) for the pure-XOR coefficient case
         // to accelerate accumulation without relying on unstable `std::simd`.
@@ -330,7 +366,7 @@ impl ReedSolomon {
     ///
     /// For each coefficient, decomposes the 256-byte GF multiply table into two
     /// 16-byte nibble tables and applies them 32 bytes at a time via VPSHUFB.
-    /// Falls back to [`ReedSolomon::encode_with_tables_chunked`] (or, if
+    /// Falls back to the portable chunked-table path (or, if
     /// `precompute_mul_tables` was never called, a plain scalar encode) when
     /// AVX2 is not available at runtime.
     ///
@@ -343,9 +379,8 @@ impl ReedSolomon {
     ///
     /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
-    /// too small. Unlike [`ReedSolomon::encode_with_tables`], a missing
-    /// `precompute_mul_tables()` call is not an error here — this method
-    /// falls back to a scalar encode instead.
+    /// too small. A missing `precompute_mul_tables()` call is not an error
+    /// here — this method falls back to a scalar encode instead.
     pub fn encode_with_avx2(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let shard_len = self.validate_encode_inputs(data, parity_out)?;
         #[cfg(target_arch = "x86_64")]
@@ -489,11 +524,15 @@ impl ReedSolomon {
     /// better inner-loop locality. This is a drop-in replacement for
     /// microbenchmarking and may be extended with SIMD later.
     ///
+    /// Benchmark-study step (see the struct-level docs); prefer
+    /// [`ReedSolomon::encode_with_avx2`] or [`ReedSolomon::encode_into`].
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
     /// too small.
+    #[doc(hidden)]
     pub fn encode_optimized(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
@@ -533,11 +572,15 @@ impl ReedSolomon {
     /// Encode using a Struct-of-Arrays (SoA) temporary to improve cache
     /// locality for the per-byte accumulation across data shards.
     ///
+    /// Benchmark-study step (see the struct-level docs); prefer
+    /// [`ReedSolomon::encode_with_avx2`] or [`ReedSolomon::encode_into`].
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
     /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
     /// too small.
+    #[doc(hidden)]
     pub fn encode_soa(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;

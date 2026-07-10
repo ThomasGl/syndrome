@@ -29,7 +29,7 @@
 //! # Examples
 //!
 //! ```
-//! use glezer_rsv::viterbi::ViterbiDecoder;
+//! use syndrome::viterbi::ViterbiDecoder;
 //!
 //! let dec = ViterbiDecoder::new(7).unwrap();
 //! let info: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1];
@@ -539,7 +539,7 @@ impl ViterbiDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::viterbi::ViterbiDecoder;
+    /// use syndrome::viterbi::ViterbiDecoder;
     /// let dec = ViterbiDecoder::new(7).unwrap();
     /// assert_eq!(dec.constraint_length, 7);
     /// assert!(ViterbiDecoder::new(0).is_err());
@@ -603,7 +603,7 @@ impl ViterbiDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::viterbi::ViterbiDecoder;
+    /// use syndrome::viterbi::ViterbiDecoder;
     /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let coded = dec.encode(&[1, 0, 1]);
     /// assert_eq!(coded.len(), 2 * (3 + 6));  // 3 info + 6 tail
@@ -641,7 +641,7 @@ impl ViterbiDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::viterbi::ViterbiDecoder;
+    /// use syndrome::viterbi::ViterbiDecoder;
     /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let info = vec![1u8, 1, 0, 1, 0, 0, 1, 1];
     /// let coded = dec.encode(&info);
@@ -783,7 +783,7 @@ impl ViterbiDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::viterbi::ViterbiDecoder;
+    /// use syndrome::viterbi::ViterbiDecoder;
     /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let info = vec![0u8; 8];
     /// let coded = dec.encode(&info);

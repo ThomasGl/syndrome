@@ -187,7 +187,7 @@ fn polar_transform(u: &mut [u8]) {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::polar::PolarEncoder;
+/// use syndrome::polar::PolarEncoder;
 ///
 /// // K=4 info bits, N=8 polar code.
 /// let enc = PolarEncoder::new(8, 4).unwrap();
@@ -956,8 +956,8 @@ fn scl_decode_recursive_reference(
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::channel_sim::AwgnChannel;
-/// use glezer_rsv::polar::{PolarEncoder, PolarDecoder};
+/// use syndrome::channel_sim::AwgnChannel;
+/// use syndrome::polar::{PolarEncoder, PolarDecoder};
 ///
 /// let n = 32usize;
 /// let k = 16usize;

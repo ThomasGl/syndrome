@@ -6,7 +6,7 @@
 //!
 //! Outputs bench/results/ldpc_pipeline_rust.json.
 
-use glezer_rsv::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
+use syndrome::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
 use std::time::Instant;
 
 const DECODE_ITERS: usize = 10;

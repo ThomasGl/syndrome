@@ -123,7 +123,7 @@ impl SixgModulation {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::sixg::SixgModulation;
+    /// use syndrome::sixg::SixgModulation;
     ///
     /// assert_eq!(SixgModulation::Bpsk.bits_per_symbol(),   1);
     /// assert_eq!(SixgModulation::Qam4096.bits_per_symbol(), 12);
@@ -149,7 +149,7 @@ impl SixgModulation {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::sixg::SixgModulation;
+    /// use syndrome::sixg::SixgModulation;
     ///
     /// assert_eq!(SixgModulation::Qam4096.label(), "4096-QAM");
     /// assert_eq!(SixgModulation::Qpsk.label(),    "QPSK");
@@ -176,7 +176,7 @@ impl SixgModulation {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::sixg::{SixgTbParams, SixgProfile, SixgModulation, sixg_profile_target_rate};
+/// use syndrome::sixg::{SixgTbParams, SixgProfile, SixgModulation, sixg_profile_target_rate};
 ///
 /// let rate = sixg_profile_target_rate(&SixgProfile::EnhancedMBB);
 /// let params = SixgTbParams {
@@ -246,7 +246,7 @@ pub struct SixgTbParams {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::sixg::{SixgProfile, sixg_profile_target_rate};
+/// use syndrome::sixg::{SixgProfile, sixg_profile_target_rate};
 ///
 /// let r = sixg_profile_target_rate(&SixgProfile::URLLC);
 /// assert!((r - 0.33).abs() < 1e-6);
@@ -283,7 +283,7 @@ pub fn sixg_profile_target_rate(profile: &SixgProfile) -> f32 {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::sixg::{SixgProfile, SixgModulation, sixg_profile_max_modulation};
+/// use syndrome::sixg::{SixgProfile, SixgModulation, sixg_profile_max_modulation};
 ///
 /// assert_eq!(sixg_profile_max_modulation(&SixgProfile::EnhancedMBB),  SixgModulation::Qam4096);
 /// assert_eq!(sixg_profile_max_modulation(&SixgProfile::URLLC),        SixgModulation::Qpsk);
@@ -330,7 +330,7 @@ pub fn sixg_profile_max_modulation(profile: &SixgProfile) -> SixgModulation {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::sixg::{sixg_select_modulation, SixgModulation};
+/// use syndrome::sixg::{sixg_select_modulation, SixgModulation};
 ///
 /// assert_eq!(sixg_select_modulation(-5.0), SixgModulation::Bpsk);
 /// assert_eq!(sixg_select_modulation(4.0),  SixgModulation::Qpsk);

@@ -11,8 +11,8 @@
 //!
 //! Run with: `cargo run --example 04_viterbi_convolutional`
 
-use glezer_rsv::channel_sim::AwgnChannel;
-use glezer_rsv::viterbi::ViterbiDecoder;
+use syndrome::channel_sim::AwgnChannel;
+use syndrome::viterbi::ViterbiDecoder;
 
 fn main() {
     let dec = ViterbiDecoder::new(7).expect("K=7, rate 1/2 (standard 0o133/0o171 generators)");

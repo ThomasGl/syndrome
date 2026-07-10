@@ -133,8 +133,8 @@ fn deinterleave_f32(e: &mut [f32], qm: usize) {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::rate_matching::rate_match;
-/// use glezer_rsv::qc_ldpc::BaseGraph;
+/// use syndrome::rate_matching::rate_match;
+/// use syndrome::qc_ldpc::BaseGraph;
 ///
 /// let z = 2usize;
 /// let n = 66 * z; // BG1 codeword length
@@ -256,8 +256,8 @@ pub fn rate_match(
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::rate_matching::rate_dematch_llr;
-/// use glezer_rsv::qc_ldpc::BaseGraph;
+/// use syndrome::rate_matching::rate_dematch_llr;
+/// use syndrome::qc_ldpc::BaseGraph;
 ///
 /// let z = 2usize;
 /// let ncb = 66 * z;
@@ -436,8 +436,8 @@ fn selection_walk(
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::rate_matching::{RateMatchCache, rate_match};
-/// use glezer_rsv::qc_ldpc::BaseGraph;
+/// use syndrome::rate_matching::{RateMatchCache, rate_match};
+/// use syndrome::qc_ldpc::BaseGraph;
 ///
 /// let z = 2usize;
 /// let n = 66 * z;

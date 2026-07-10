@@ -12,8 +12,8 @@
 //!
 //! Run with: `cargo run --example 06_5g_transport_block`
 
-use glezer_rsv::channel_sim::AwgnChannel;
-use glezer_rsv::transport_block::{DlSchDecoder, DlSchEncoder};
+use syndrome::channel_sim::AwgnChannel;
+use syndrome::transport_block::{DlSchDecoder, DlSchEncoder};
 
 fn main() {
     // ~100-byte payload -- a small IP packet or a VoIP frame.

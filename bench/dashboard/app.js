@@ -1,5 +1,5 @@
 /**
- * glezer-rsv benchmark dashboard.
+ * syndrome benchmark dashboard.
  *
  * Fetches bench/results/{rust,cpp,python,meta}.json (relative to this file,
  * served by `python -m http.server` from bench/dashboard/).

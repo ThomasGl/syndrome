@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run --example 02_crc_error_detection`
 
-use glezer_rsv::crc::{Crc24, CrcKind};
+use syndrome::crc::{Crc24, CrcKind};
 
 fn main() {
     let crc = Crc24::new(CrcKind::Crc24A);

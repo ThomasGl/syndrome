@@ -7,7 +7,7 @@
 //!
 //! Run with: `cargo run --example 01_hamming_first_steps`
 
-use glezer_rsv::{decode_hamming_7_4, encode_hamming_7_4};
+use syndrome::{decode_hamming_7_4, encode_hamming_7_4};
 
 /// Print a `u8` as an N-bit binary string, least significant bit last.
 fn bits(value: u8, width: u32) -> String {

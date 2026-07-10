@@ -4,7 +4,7 @@ import re
 s = Path('/tmp/ts38212/docx/word/document.xml').read_text()
 start=0
 idx=0
-outdir=Path('/home/thomas/projects/rust_learn/glezer_rsv/data')
+outdir=Path('/home/thomas/projects/rust_learn/syndrome/data')
 outdir.mkdir(exist_ok=True)
 while True:
     i = s.find('<w:tbl', start)

@@ -1,5 +1,5 @@
 [package]
-name = "glezer_rsv-fuzz"
+name = "syndrome-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.glezer_rsv]
+[dependencies.syndrome]
 path = ".."
 
 [[bin]]
@@ -58,7 +58,7 @@ bench = false
 [profile.release]
 debug = 1
 
-# Standalone workspace: this crate must NOT join the parent glezer_rsv
+# Standalone workspace: this crate must NOT join the parent syndrome
 # workspace (there isn't one at the repo root, but this is the standard
 # cargo-fuzz convention and keeps `cargo` from ever trying to fold this
 # directory into any future root-level `[workspace]`).

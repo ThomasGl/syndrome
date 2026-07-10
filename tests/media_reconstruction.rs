@@ -1,6 +1,6 @@
 //! End-to-end FEC reconstruction tests: audio, video, Wi-Fi, and 6G scenarios.
-use glezer_rsv::channel_sim::AwgnChannel;
-use glezer_rsv::transport_block::{DlSchDecoder, DlSchEncoder};
+use syndrome::channel_sim::AwgnChannel;
+use syndrome::transport_block::{DlSchDecoder, DlSchEncoder};
 
 #[allow(clippy::too_many_lines)]
 #[test]

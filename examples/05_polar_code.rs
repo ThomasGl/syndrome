@@ -13,8 +13,8 @@
 //!
 //! Run with: `cargo run --example 05_polar_code`
 
-use glezer_rsv::channel_sim::AwgnChannel;
-use glezer_rsv::polar::{PolarDecoder, PolarEncoder};
+use syndrome::channel_sim::AwgnChannel;
+use syndrome::polar::{PolarDecoder, PolarEncoder};
 
 /// Minimal deterministic xorshift64 PRNG, seeded for a reproducible demo
 /// message (same shift triplet as `channel_sim::AwgnChannel`).

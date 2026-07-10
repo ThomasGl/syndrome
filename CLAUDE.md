@@ -1,6 +1,6 @@
-Workspace Guidelines & Instructions: glezer-rsv
+Workspace Guidelines & Instructions: syndrome
 
-This file defines the technical constraints, software paradigms, style guidelines, and execution targets for glezer-rsv developers and AI code assistants.
+This file defines the technical constraints, software paradigms, style guidelines, and execution targets for syndrome developers and AI code assistants.
 
 1. Mathematical Rigor & Code Style
 

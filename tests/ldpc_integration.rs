@@ -3,7 +3,7 @@
 //! These tests use real 3GPP BG1/BG2 parameters and verify the
 //! encode→decode round-trip under controlled channel conditions.
 
-use glezer_rsv::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
+use syndrome::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
 
 // ---------------------------------------------------------------------------
 // Helpers

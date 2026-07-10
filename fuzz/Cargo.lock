@@ -50,21 +50,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glezer_rsv"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "glezer_rsv-fuzz"
-version = "0.0.0"
-dependencies = [
- "glezer_rsv",
- "libfuzzer-sys",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -200,6 +185,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "syndrome"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "syndrome-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "syndrome",
 ]
 
 [[package]]

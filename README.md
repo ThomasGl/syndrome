@@ -1,6 +1,6 @@
-# glezer-rsv
+# syndrome
 
-[![CI](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/glezer-rsv/actions/workflows/ci.yml)
+[![CI](https://github.com/thomas-glezer/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-glezer/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-258%20passing-brightgreen)](tests/)
@@ -83,13 +83,14 @@ Think of it like a smarter parity bit: a 5G base station transmits 26,000-bit bl
 9. [References](#9-references)
 10. [Learning Path](#10-learning-path)
 11. [Similar Projects](#11-similar-projects)
+12. [Topics & Keywords](#12-topics--keywords)
 
 ---
 
 ## 1. Module Overview
 
 ```
-glezer_rsv/
+syndrome/
 ├── src/
 │   ├── lib.rs              — Crate root; re-exports all public API
 │   ├── error.rs            — FecError enum (InvalidParam, CrcMismatch, …)
@@ -191,8 +192,8 @@ at 01 and work down — every concept builds on the previous one.
 *(Verified working code — condensed from [examples/06_5g_transport_block.rs](examples/06_5g_transport_block.rs).)*
 
 ```rust
-use glezer_rsv::transport_block::{DlSchEncoder, DlSchDecoder};
-use glezer_rsv::channel_sim::AwgnChannel;
+use syndrome::transport_block::{DlSchEncoder, DlSchDecoder};
+use syndrome::channel_sim::AwgnChannel;
 
 // 800-bit transport block, rate 1/2, QPSK, 3200 coded bits total.
 let (tb_size, rate, qm, g) = (800usize, 0.5f32, 2usize, 3200usize);
@@ -218,7 +219,7 @@ assert_eq!(tb_out, tb); // bit-exact reconstruction
 ### QC-LDPC encoder + decoder (low-level)
 
 ```rust
-use glezer_rsv::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
+use syndrome::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
 
 let enc = QcLdpcEncoder::new(BaseGraph::Bg1, 384)?;
 let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 384, 0.25)?;
@@ -244,7 +245,7 @@ println!("converged in {iters_used} iterations (syndrome-check early exit)");
 ### Reed-Solomon packet-loss recovery
 
 ```rust
-use glezer_rsv::ReedSolomon;
+use syndrome::ReedSolomon;
 
 // RS(10, 4): recover any 4 lost packets from 14 transmitted
 let mut rs = ReedSolomon::new(10, 4);
@@ -253,13 +254,14 @@ rs.precompute_mul_tables();
 let data: Vec<Vec<u8>> = (0..10).map(|_| vec![0xABu8; 1024]).collect();
 let refs: Vec<&[u8]>   = data.iter().map(|v| v.as_slice()).collect();
 let mut parity = vec![0u8; 4 * 1024];
-rs.encode_with_tables_chunked(&refs, &mut parity); // ~10 GiB/s on AVX2 hardware
+// Runtime-detects AVX2; falls back to portable table code elsewhere.
+rs.encode_with_avx2(&refs, &mut parity)?;
 ```
 
 ### Viterbi (rate-1/2, K=7)
 
 ```rust
-use glezer_rsv::viterbi::ViterbiDecoder;
+use syndrome::viterbi::ViterbiDecoder;
 
 let dec = ViterbiDecoder::new(7).unwrap(); // constraint length 7, G=(0o133, 0o171)
 let info_bits = vec![1u8, 0, 1, 1, 0, 0, 1];
@@ -278,7 +280,7 @@ assert_eq!(decoded_soft, info_bits);
 ### Turbo code (LTE rate-1/3, TS 36.212)
 
 ```rust
-use glezer_rsv::{TurboEncoder, TurboDecoder};
+use syndrome::{TurboEncoder, TurboDecoder};
 
 // K=1024 info bits → 3K+12 coded bits (two 8-state RSC encoders + QPP interleaver)
 let enc = TurboEncoder::new(1024)?;
@@ -298,7 +300,7 @@ assert_eq!(out, info);
 ### BCH (storage-grade algebraic correction)
 
 ```rust
-use glezer_rsv::BchCode;
+use syndrome::BchCode;
 
 // BCH(255, 223, t=4): corrects any 4 bit errors in a 255-bit block
 let bch = BchCode::new(4)?;
@@ -314,7 +316,7 @@ assert_eq!(corrected, 2);
 ### Golay(24,12) — the Voyager code
 
 ```rust
-use glezer_rsv::GolayCode;
+use syndrome::GolayCode;
 
 let golay = GolayCode::new();
 let info = [1u8, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0];
@@ -330,7 +332,7 @@ assert_eq!((out, fixed), (info, 3));
 ### Lock-free LDPC pipeline (multi-worker)
 
 ```rust
-use glezer_rsv::{BaseGraph, QcLdpcDecoder, LdpcPipeline};
+use syndrome::{BaseGraph, QcLdpcDecoder, LdpcPipeline};
 
 let decoder  = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 384, 0.25).unwrap();
 let mut pipe = LdpcPipeline::with_workers(decoder, /*max_iters=*/10, /*threads=*/4);
@@ -803,6 +805,49 @@ Month 3 — Performance and systems
 | [srsRAN Project](https://github.com/srsran/srsRAN_Project) | C++17 | 5G NR PHY | Production-quality open-source gNB; LDPC with AVX2 paths. |
 | [rav1e](https://github.com/xiph/rav1e) | Rust | AV1 video codec | Demonstrates Rust competing with C++ on DSP kernels. |
 | [ldpc-codes](https://crates.io/crates/ldpc-codes) | Rust | Generic LDPC | Pure-Rust LDPC; different design goals (no 5G BG, no SIMD). |
+
+---
+
+## 12. Topics & Keywords
+
+A term index of what this library covers, for search and discovery.
+
+**Concepts:** forward error correction (FEC) · channel coding · error-correcting
+codes · coding theory · Shannon limit · belief propagation · soft-decision
+decoding · log-likelihood ratio (LLR) · AWGN channel · bit error rate (BER)
+waterfall · erasure coding · syndrome decoding · code rate · HARQ ·
+incremental redundancy
+
+**Algorithms:** QC-LDPC (layered offset min-sum, base graphs BG1/BG2) · polar
+codes (successive cancellation, CA-SCL list decoding) · Reed–Solomon over
+GF(256) (Vandermonde erasure) · BCH (Berlekamp–Massey, Chien search) ·
+convolutional codes / Viterbi (hard ACS, soft max-log-MAP) · LTE Turbo (PCCC,
+BCJR, QPP interleaver) · extended binary Golay(24,12,8) · Hamming(7,4) ·
+CRC-24A/B/C, CRC-16/11/6
+
+**Standards:** 3GPP TS 38.212 (5G NR) · 3GPP TS 36.212 (LTE) · IEEE
+802.11ax/be (Wi-Fi 6/7) · DVB-S2 · CCSDS · IMT-2030 (6G research)
+
+**Engineering:** Rust · SIMD (AVX2, VPSHUFB, NEON) · zero-allocation hot
+paths · lock-free SPSC ring buffer · thread affinity · rate matching ·
+transport-block segmentation · fixed-point i8 LLR quantization ·
+cache-aligned flat memory layout · struct-of-arrays (SoA)
+
+**Hardware targets:** the SIMD paths are keyed to instruction sets, so they
+cover whole processor families:
+
+| Path | Instruction set | Common hardware | Status |
+|---|---|---|---|
+| x86-64 AVX2 | AVX2 + VPSHUFB | Intel Core (Haswell 2013 →), Intel Xeon, AMD Ryzen / Threadripper / EPYC | Runtime-detected; proven bit-identical to scalar by seeded equivalence tests |
+| AArch64 NEON | ASIMD | Raspberry Pi 4/5, Apple Silicon (M1–M4), AWS Graviton, Ampere Altra, Qualcomm Snapdragon | Compiled path, wired into the LDPC decoder |
+| Portable scalar | none | Everything else Rust targets | Reference implementation; every SIMD path is tested bit-identical against it |
+| Bare-metal ARM Cortex-M | Thumb-2, `no_std` | STM32, Nordic nRF52, Arduino boards | **Planned** — the crate currently requires `std` |
+
+Questions this repository answers: *Is there a Rust library for 5G NR LDPC
+encoding and decoding? How do I implement TS 38.212 code block segmentation
+and rate matching? What is a Rust alternative to AFF3CT? How does a polar
+SCL decoder work? How do I do Reed-Solomon erasure coding in Rust with SIMD?
+How fast can safe Rust decode LDPC compared to C++?*
 
 ---
 

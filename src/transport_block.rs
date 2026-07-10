@@ -77,7 +77,7 @@ pub struct DecodeReport {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::transport_block::DlSchEncoder;
+/// use syndrome::transport_block::DlSchEncoder;
 ///
 /// let tb_size = 200usize; // bits
 /// let enc = DlSchEncoder::new(tb_size, 0.5, 1, 1000).unwrap();
@@ -132,7 +132,7 @@ impl DlSchEncoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::transport_block::DlSchEncoder;
+    /// use syndrome::transport_block::DlSchEncoder;
     /// let enc = DlSchEncoder::new(200, 0.5, 1, 512).unwrap();
     /// ```
     pub fn new(tb_size: usize, target_rate: f32, qm: usize, g: usize) -> Result<Self, FecError> {
@@ -279,7 +279,7 @@ impl Clone for QcLdpcEncoder {
 /// # Examples
 ///
 /// ```no_run
-/// use glezer_rsv::transport_block::{DlSchEncoder, DlSchDecoder};
+/// use syndrome::transport_block::{DlSchEncoder, DlSchDecoder};
 ///
 /// let tb_size = 200usize;
 /// let enc = DlSchEncoder::new(tb_size, 0.5, 1, 1000).unwrap();
@@ -342,7 +342,7 @@ impl DlSchDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::transport_block::DlSchDecoder;
+    /// use syndrome::transport_block::DlSchDecoder;
     /// let dec = DlSchDecoder::new(200, 0.5, 1, 512, 10, 0.25).unwrap();
     /// ```
     pub fn new(

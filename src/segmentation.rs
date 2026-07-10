@@ -192,8 +192,8 @@ pub struct SegmentationParams {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::segmentation::compute_segmentation;
-/// use glezer_rsv::qc_ldpc::BaseGraph;
+/// use syndrome::segmentation::compute_segmentation;
+/// use syndrome::qc_ldpc::BaseGraph;
 ///
 /// // Small TB → BG2, no segmentation.
 /// let p = compute_segmentation(100, 0.5).unwrap();

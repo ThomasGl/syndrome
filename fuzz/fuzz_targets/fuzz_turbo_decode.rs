@@ -12,8 +12,8 @@
 
 #![no_main]
 
-use glezer_rsv::turbo::TurboDecoder;
 use libfuzzer_sys::fuzz_target;
+use syndrome::turbo::TurboDecoder;
 
 const SUPPORTED_K: [usize; 8] = [40, 104, 256, 512, 1024, 2048, 4096, 6144];
 

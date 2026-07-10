@@ -19,8 +19,8 @@
 //! # Usage
 //!
 //! ```
-//! use glezer_rsv::harq::HarqBuffer;
-//! use glezer_rsv::qc_ldpc::BaseGraph;
+//! use syndrome::harq::HarqBuffer;
+//! use syndrome::qc_ldpc::BaseGraph;
 //!
 //! let mut buf = HarqBuffer::new(BaseGraph::Bg1, 2); // z=2
 //! let e_llr = vec![1.0f32; 32];
@@ -67,8 +67,8 @@ impl HarqBuffer {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::harq::HarqBuffer;
-    /// use glezer_rsv::qc_ldpc::BaseGraph;
+    /// use syndrome::harq::HarqBuffer;
+    /// use syndrome::qc_ldpc::BaseGraph;
     ///
     /// let buf = HarqBuffer::new(BaseGraph::Bg1, 2);
     /// assert_eq!(buf.ncb(), 66 * 2);
@@ -129,8 +129,8 @@ impl HarqBuffer {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::harq::HarqBuffer;
-    /// use glezer_rsv::qc_ldpc::BaseGraph;
+    /// use syndrome::harq::HarqBuffer;
+    /// use syndrome::qc_ldpc::BaseGraph;
     ///
     /// let mut buf = HarqBuffer::new(BaseGraph::Bg2, 4);
     /// let e = vec![0.5f32; 16];

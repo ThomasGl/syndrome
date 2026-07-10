@@ -4,7 +4,7 @@
 # parity output for the deterministic seed input.
 #
 # Usage:  bash bench/run_all.sh
-# Must be run from the repo root (glezer_rsv/).
+# Must be run from the repo root (syndrome/).
 #
 # Exit codes:
 #   0 — all checksums match, JSON written, dashboard ready

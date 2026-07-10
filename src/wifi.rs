@@ -81,7 +81,7 @@ impl WifiLdpcParams {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::wifi::{WifiStandard, WifiLdpcParams};
+    /// use syndrome::wifi::{WifiStandard, WifiLdpcParams};
     ///
     /// let p = WifiLdpcParams {
     ///     standard: WifiStandard::WiFi6,
@@ -171,7 +171,7 @@ fn closest_rate(target_rate: f32) -> (usize, usize) {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::wifi::{select_wifi_ldpc, WifiStandard};
+/// use syndrome::wifi::{select_wifi_ldpc, WifiStandard};
 ///
 /// let p = select_wifi_ldpc(20, WifiStandard::WiFi6, 0.5);
 /// assert_eq!(p.z, 27);        // 20 bytes = 160 bits; K(27,1/2)=324 ≥ 160
@@ -456,7 +456,7 @@ pub const WIFI7_MCS_TABLE: [WifiMcs; 14] = [
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::wifi::{wifi_ldpc_params_for_mcs, WIFI6_MCS_TABLE};
+/// use syndrome::wifi::{wifi_ldpc_params_for_mcs, WIFI6_MCS_TABLE};
 ///
 /// // MCS 5: 64-QAM 2/3
 /// let p = wifi_ldpc_params_for_mcs(&WIFI6_MCS_TABLE[5], 30);

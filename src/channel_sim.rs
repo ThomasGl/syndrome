@@ -29,7 +29,7 @@
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::channel_sim::AwgnChannel;
+/// use syndrome::channel_sim::AwgnChannel;
 ///
 /// let mut ch = AwgnChannel::new(5.0, 0.5, 42);
 /// let bits: Vec<u8> = vec![0, 1, 0, 0, 1];
@@ -60,7 +60,7 @@ impl AwgnChannel {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::channel_sim::AwgnChannel;
+    /// use syndrome::channel_sim::AwgnChannel;
     ///
     /// // Rate-1/2 code at 3 dB Eb/N0.
     /// let ch = AwgnChannel::new(3.0, 0.5, 1);
@@ -127,7 +127,7 @@ impl AwgnChannel {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::channel_sim::AwgnChannel;
+    /// use syndrome::channel_sim::AwgnChannel;
     ///
     /// let mut ch = AwgnChannel::new(10.0, 0.5, 7);
     /// let bits = vec![0u8; 64];
@@ -166,7 +166,7 @@ impl AwgnChannel {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::channel_sim::AwgnChannel;
+    /// use syndrome::channel_sim::AwgnChannel;
     ///
     /// let ch = AwgnChannel::new(0.0, 0.5, 1);
     /// let bits = vec![0u8, 1u8, 0u8];
@@ -202,7 +202,7 @@ impl AwgnChannel {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::channel_sim::AwgnChannel;
+    /// use syndrome::channel_sim::AwgnChannel;
     ///
     /// let a = vec![0u8, 0, 1, 1];
     /// let b = vec![0u8, 1, 1, 0];
@@ -231,7 +231,7 @@ impl AwgnChannel {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::channel_sim::AwgnChannel;
+    /// use syndrome::channel_sim::AwgnChannel;
     ///
     /// let a = vec![0u8, 1, 0, 1];
     /// let b = vec![0u8, 0, 0, 1];

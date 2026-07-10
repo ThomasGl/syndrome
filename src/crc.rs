@@ -17,7 +17,7 @@
 //! # Examples
 //!
 //! ```
-//! use glezer_rsv::crc::{Crc24, CrcKind};
+//! use syndrome::crc::{Crc24, CrcKind};
 //!
 //! let crc = Crc24::new(CrcKind::Crc24A);
 //! let mut bits: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 0];
@@ -154,7 +154,7 @@ impl Crc24 {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::crc::{Crc24, CrcKind};
+    /// use syndrome::crc::{Crc24, CrcKind};
     /// let crc = Crc24::new(CrcKind::Crc24A);
     /// ```
     pub fn new(kind: CrcKind) -> Self {
@@ -216,7 +216,7 @@ impl Crc24 {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::crc::{Crc24, CrcKind};
+    /// use syndrome::crc::{Crc24, CrcKind};
     /// let crc = Crc24::new(CrcKind::Crc24A);
     /// // All-zero input must produce zero remainder.
     /// assert_eq!(crc.compute(&vec![0u8; 24]), 0);
@@ -280,7 +280,7 @@ impl Crc24 {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::crc::{Crc24, CrcKind};
+    /// use syndrome::crc::{Crc24, CrcKind};
     /// let crc = Crc24::new(CrcKind::Crc24B);
     /// let mut bits = vec![1u8, 0, 1, 0, 1, 1, 0, 1];
     /// crc.attach(&mut bits);

@@ -87,7 +87,7 @@
 //! # Examples
 //!
 //! ```
-//! use glezer_rsv::BchCode;
+//! use syndrome::BchCode;
 //!
 //! // t = 2: corrects up to 2 bit errors per 255-bit block.
 //! let bch = BchCode::new(2).unwrap();
@@ -277,7 +277,7 @@ impl BchCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::BchCode;
+    /// use syndrome::BchCode;
     /// let bch = BchCode::new(3).unwrap();
     /// assert_eq!(bch.n(), 255);
     /// assert_eq!(bch.n() - bch.k(), bch.parity_len());
@@ -535,7 +535,7 @@ impl BchCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::BchCode;
+    /// use syndrome::BchCode;
     /// let bch = BchCode::new(1).unwrap();
     /// let info = vec![0u8; bch.k()];
     /// let mut codeword = vec![0u8; bch.n()];
@@ -595,7 +595,7 @@ impl BchCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::BchCode;
+    /// use syndrome::BchCode;
     /// let bch = BchCode::new(4).unwrap();
     /// let k_short = 64; // a small NAND ECC region
     /// let info = vec![1u8; k_short];
@@ -917,7 +917,7 @@ impl BchCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::BchCode;
+    /// use syndrome::BchCode;
     /// let bch = BchCode::new(2).unwrap();
     /// let info = vec![1u8; bch.k()];
     /// let mut codeword = vec![0u8; bch.n()];
@@ -962,7 +962,7 @@ impl BchCode {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::BchCode;
+    /// use syndrome::BchCode;
     /// let bch = BchCode::new(3).unwrap();
     /// let k_short = 32;
     /// let info = vec![1u8, 0].into_iter().cycle().take(k_short).collect::<Vec<u8>>();

@@ -1,4 +1,4 @@
-use glezer_rsv::ReedSolomon;
+use syndrome::ReedSolomon;
 use std::time::Instant;
 
 fn bench<F: Fn(&ReedSolomon, &[&[u8]], &mut [u8])>(

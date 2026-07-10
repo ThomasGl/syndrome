@@ -27,21 +27,21 @@
 //!
 //! Case sizes are kept small so the whole suite runs in well under 20s.
 
-use glezer_rsv::FecError;
-use glezer_rsv::bch::BchCode;
-use glezer_rsv::crc::{Crc24, CrcKind};
-use glezer_rsv::golay::GolayCode;
-use glezer_rsv::hamming::{decode_hamming_7_4, encode_hamming_7_4};
-use glezer_rsv::harq::HarqBuffer;
-use glezer_rsv::polar::{PolarDecoder, PolarEncoder};
-use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
-use glezer_rsv::quantize::{dequantize_llr, quantize_llr};
-use glezer_rsv::rate_matching::{rate_dematch_llr, rate_match};
-use glezer_rsv::reed_solomon::ReedSolomon;
-use glezer_rsv::segmentation::{compute_segmentation, segment};
-use glezer_rsv::transport_block::{DlSchDecoder, DlSchEncoder};
-use glezer_rsv::turbo::{TurboDecoder, TurboEncoder};
-use glezer_rsv::viterbi::ViterbiDecoder;
+use syndrome::FecError;
+use syndrome::bch::BchCode;
+use syndrome::crc::{Crc24, CrcKind};
+use syndrome::golay::GolayCode;
+use syndrome::hamming::{decode_hamming_7_4, encode_hamming_7_4};
+use syndrome::harq::HarqBuffer;
+use syndrome::polar::{PolarDecoder, PolarEncoder};
+use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
+use syndrome::quantize::{dequantize_llr, quantize_llr};
+use syndrome::rate_matching::{rate_dematch_llr, rate_match};
+use syndrome::reed_solomon::ReedSolomon;
+use syndrome::segmentation::{compute_segmentation, segment};
+use syndrome::transport_block::{DlSchDecoder, DlSchEncoder};
+use syndrome::turbo::{TurboDecoder, TurboEncoder};
+use syndrome::viterbi::ViterbiDecoder;
 
 // ===========================================================================
 // Shared test helpers

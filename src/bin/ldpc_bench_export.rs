@@ -4,7 +4,7 @@
 //! Usage: `cargo run --release --bin ldpc_bench_export`
 //! Output: `bench/results/ldpc_rust.json`
 
-use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 use std::time::Instant;
 
 const Z: usize = 384;

@@ -24,7 +24,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use glezer_rsv::{BaseGraph, QcLdpcDecoder, LdpcPipeline};
+//! use syndrome::{BaseGraph, QcLdpcDecoder, LdpcPipeline};
 //!
 //! let decoder  = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 384, 0.25).unwrap();
 //! let mut pipe = LdpcPipeline::new(decoder, 10);

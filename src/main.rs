@@ -1,4 +1,4 @@
-use glezer_rsv::{
+use syndrome::{
     BaseGraph, QcLdpcDecoder, ReedSolomon, SpscRing, ViterbiDecoder, decode_hamming_7_4,
     encode_hamming_7_4,
 };

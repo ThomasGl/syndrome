@@ -19,7 +19,7 @@
 use std::fs;
 use std::io::Write as IoWrite;
 
-use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
+use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
 
 // ---------------------------------------------------------------------------
 // Minimal XorShift64 RNG + Box-Muller Gaussian (no external crates)

@@ -9,7 +9,7 @@ use core::fmt;
 /// Errors returned by the 5G NR FEC processing chain.
 ///
 /// This is the single error type returned by every fallible public API in
-/// `glezer_rsv`. It implements [`std::error::Error`], so it composes with
+/// `syndrome`. It implements [`std::error::Error`], so it composes with
 /// `anyhow`/`Box<dyn Error>` via `?`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FecError {

@@ -13,7 +13,7 @@
 //!
 //! Run with: `cargo run --example 07_lockfree_pipeline`
 
-use glezer_rsv::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
+use syndrome::{BaseGraph, LdpcPipeline, QcLdpcDecoder};
 
 const ITERATIONS: usize = 10; // LOMS iterations applied to every frame by every worker.
 const N_WORKERS: usize = 2;

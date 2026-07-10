@@ -1,5 +1,5 @@
 [package]
-name = "glezer_rsv"
+name = "syndrome"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -8,7 +8,7 @@ description = "Multi-standard Forward Error Correction in safe Rust: 5G NR TS 38
 authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
 readme = "README.md"
 # NOTE: update `repository` if the GitHub slug differs when the remote is created.
-repository = "https://github.com/thomas-glezer/glezer-rsv"
+repository = "https://github.com/thomas-glezer/syndrome"
 keywords = ["fec", "ldpc", "5g", "reed-solomon", "simd"]
 # "no-std" deliberately NOT claimed: the crate currently requires std (threads,
 # Vec-based construction). Re-add the category once the cortex-m feature

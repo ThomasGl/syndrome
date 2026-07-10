@@ -348,7 +348,7 @@ impl QcLdpcParams {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+/// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 ///
 /// let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
 /// let n = decoder.variable_node_count();
@@ -456,7 +456,7 @@ impl QcLdpcDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
     ///
     /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
     /// let n   = dec.variable_node_count();
@@ -1218,7 +1218,7 @@ enum EncodeStrategy {
 /// # Examples
 ///
 /// ```
-/// use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcEncoder};
+/// use syndrome::qc_ldpc::{BaseGraph, QcLdpcEncoder};
 ///
 /// let enc = QcLdpcEncoder::new(BaseGraph::Bg1, 2).unwrap();
 /// let k = enc.info_bit_count();
@@ -1322,7 +1322,7 @@ impl QcLdpcEncoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::qc_ldpc::{BaseGraph, QcLdpcEncoder};
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcEncoder};
     ///
     /// let enc = QcLdpcEncoder::new(BaseGraph::Bg1, 2).unwrap();
     /// let k_prime = enc.info_bit_count() - 4; // pretend 4 filler bits

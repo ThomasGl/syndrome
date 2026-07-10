@@ -1,4 +1,4 @@
-# glezer-rsv Cross-Language Benchmark Suite
+# syndrome Cross-Language Benchmark Suite
 
 Reproducible Reed-Solomon encode throughput comparison: Rust vs same-algorithm C++ vs Python.
 

@@ -1,10 +1,10 @@
-# glezer_rsv fuzz targets
+# syndrome fuzz targets
 
 This is a standard [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
 layout (`libfuzzer-sys` harnesses, one `[[bin]]` per target in
 `fuzz/Cargo.toml`). It is its own Cargo workspace (`[workspace]` at the
 bottom of `fuzz/Cargo.toml`) and is **not** a member of the root
-`glezer_rsv` workspace — the root `Cargo.toml` is untouched.
+`syndrome` workspace — the root `Cargo.toml` is untouched.
 
 ## Targets
 

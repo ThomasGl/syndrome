@@ -9,12 +9,12 @@
 //!
 //! All numbers are measured on this machine at run time — never hand-written.
 
-use glezer_rsv::channel_sim::AwgnChannel;
-use glezer_rsv::crc::{Crc24, CrcKind};
-use glezer_rsv::hamming::encode_hamming_7_4;
-use glezer_rsv::polar::{PolarDecoder, PolarEncoder};
-use glezer_rsv::viterbi::ViterbiDecoder;
-use glezer_rsv::{
+use syndrome::channel_sim::AwgnChannel;
+use syndrome::crc::{Crc24, CrcKind};
+use syndrome::hamming::encode_hamming_7_4;
+use syndrome::polar::{PolarDecoder, PolarEncoder};
+use syndrome::viterbi::ViterbiDecoder;
+use syndrome::{
     BaseGraph, BchCode, GolayCode, QcLdpcDecoder, QcLdpcEncoder, ReedSolomon, TurboDecoder,
     TurboEncoder,
 };
@@ -101,7 +101,7 @@ fn main() {
         let ns_dec = time_ns(
             || {
                 for (o, &c) in out.iter_mut().zip(&coded_fixed) {
-                    *o = glezer_rsv::decode_hamming_7_4(c).unwrap();
+                    *o = syndrome::decode_hamming_7_4(c).unwrap();
                 }
             },
             20,

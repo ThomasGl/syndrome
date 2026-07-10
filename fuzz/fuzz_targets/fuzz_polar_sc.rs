@@ -10,8 +10,8 @@
 
 #![no_main]
 
-use glezer_rsv::polar::PolarDecoder;
 use libfuzzer_sys::fuzz_target;
+use syndrome::polar::PolarDecoder;
 
 /// Map a `(hi, lo)` byte pair to an `f32` LLR: `hi % 8` selects an
 /// occasional NaN/+-Inf/zero special case (probability 4/8), otherwise a

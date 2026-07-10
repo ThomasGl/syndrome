@@ -1,4 +1,4 @@
-//! Reproducible Criterion benchmarks for glezer_rsv.
+//! Reproducible Criterion benchmarks for syndrome.
 //!
 //! Run:    cargo bench --bench fec_bench
 //! Output: target/criterion/** (HTML reports + raw estimates.json per bench)
@@ -15,7 +15,7 @@
 //! MB/s and line up with the C++/Python comparison drivers.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use glezer_rsv::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder, ReedSolomon, SpscRing};
+use syndrome::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder, ReedSolomon, SpscRing};
 
 /// Reed-Solomon encode, swept over shard length. Data payload = 10 shards.
 fn bench_reed_solomon(c: &mut Criterion) {

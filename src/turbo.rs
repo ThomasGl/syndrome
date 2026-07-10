@@ -196,7 +196,7 @@ impl TurboEncoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::TurboEncoder;
+    /// use syndrome::TurboEncoder;
     /// let enc = TurboEncoder::new(40).unwrap();
     /// assert_eq!(enc.output_len(), 3 * 40 + 12);
     /// ```
@@ -221,7 +221,7 @@ impl TurboEncoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::TurboEncoder;
+    /// use syndrome::TurboEncoder;
     /// let enc = TurboEncoder::new(104).unwrap();
     /// assert_eq!(enc.output_len(), 3 * 104 + 12);
     /// ```
@@ -246,7 +246,7 @@ impl TurboEncoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::TurboEncoder;
+    /// use syndrome::TurboEncoder;
     /// let enc = TurboEncoder::new(40).unwrap();
     /// let info = vec![1u8, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0,
     ///                  1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0];
@@ -384,7 +384,7 @@ impl TurboDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::TurboDecoder;
+    /// use syndrome::TurboDecoder;
     /// let dec = TurboDecoder::new(40).unwrap();
     /// ```
     pub fn new(k: usize) -> Result<Self, FecError> {
@@ -453,7 +453,7 @@ impl TurboDecoder {
     /// # Examples
     ///
     /// ```
-    /// use glezer_rsv::{TurboDecoder, TurboEncoder};
+    /// use syndrome::{TurboDecoder, TurboEncoder};
     ///
     /// let k = 40;
     /// let enc = TurboEncoder::new(k).unwrap();

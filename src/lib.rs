@@ -1,4 +1,4 @@
-//! glezer_rsv: 5G NR Forward Error Correction library
+//! syndrome: 5G NR Forward Error Correction library
 //!
 //! A protocol-aware FEC library implementing the 3GPP TS 38.212 transport block
 //! processing chain: CRC attachment, code block segmentation, QC-LDPC encode/decode
@@ -6,8 +6,8 @@
 //! Viterbi convolutional decoding, Polar codes, LTE Turbo codes, BCH codes, and
 //! the extended binary Golay code.
 //!
-//! Designed for zero-allocation hot paths, AVX2/AVX-512 SIMD acceleration, and
-//! lock-free SPSC pipeline concurrency.
+//! Designed for zero-allocation hot paths, AVX2 (x86-64) and NEON (AArch64)
+//! SIMD acceleration, and lock-free SPSC pipeline concurrency.
 
 pub mod affinity;
 pub mod bch;

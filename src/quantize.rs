@@ -2,9 +2,10 @@
 //!
 //! Industrial LDPC decoders quantise soft log-likelihood ratios to 8-bit
 //! integers to exploit 32-wide integer SIMD (vs 8-wide f32).  This module
-//! provides the scalar quantization/dequantization layer; the AVX2 and
-//! AVX-512 i8 LOMS kernels live in `crate::simd_avx2` and
-//! `crate::simd_avx512` respectively.
+//! provides the scalar quantization/dequantization layer.  The vectorized
+//! i8 LOMS kernels that would consume it are planned but not yet
+//! implemented — the shipping LDPC decode paths (scalar, AVX2, NEON)
+//! operate on f32 LLRs.
 //!
 //! # Fixed-Point Format
 //!
@@ -19,7 +20,7 @@
 //! # Examples
 //!
 //! ```
-//! use glezer_rsv::quantize::{quantize_llr, dequantize_llr};
+//! use syndrome::quantize::{quantize_llr, dequantize_llr};
 //!
 //! let f = [1.5f32, -3.0, 0.0, 200.0];
 //! let mut q = [0i8; 4];

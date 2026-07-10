@@ -9,8 +9,8 @@
 
 #![no_main]
 
-use glezer_rsv::reed_solomon::ReedSolomon;
 use libfuzzer_sys::fuzz_target;
+use syndrome::reed_solomon::ReedSolomon;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {

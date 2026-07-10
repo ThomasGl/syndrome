@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run --example 03_reed_solomon_packet_loss`
 
-use glezer_rsv::ReedSolomon;
+use syndrome::ReedSolomon;
 
 const SHARD_LEN: usize = 1024; // 1 KiB per shard, like a network packet or disk block.
 const DATA_SHARDS: usize = 10;
