@@ -143,7 +143,7 @@ impl DlSchEncoder {
 
         // Build one encoder per code block (they're all identical for a given
         // TB since all CBs share the same Z).
-        let enc = QcLdpcEncoder::new(params.bg, params.z).map_err(FecError::Legacy)?;
+        let enc = QcLdpcEncoder::new(params.bg, params.z)?;
         let encoders = (0..params.c).map(|_| enc.clone()).collect::<Vec<_>>();
 
         // E per CB: G / C, must be divisible by Qm.
@@ -218,8 +218,7 @@ impl DlSchEncoder {
 
         for (ci, cb) in cb_blocks.iter().enumerate() {
             // §5.3.2 — LDPC encode with filler padding.
-            enc.encode_5g(cb, self.params.n_filler, &mut codeword)
-                .map_err(FecError::Legacy)?;
+            enc.encode_5g(cb, self.params.n_filler, &mut codeword)?;
 
             // §5.4.2 — rate match (E bits).
             rate_match(
@@ -336,8 +335,7 @@ impl DlSchDecoder {
         let tb_crc = Crc24::new(CrcKind::Crc24A);
         let cb_crc = Crc24::new(CrcKind::Crc24B);
 
-        let dec = QcLdpcDecoder::with_lifting_size(params.bg, params.z, offset_beta)
-            .map_err(FecError::Legacy)?;
+        let dec = QcLdpcDecoder::with_lifting_size(params.bg, params.z, offset_beta)?;
         let decoders: Vec<QcLdpcDecoder> = (0..params.c).map(|_| dec.clone()).collect();
         let harq_bufs: Vec<HarqBuffer> = (0..params.c)
             .map(|_| HarqBuffer::with_filler(params.bg, params.z, params.n_filler))
@@ -448,16 +446,14 @@ impl DlSchDecoder {
             }
 
             // decode_5g sets filler LLRs + punctured LLRs correctly.
-            let cb_iters = self.decoders[ci]
-                .decode_5g(
-                    &mut llr_cb,
-                    n_filler,
-                    &mut edge_r,
-                    &mut scratch,
-                    &mut hard,
-                    self.iterations,
-                )
-                .map_err(FecError::Legacy)?;
+            let cb_iters = self.decoders[ci].decode_5g(
+                &mut llr_cb,
+                n_filler,
+                &mut edge_r,
+                &mut scratch,
+                &mut hard,
+                self.iterations,
+            )?;
             max_iters = max_iters.max(cb_iters);
 
             // Extract K' info bits (systematic only, no filler).
@@ -579,6 +575,70 @@ mod tests {
         assert!(DlSchEncoder::new(0, 0.5, 1, 512).is_err());
         assert!(DlSchEncoder::new(100, 0.5, 0, 512).is_err());
         assert!(DlSchEncoder::new(100, 0.5, 1, 0).is_err());
+    }
+
+    /// FINDING 9 round-trip regression guard: a sweep of "awkward" transport
+    /// block sizes (including the exact `compute_segmentation(8425, 0.5)`
+    /// reproducer from tests/robustness.rs, plus sizes that land on every
+    /// residue of $B' \bmod C$, not just the lucky evenly-divisible ones)
+    /// proving that the fixed segmentation math (`K' = \lceil B'/C \rceil`,
+    /// zero-padded slack — see `segmentation`'s module doc) still round-trips
+    /// correctly end-to-end through the full `DlSchEncoder` -> channel ->
+    /// `DlSchDecoder` chain, not just in isolation.
+    ///
+    /// Each case sends the *entire* codeword per code block (`g = c * n`,
+    /// `qm = 1`, no puncturing) over a noiseless channel, so decode success
+    /// isolates segmentation/CRC correctness from LDPC waterfall behavior.
+    #[test]
+    fn round_trip_sweep_awkward_tb_sizes() {
+        let cases: &[(usize, f32)] = &[
+            (8425, 0.5),  // exact finding-9 reproducer: BG1, C=2, non-divisible B'
+            (100, 0.5),   // BG2, C=1
+            (197, 0.5),   // BG2, C=1
+            (3800, 0.5),  // BG2, C=1 (B == Kcb boundary)
+            (3825, 0.5),  // BG1, C=1 (A just above the BG2 cutoff)
+            (8448, 0.5),  // BG1, B == Kcb exactly -> C=1
+            (8449, 0.5),  // BG1, C=2
+            (10001, 0.5), // BG1, C=2
+            (12345, 0.9), // BG1, C=2
+            (20000, 0.5), // BG1, C=3
+        ];
+        for &(tb_size, rate) in cases {
+            let params = compute_segmentation(tb_size, rate).unwrap();
+            let qm = 1usize;
+            // Send the whole codeword per code block: no puncturing, so
+            // decode success isolates segmentation correctness.
+            let g = params.c * params.n;
+
+            let enc = DlSchEncoder::new(tb_size, rate, qm, g)
+                .unwrap_or_else(|e| panic!("tb_size={tb_size} rate={rate}: encoder: {e:?}"));
+            let mut dec = DlSchDecoder::new(tb_size, rate, qm, g, 20, 0.25)
+                .unwrap_or_else(|e| panic!("tb_size={tb_size} rate={rate}: decoder: {e:?}"));
+
+            let tb: Vec<u8> = (0..tb_size).map(|i| ((i * 13 + 5) % 7 < 3) as u8).collect();
+            let mut coded = vec![0u8; enc.output_bits()];
+            enc.encode(&tb, 0, &mut coded)
+                .unwrap_or_else(|e| panic!("tb_size={tb_size} rate={rate}: encode: {e:?}"));
+
+            // Noiseless channel: strong LLRs matching the transmitted bits.
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 0 { 10.0 } else { -10.0 })
+                .collect();
+            let mut tb_out = vec![0u8; tb_size];
+            let report = dec
+                .decode(&llr, 0, &mut tb_out)
+                .unwrap_or_else(|e| panic!("tb_size={tb_size} rate={rate}: decode: {e:?}"));
+
+            assert!(
+                report.crc_ok,
+                "tb_size={tb_size} rate={rate}: CRC failed to pass over a noiseless channel"
+            );
+            assert_eq!(
+                tb_out, tb,
+                "tb_size={tb_size} rate={rate}: recovered payload mismatch"
+            );
+        }
     }
 
     #[test]

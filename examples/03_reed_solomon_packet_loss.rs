@@ -47,7 +47,9 @@ fn main() {
 
     // Encode: parity shards are linear combinations of the data shards over
     // GF(256), computed once and sent alongside the data.
-    let parity_shards = rs.encode(&data_shards);
+    let parity_shards = rs
+        .encode(&data_shards)
+        .expect("shapes are consistent by construction");
     println!(
         "Encoded {} parity shards ({} bytes each).",
         parity_shards.len(),

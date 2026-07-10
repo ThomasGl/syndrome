@@ -67,7 +67,7 @@ fn main() {
 
         // --- encode_into ---
         let ns_into = time_encode(|| {
-            rs.encode_into(&refs, &mut parity);
+            rs.encode_into(&refs, &mut parity).unwrap();
         });
         let mib_into = mib_per_s(payload_bytes, ns_into);
         records.push(format!(
@@ -76,7 +76,7 @@ fn main() {
 
         // --- encode_with_tables_chunked ---
         let ns_chunked = time_encode(|| {
-            rs.encode_with_tables_chunked(&refs, &mut parity);
+            rs.encode_with_tables_chunked(&refs, &mut parity).unwrap();
         });
         let mib_chunked = mib_per_s(payload_bytes, ns_chunked);
         records.push(format!(
@@ -85,7 +85,7 @@ fn main() {
 
         // --- encode_with_avx2 (runtime-detected; falls back to chunked) ---
         let ns_avx2 = time_encode(|| {
-            rs.encode_with_avx2(&refs, &mut parity);
+            rs.encode_with_avx2(&refs, &mut parity).unwrap();
         });
         let mib_avx2 = mib_per_s(payload_bytes, ns_avx2);
         records.push(format!(
@@ -97,7 +97,7 @@ fn main() {
             let seed = seed_data(shard_len);
             let seed_refs: Vec<&[u8]> = seed.iter().map(|v| v.as_slice()).collect();
             let mut cparity = vec![0u8; PARITY_SHARDS * shard_len];
-            rs.encode_into(&seed_refs, &mut cparity);
+            rs.encode_into(&seed_refs, &mut cparity).unwrap();
             checksum_parity = Some(cparity);
         }
     }

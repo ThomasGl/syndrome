@@ -760,7 +760,8 @@ impl PolarDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`FecError::InvalidParam`] if `n` is not a power of 2.
+    /// Returns [`FecError::InvalidParam`] if `n` is not a power of 2, `k >=
+    /// n`, or `list_size == 0`.
     pub fn new(
         n: usize,
         k: usize,
@@ -774,6 +775,11 @@ impl PolarDecoder {
         }
         if k >= n {
             return Err(FecError::InvalidParam("k must be < n"));
+        }
+        if list_size == 0 {
+            return Err(FecError::InvalidParam(
+                "list_size must be >= 1 (0 would leave the SCL path list empty)",
+            ));
         }
         let is_frozen = frozen_mask(n, k);
         let crc = crc_kind.map(Crc24::new);
@@ -980,6 +986,18 @@ mod tests {
     fn invalid_n_rejected() {
         assert!(PolarEncoder::new(7, 4).is_err());
         assert!(PolarEncoder::new(0, 0).is_err());
+    }
+
+    /// FINDING 7 regression guard (was
+    /// `finding_polar_scl_list_size_zero_panics` in tests/robustness.rs,
+    /// `#[should_panic]`): `PolarDecoder::new` used to accept `list_size ==
+    /// 0`, and `decode_scl` would then index the (empty, after
+    /// `truncate(0)`) path list out of bounds. `list_size == 0` is now
+    /// rejected at construction.
+    #[test]
+    fn list_size_zero_rejected() {
+        assert!(PolarDecoder::new(8, 4, 0, None).is_err());
+        assert!(PolarDecoder::new(8, 4, 1, None).is_ok());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::bg_tables::{
     BG1_COLS, BG1_ENTRIES, BG1_ENTRY_COUNT, BG1_ROWS, BG2_COLS, BG2_ENTRIES, BG2_ENTRY_COUNT,
     BG2_ROWS,
 };
+use crate::error::FecError;
 
 /// Supported 5G NR QC-LDPC base graph identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,9 +282,10 @@ impl QcLdpcParams {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `z` is not a valid 3GPP lifting size.
-    pub fn new(bg: BaseGraph, z: usize) -> Result<Self, &'static str> {
-        let ils = ils_for_z(z).ok_or("z is not a valid 3GPP lifting size")?;
+    /// Returns [`FecError::InvalidParam`] if `z` is not a valid 3GPP lifting size.
+    pub fn new(bg: BaseGraph, z: usize) -> Result<Self, FecError> {
+        let ils =
+            ils_for_z(z).ok_or(FecError::InvalidParam("z is not a valid 3GPP lifting size"))?;
 
         let (num_row_blocks, num_col_blocks, entries, entry_count) = match bg {
             BaseGraph::Bg1 => (BG1_ROWS, BG1_COLS, BG1_ENTRIES.as_ref(), BG1_ENTRY_COUNT),
@@ -392,12 +394,8 @@ impl QcLdpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `z` is not a valid 3GPP lifting size.
-    pub fn with_lifting_size(
-        bg: BaseGraph,
-        z: usize,
-        offset_beta: f32,
-    ) -> Result<Self, &'static str> {
+    /// Returns [`FecError::InvalidParam`] if `z` is not a valid 3GPP lifting size.
+    pub fn with_lifting_size(bg: BaseGraph, z: usize, offset_beta: f32) -> Result<Self, FecError> {
         let params = QcLdpcParams::new(bg, z)?;
         Ok(Self {
             params,
@@ -477,7 +475,7 @@ impl QcLdpcDecoder {
         layer_scratch: &mut [f32],
         hard_output: &mut [u8],
         iterations: usize,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, FecError> {
         let z = self.params.z;
         let k_b = self.params.num_col_blocks - self.params.num_row_blocks;
         let k = k_b * z;
@@ -528,7 +526,11 @@ impl QcLdpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any buffer length is insufficient.
+    /// Returns [`FecError::InvalidParam`] if `llr` or `hard_output` do not have
+    /// exactly length [`QcLdpcDecoder::variable_node_count`]. Returns
+    /// [`FecError::BufferTooSmall`] if `edge_r` or `layer_scratch` are smaller
+    /// than [`QcLdpcDecoder::required_edge_buffer`] /
+    /// [`QcLdpcDecoder::required_layer_buffer`] respectively.
     ///
     /// On success returns the number of iterations actually performed.  When
     /// the syndrome check passes before `iterations` complete, the loop exits
@@ -540,21 +542,31 @@ impl QcLdpcDecoder {
         layer_scratch: &mut [f32],
         hard_output: &mut [u8],
         iterations: usize,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<usize, FecError> {
         let n = self.variable_node_count();
         if llr.len() != n {
-            return Err("llr length mismatch");
+            return Err(FecError::InvalidParam(
+                "llr length must equal variable_node_count()",
+            ));
         }
         if hard_output.len() != n {
-            return Err("hard_output length mismatch");
+            return Err(FecError::InvalidParam(
+                "hard_output length must equal variable_node_count()",
+            ));
         }
         let edge_count = self.required_edge_buffer();
         if edge_r.len() < edge_count {
-            return Err("edge_r buffer too small");
+            return Err(FecError::BufferTooSmall {
+                required: edge_count,
+                provided: edge_r.len(),
+            });
         }
         let layer_scratch_len = self.required_layer_buffer();
         if layer_scratch.len() < layer_scratch_len {
-            return Err("layer_scratch buffer too small");
+            return Err(FecError::BufferTooSmall {
+                required: layer_scratch_len,
+                provided: layer_scratch.len(),
+            });
         }
 
         // Initialize extrinsic messages to zero once before the first iteration.
@@ -824,7 +836,7 @@ impl ParityGenerator {
     /// Augmented matrix layout: `[Hp (M cols) | Hs (K cols)]`, packed into
     /// `ceil((M+K)/64)` words per row.  After elimination on the Hp block, the
     /// Hs block contains the generator.
-    fn build(params: &QcLdpcParams) -> Result<Self, &'static str> {
+    fn build(params: &QcLdpcParams) -> Result<Self, FecError> {
         let z = params.z;
         let m_b = params.num_row_blocks;
         let n_b = params.num_col_blocks;
@@ -860,7 +872,9 @@ impl ParityGenerator {
         // Packed GF(2) Gaussian elimination on columns 0..m (Hp block).
         for col in 0..m {
             let pivot = (col..m).find(|&r| gf_bit_get(&aug[r], col));
-            let pivot = pivot.ok_or("parity matrix is singular — cannot encode")?;
+            let pivot = pivot.ok_or(FecError::InvalidParam(
+                "parity matrix is singular — cannot encode",
+            ))?;
             if pivot != col {
                 aug.swap(col, pivot);
             }
@@ -1240,9 +1254,9 @@ impl QcLdpcEncoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `z` is not valid, or (dense fallback only) if the
-    /// parity matrix is singular.
-    pub fn new(bg: BaseGraph, z: usize) -> Result<Self, &'static str> {
+    /// Returns [`FecError::InvalidParam`] if `z` is not valid, or (dense
+    /// fallback only) if the parity matrix is singular.
+    pub fn new(bg: BaseGraph, z: usize) -> Result<Self, FecError> {
         let params = QcLdpcParams::new(bg, z)?;
         let k_b_blocks = params.num_col_blocks - params.num_row_blocks;
         let k_bits = k_b_blocks * params.z;
@@ -1300,8 +1314,10 @@ impl QcLdpcEncoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `info_bits.len() != k_bits - n_filler` or the codeword
-    /// buffer has the wrong length.
+    /// Returns [`FecError::InvalidParam`] if `n_filler` exceeds the encoder's
+    /// `k_bits`. Returns [`FecError::BufferTooSmall`] if
+    /// `info_bits.len() != k_bits - n_filler` or the codeword buffer has the
+    /// wrong length.
     ///
     /// # Examples
     ///
@@ -1320,11 +1336,16 @@ impl QcLdpcEncoder {
         info_bits: &[u8],
         n_filler: usize,
         codeword: &mut [u8],
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), FecError> {
         let k = self.k_bits;
-        let k_prime = k.checked_sub(n_filler).ok_or("n_filler exceeds k_bits")?;
+        let k_prime = k
+            .checked_sub(n_filler)
+            .ok_or(FecError::InvalidParam("n_filler exceeds k_bits"))?;
         if info_bits.len() != k_prime {
-            return Err("info_bits length must equal k_bits - n_filler");
+            return Err(FecError::BufferTooSmall {
+                required: k_prime,
+                provided: info_bits.len(),
+            });
         }
         // Build full-K info buffer with filler zeros at positions k_prime..k.
         // This is a setup path (not the hot loop) so a stack Vec is acceptable.
@@ -1353,15 +1374,22 @@ impl QcLdpcEncoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if buffer lengths are incorrect.
-    pub fn encode(&self, info_bits: &[u8], codeword: &mut [u8]) -> Result<(), &'static str> {
+    /// Returns [`FecError::BufferTooSmall`] if `info_bits.len() !=
+    /// info_bit_count()` or `codeword.len() != codeword_bit_count()`.
+    pub fn encode(&self, info_bits: &[u8], codeword: &mut [u8]) -> Result<(), FecError> {
         let k = self.k_bits;
         let n = self.codeword_bit_count();
         if info_bits.len() != k {
-            return Err("info_bits length must equal info_bit_count()");
+            return Err(FecError::BufferTooSmall {
+                required: k,
+                provided: info_bits.len(),
+            });
         }
         if codeword.len() != n {
-            return Err("codeword length must equal codeword_bit_count()");
+            return Err(FecError::BufferTooSmall {
+                required: n,
+                provided: codeword.len(),
+            });
         }
         codeword[..k].copy_from_slice(info_bits);
         match &self.strategy {
@@ -1495,14 +1523,20 @@ impl QcLdpcEncoder {
         &self,
         info_bits: &[u8],
         codeword: &mut [u8],
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), FecError> {
         let k = self.k_bits;
         let n = self.codeword_bit_count();
         if info_bits.len() != k {
-            return Err("info_bits length must equal info_bit_count()");
+            return Err(FecError::BufferTooSmall {
+                required: k,
+                provided: info_bits.len(),
+            });
         }
         if codeword.len() != n {
-            return Err("codeword length must equal codeword_bit_count()");
+            return Err(FecError::BufferTooSmall {
+                required: n,
+                provided: codeword.len(),
+            });
         }
         let generator = ParityGenerator::build(&self.params)?;
         codeword[..k].copy_from_slice(info_bits);

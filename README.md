@@ -261,7 +261,7 @@ rs.encode_with_tables_chunked(&refs, &mut parity); // ~10 GiB/s on AVX2 hardware
 ```rust
 use glezer_rsv::viterbi::ViterbiDecoder;
 
-let dec = ViterbiDecoder::new(7); // constraint length 7, G=(0o133, 0o171)
+let dec = ViterbiDecoder::new(7).unwrap(); // constraint length 7, G=(0o133, 0o171)
 let info_bits = vec![1u8, 0, 1, 1, 0, 0, 1];
 let coded     = dec.encode(&info_bits);   // adds 6 zero-tail bits → 28 coded bits
 

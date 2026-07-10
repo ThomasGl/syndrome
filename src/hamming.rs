@@ -1,3 +1,5 @@
+use crate::error::FecError;
+
 /// Hamming (7,4) encoder and decoder utilities.
 ///
 /// Provides functions to encode 4 bits into a 7-bit Hamming code and to decode
@@ -52,9 +54,7 @@ impl Hamming74 {
     }
 
     /// Decode a 7-bit Hamming code (stored in low bits of `u8`). Attempts to
-    /// correct a single-bit error. Returns `Ok(4-bit nibble)` on success or
-    /// `Err(&'static str)` if a double-bit error is detected (syndrome zero but
-    /// parity mismatch cannot be corrected here).
+    /// correct a single-bit error.
     ///
     /// # Arguments
     ///
@@ -62,8 +62,16 @@ impl Hamming74 {
     ///
     /// # Returns
     ///
-    /// `Ok(nibble)` with the corrected 4-bit data, or `Err` if unrecoverable.
-    pub fn decode(code: u8) -> Result<u8, &'static str> {
+    /// `Ok(nibble)` with the corrected 4-bit data.
+    ///
+    /// # Errors
+    ///
+    /// This single-error-correcting decode is total over all 7-bit inputs
+    /// (Hamming(7,4)'s syndrome always maps to a correctable single-bit
+    /// position or to zero) and currently never fails, but returns
+    /// [`FecError`] rather than a bare `u8` to match the crate-wide error
+    /// convention and leave room for future stricter validation.
+    pub fn decode(code: u8) -> Result<u8, FecError> {
         let r = code & 0x7F;
         let b = |pos: u8| -> u8 { (r >> (pos - 1)) & 1 };
 
@@ -104,7 +112,7 @@ pub fn encode_hamming_7_4(nibble: u8) -> u8 {
     Hamming74::encode(nibble)
 }
 
-pub fn decode_hamming_7_4(code: u8) -> Result<u8, &'static str> {
+pub fn decode_hamming_7_4(code: u8) -> Result<u8, FecError> {
     Hamming74::decode(code)
 }
 

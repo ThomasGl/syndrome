@@ -15,7 +15,7 @@ use glezer_rsv::channel_sim::AwgnChannel;
 use glezer_rsv::viterbi::ViterbiDecoder;
 
 fn main() {
-    let dec = ViterbiDecoder::new(7); // K=7, rate 1/2 (standard 0o133/0o171 generators)
+    let dec = ViterbiDecoder::new(7).expect("K=7, rate 1/2 (standard 0o133/0o171 generators)");
     println!(
         "Viterbi decoder: constraint length K={}, rate 1/2, {} trellis states",
         dec.constraint_length,

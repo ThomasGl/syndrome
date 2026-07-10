@@ -1,0 +1,65 @@
+[package]
+name = "glezer_rsv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.glezer_rsv]
+path = ".."
+
+[[bin]]
+name = "fuzz_bch_decode"
+path = "fuzz_targets/fuzz_bch_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rs_decode"
+path = "fuzz_targets/fuzz_rs_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_polar_sc"
+path = "fuzz_targets/fuzz_polar_sc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_turbo_decode"
+path = "fuzz_targets/fuzz_turbo_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ldpc_decode"
+path = "fuzz_targets/fuzz_ldpc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crc"
+path = "fuzz_targets/fuzz_crc.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Standalone workspace: this crate must NOT join the parent glezer_rsv
+# workspace (there isn't one at the repo root, but this is the standard
+# cargo-fuzz convention and keeps `cargo` from ever trying to fold this
+# directory into any future root-level `[workspace]`).
+[workspace]

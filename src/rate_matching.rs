@@ -127,8 +127,8 @@ fn deinterleave_f32(e: &mut [f32], qm: usize) {
 ///
 /// # Errors
 ///
-/// Returns [`FecError::InvalidParam`] if `e_bits` is not divisible by `qm`
-/// or `rv` ≥ 4.
+/// Returns [`FecError::InvalidParam`] if `rv` ≥ 4, `qm == 0`, `z == 0`, or
+/// `e_bits` is not divisible by `qm`.
 ///
 /// # Examples
 ///
@@ -154,6 +154,12 @@ pub fn rate_match(
 ) -> Result<(), FecError> {
     if rv >= 4 {
         return Err(FecError::InvalidParam("RV must be 0..=3"));
+    }
+    if qm == 0 {
+        return Err(FecError::InvalidParam("Qm must be > 0"));
+    }
+    if z == 0 {
+        return Err(FecError::InvalidParam("lifting size Z must be > 0"));
     }
     let e_bits = e_out.len();
     if e_bits % qm != 0 {
@@ -244,7 +250,8 @@ pub fn rate_match(
 ///
 /// # Errors
 ///
-/// Returns [`FecError::InvalidParam`] if `rv` ≥ 4 or `E % Qm ≠ 0`.
+/// Returns [`FecError::InvalidParam`] if `rv` ≥ 4, `qm == 0`, `z == 0`, or
+/// `E % Qm ≠ 0`.
 ///
 /// # Examples
 ///
@@ -269,6 +276,12 @@ pub fn rate_dematch_llr(
 ) -> Result<(), FecError> {
     if rv >= 4 {
         return Err(FecError::InvalidParam("RV must be 0..=3"));
+    }
+    if qm == 0 {
+        return Err(FecError::InvalidParam("Qm must be > 0"));
+    }
+    if z == 0 {
+        return Err(FecError::InvalidParam("lifting size Z must be > 0"));
     }
     let e_bits = e_llr.len();
     if e_bits % qm != 0 {
@@ -378,5 +391,35 @@ mod tests {
         let codeword = vec![0u8; 66 * 2];
         let mut e_out = vec![0u8; 8];
         assert!(rate_match(&codeword, &mut e_out, 4, 1, BaseGraph::Bg1, 2, 0).is_err());
+    }
+
+    /// FINDING 2/4 regression guard (was `finding_rate_match_qm_zero_panics`
+    /// / `finding_rate_dematch_llr_qm_zero_panics` in tests/robustness.rs,
+    /// `#[should_panic]`): `qm == 0` used to divide-by-zero via `e_bits %
+    /// qm` before any validation ran.
+    #[test]
+    fn qm_zero_rejected() {
+        let codeword = vec![0u8; 66 * 2];
+        let mut e_out = vec![0u8; 8];
+        assert!(rate_match(&codeword, &mut e_out, 0, 0, BaseGraph::Bg1, 2, 0).is_err());
+
+        let e_llr = vec![1.0f32; 8];
+        let mut cb = vec![0.0f32; 200];
+        assert!(rate_dematch_llr(&e_llr, &mut cb, 0, 0, BaseGraph::Bg1, 2, 0).is_err());
+    }
+
+    /// FINDING 3/5 regression guard (was `finding_rate_match_z_zero_panics`
+    /// / `finding_rate_dematch_llr_z_zero_panics` in tests/robustness.rs,
+    /// `#[should_panic]`): `z == 0` used to divide-by-zero via
+    /// `(k0 + j) % ncb` (`ncb = n_b * z == 0`) before any validation ran.
+    #[test]
+    fn z_zero_rejected() {
+        let codeword = vec![0u8; 66 * 2];
+        let mut e_out = vec![0u8; 8];
+        assert!(rate_match(&codeword, &mut e_out, 0, 1, BaseGraph::Bg1, 0, 0).is_err());
+
+        let e_llr = vec![1.0f32; 8];
+        let mut cb = vec![0.0f32; 200];
+        assert!(rate_dematch_llr(&e_llr, &mut cb, 0, 1, BaseGraph::Bg1, 0, 0).is_err());
     }
 }

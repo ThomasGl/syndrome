@@ -39,13 +39,21 @@ fn bench_reed_solomon(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("encode_into", shard_len),
             &shard_len,
-            |b, _| b.iter(|| rs.encode_into(black_box(&refs), black_box(&mut parity))),
+            |b, _| {
+                b.iter(|| {
+                    rs.encode_into(black_box(&refs), black_box(&mut parity))
+                        .unwrap()
+                })
+            },
         );
         group.bench_with_input(
             BenchmarkId::new("encode_with_tables_chunked", shard_len),
             &shard_len,
             |b, _| {
-                b.iter(|| rs.encode_with_tables_chunked(black_box(&refs), black_box(&mut parity)))
+                b.iter(|| {
+                    rs.encode_with_tables_chunked(black_box(&refs), black_box(&mut parity))
+                        .unwrap()
+                })
             },
         );
     }

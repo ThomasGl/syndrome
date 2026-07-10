@@ -17,7 +17,7 @@ fn main() {
     // Reed-Solomon stub usage
     let rs = ReedSolomon::new(4, 2);
     let data_shards: Vec<Vec<u8>> = vec![vec![1u8; 16]; 4];
-    let parity = rs.encode(&data_shards);
+    let parity = rs.encode(&data_shards).unwrap();
     println!("Reed-Solomon parity shards: {}", parity.len());
 
     // QC-LDPC layered decoder proof-of-concept.
@@ -39,7 +39,7 @@ fn main() {
     }
 
     // Viterbi stub usage
-    let v = ViterbiDecoder::new(7);
+    let v = ViterbiDecoder::new(7).expect("k=7 is a valid constraint length");
     let decoded = v.decode(&[]);
     println!("Viterbi decoded length: {}", decoded.len());
 }

@@ -146,7 +146,7 @@ fn main() {
         let mut parity = vec![0u8; p * shard_len];
         let info_bits = d * shard_len * 8;
 
-        let ns_enc = time_ns(|| rs.encode_with_avx2(&refs, &mut parity), 20, 300);
+        let ns_enc = time_ns(|| rs.encode_with_avx2(&refs, &mut parity).unwrap(), 20, 300);
         records.push(Record {
             algo: "reed_solomon",
             label: "Reed-Solomon RS(10,4) GF(256)".into(),
@@ -197,7 +197,7 @@ fn main() {
 
     // ── Viterbi K=7 rate-1/2, 2048 info bits ─────────────────────────────
     {
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let info = random_bits(2048, 11);
         let coded = dec.encode(&info);
         let llr: Vec<f32> = coded
@@ -359,10 +359,12 @@ fn main() {
         let ns_enc = time_ns(
             || {
                 for b in 0..blocks {
-                    golay.encode(
-                        &info[b * 12..(b + 1) * 12],
-                        &mut coded[b * 24..(b + 1) * 24],
-                    );
+                    golay
+                        .encode(
+                            &info[b * 12..(b + 1) * 12],
+                            &mut coded[b * 24..(b + 1) * 24],
+                        )
+                        .unwrap();
                 }
             },
             10,

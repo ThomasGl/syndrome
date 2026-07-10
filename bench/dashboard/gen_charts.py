@@ -97,11 +97,23 @@ def chart_rs_throughput():
         key = (rec.get("lang", "?"), rec.get("impl", "?"))
         series.setdefault(key, {})[rec["shard_len"]] = rec["mib_per_s"]
 
+    # One distinct color per series — the three Rust implementations get
+    # distinct warm hues instead of sharing one orange. Full 6-color set
+    # validated (lightness band, chroma, CVD separation, contrast) against
+    # the dark surface with the dataviz palette validator.
     COLORS = {
-        "rust":              RUST_COLORS[0],
-        "cpp":               CPP_COLOR,
-        "python_same_algo":  PY_COLOR,
-        "python_reedsolo":   PY2_COLOR,
+        ("rust", "encode_into"):                "#ea580c",  # orange
+        ("rust", "encode_with_tables_chunked"): "#b45309",  # amber
+        ("rust", "encode_with_avx2"):           "#dc2626",  # red
+        ("cpp", "encode_into"):                 CPP_COLOR,
+        ("python_same_algo", "encode_into"):    PY_COLOR,
+        ("python_reedsolo", "reedsolo.RSCodec.encode"): PY2_COLOR,
+    }
+    LANG_FALLBACK = {
+        "rust": RUST_COLORS[0],
+        "cpp": CPP_COLOR,
+        "python_same_algo": PY_COLOR,
+        "python_reedsolo": PY2_COLOR,
     }
 
     x = np.arange(len(shard_lens))
@@ -112,16 +124,21 @@ def chart_rs_throughput():
     for si, ((lang, impl), bylen) in enumerate(series.items()):
         vals = [bylen.get(sl, 0) for sl in shard_lens]
         offset = (si - n_series / 2 + 0.5) * width
-        color = COLORS.get(lang, DIM)
+        color = COLORS.get((lang, impl), LANG_FALLBACK.get(lang, DIM))
         label = f"{lang} {impl}"[:40]
         ax.bar(x + offset, vals, width * 0.9, label=label, color=color, alpha=0.85)
 
+    # Log y-axis: series span ~2.5 MiB/s (Python) to ~10 GiB/s (AVX2); on a
+    # linear axis the Python bars are invisible-yet-legended, which misleads.
+    ax.set_yscale("log")
     xlabels = [f"{sl//1024} KiB" if sl >= 1024 else f"{sl} B" for sl in shard_lens]
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, color=DIM)
-    style_ax(ax, xlabel="Shard length", ylabel="MiB/s",
+    style_ax(ax, xlabel="Shard length", ylabel="MiB/s (log scale)",
              title="Reed-Solomon Encode Throughput")
-    ax.legend(facecolor=BG, edgecolor=GRIDCOLOR, labelcolor=TEXT, fontsize=8)
+    # Legend below the axes so it never occludes the tallest bars.
+    ax.legend(facecolor=BG, edgecolor=GRIDCOLOR, labelcolor=TEXT, fontsize=8,
+              ncols=3, loc="upper center", bbox_to_anchor=(0.5, -0.12))
     fig.tight_layout()
     out = EXPORTS / "rs_throughput.png"
     fig.savefig(out, dpi=150, facecolor=BG)
@@ -235,12 +252,13 @@ def chart_latency():
         print("  [skip] latency — no data")
         return
 
+    # Same entity → same color as the RS throughput chart (validated set).
     IMPL_STYLE = {
-        ("rust",             "encode_into"):                ("Rust encode_into",                RUST_COLORS[0], "-", "o"),
-        ("rust",             "encode_with_tables_chunked"): ("Rust tables_chunked",              RUST_COLORS[1], "-", "o"),
-        ("rust",             "encode_with_avx2"):           ("Rust encode_with_avx2",            "#fde68a",      "-", "o"),
-        ("cpp",              "encode_into"):                ("C++ encode_into",                  CPP_COLOR,      "--","s"),
-        ("python_same_algo", "encode_into"):                ("Python same_algo",                 PY_COLOR,       ":", "^"),
+        ("rust",             "encode_into"):                ("Rust encode_into",                "#ea580c", "-", "o"),
+        ("rust",             "encode_with_tables_chunked"): ("Rust tables_chunked",             "#b45309", "-", "o"),
+        ("rust",             "encode_with_avx2"):           ("Rust encode_with_avx2",           "#dc2626", "-", "o"),
+        ("cpp",              "encode_into"):                ("C++ encode_into",                 CPP_COLOR, "--","s"),
+        ("python_same_algo", "encode_into"):                ("Python same_algo",                PY_COLOR,  ":", "^"),
     }
 
     by_key = {}

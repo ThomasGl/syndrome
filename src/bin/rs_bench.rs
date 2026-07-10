@@ -35,7 +35,7 @@ fn main() {
         &refs,
         &mut parity,
         |rs, data, parity| {
-            rs.encode_into(data, parity);
+            rs.encode_into(data, parity).unwrap();
         },
     );
     bench(
@@ -44,11 +44,11 @@ fn main() {
         &refs,
         &mut parity,
         |rs, data, parity| {
-            rs.encode_optimized(data, parity);
+            rs.encode_optimized(data, parity).unwrap();
         },
     );
     bench("encode_soa", &rs, &refs, &mut parity, |rs, data, parity| {
-        rs.encode_soa(data, parity);
+        rs.encode_soa(data, parity).unwrap();
     });
     // precompute mul tables and benchmark table-based encoder and SIMD encoder
     let mut rs2 = ReedSolomon::new(10, 4);
@@ -59,7 +59,7 @@ fn main() {
         &refs,
         &mut parity,
         |rs, data, parity| {
-            rs.encode_with_tables(data, parity);
+            rs.encode_with_tables(data, parity).unwrap();
         },
     );
     bench(
@@ -68,7 +68,7 @@ fn main() {
         &refs,
         &mut parity,
         |rs, data, parity| {
-            rs.encode_simd(data, parity);
+            rs.encode_simd(data, parity).unwrap();
         },
     );
     bench(
@@ -77,7 +77,7 @@ fn main() {
         &refs,
         &mut parity,
         |rs, data, parity| {
-            rs.encode_with_tables_chunked(data, parity);
+            rs.encode_with_tables_chunked(data, parity).unwrap();
         },
     );
 }

@@ -85,7 +85,7 @@
 //! let golay = GolayCode::new();
 //! let info: [u8; 12] = [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0];
 //! let mut codeword = [0u8; 24];
-//! golay.encode(&info, &mut codeword);
+//! golay.encode(&info, &mut codeword).unwrap();
 //!
 //! // Introduce 3 bit errors (the maximum guaranteed-correctable count).
 //! codeword[0] ^= 1;
@@ -322,7 +322,7 @@ impl GolayCode {
     /// let golay = GolayCode::new();
     /// let info = [0u8; 12];
     /// let mut codeword = [0u8; 24];
-    /// golay.encode(&info, &mut codeword);
+    /// golay.encode(&info, &mut codeword).unwrap();
     /// assert_eq!(codeword, [0u8; 24]);
     /// ```
     pub fn new() -> Self {
@@ -389,9 +389,10 @@ impl GolayCode {
     /// * `out` - Exactly [`GOLAY_N`] (24) bytes; overwritten with the
     ///   systematic codeword (`out[0..12] == info`, `out[12..24]` is parity).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `info.len() != 12` or `out.len() != 24`.
+    /// Returns [`FecError::BufferTooSmall`] if `info.len() != `[`GOLAY_K`]
+    /// or `out.len() != `[`GOLAY_N`].
     ///
     /// # Examples
     ///
@@ -400,15 +401,26 @@ impl GolayCode {
     /// let golay = GolayCode::new();
     /// let info = [1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0];
     /// let mut codeword = [0u8; 24];
-    /// golay.encode(&info, &mut codeword);
+    /// golay.encode(&info, &mut codeword).unwrap();
     /// assert_eq!(&codeword[0..12], &info[..]);
     /// ```
-    pub fn encode(&self, info: &[u8], out: &mut [u8]) {
-        assert_eq!(info.len(), GOLAY_K, "info must be exactly 12 bits");
-        assert_eq!(out.len(), GOLAY_N, "out must be exactly 24 bits");
+    pub fn encode(&self, info: &[u8], out: &mut [u8]) -> Result<(), FecError> {
+        if info.len() != GOLAY_K {
+            return Err(FecError::BufferTooSmall {
+                required: GOLAY_K,
+                provided: info.len(),
+            });
+        }
+        if out.len() != GOLAY_N {
+            return Err(FecError::BufferTooSmall {
+                required: GOLAY_N,
+                provided: out.len(),
+            });
+        }
         let msg = bits_to_u32(info, GOLAY_K);
         let cw = self.encode_table[msg as usize];
         u32_to_bits(cw, GOLAY_N, out);
+        Ok(())
     }
 
     /// Decode a (possibly corrupted) 24-bit word, correcting up to 3
@@ -440,7 +452,7 @@ impl GolayCode {
     /// let golay = GolayCode::new();
     /// let info = [0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0];
     /// let mut codeword = [0u8; 24];
-    /// golay.encode(&info, &mut codeword);
+    /// golay.encode(&info, &mut codeword).unwrap();
     /// codeword[3] ^= 1; // single-bit error
     ///
     /// let mut decoded = [0u8; 12];
@@ -597,7 +609,7 @@ mod tests {
             let msg = rng.next() & 0x0FFF;
             let info = message_bits(msg);
             let mut codeword = [0u8; 24];
-            golay.encode(&info, &mut codeword);
+            golay.encode(&info, &mut codeword).unwrap();
             let cw_bits = bits_to_u32(&codeword, 24);
 
             // Weight 1.
@@ -640,7 +652,7 @@ mod tests {
 
         let info = [1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
         let mut codeword = [0u8; 24];
-        golay.encode(&info, &mut codeword);
+        golay.encode(&info, &mut codeword).unwrap();
         let cw_bits = bits_to_u32(&codeword, 24);
 
         let mut tested = 0;
@@ -677,7 +689,7 @@ mod tests {
         for msg in [0u32, 1, 0xABC, 0xFFF, 0x555, 0xAAA] {
             let info = message_bits(msg);
             let mut codeword = [0u8; 24];
-            golay.encode(&info, &mut codeword);
+            golay.encode(&info, &mut codeword).unwrap();
             let mut decoded = [0u8; 12];
             assert_eq!(golay.decode(&codeword, &mut decoded), Ok(0));
             assert_eq!(decoded, info);
@@ -689,10 +701,23 @@ mod tests {
         let golay = GolayCode::new();
         let info_short = [0u8; 11];
         let mut out = [0u8; 24];
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            golay.encode(&info_short, &mut out);
-        }));
-        assert!(result.is_err());
+        assert_eq!(
+            golay.encode(&info_short, &mut out),
+            Err(FecError::BufferTooSmall {
+                required: GOLAY_K,
+                provided: 11
+            })
+        );
+
+        let info = [0u8; 12];
+        let mut out_short = [0u8; 23];
+        assert_eq!(
+            golay.encode(&info, &mut out_short),
+            Err(FecError::BufferTooSmall {
+                required: GOLAY_N,
+                provided: 23
+            })
+        );
     }
 
     #[test]

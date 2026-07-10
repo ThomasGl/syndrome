@@ -222,4 +222,15 @@ mod tests {
         let mut dst = vec![0.0f32; 1];
         assert!(buf.copy_llr_into(&mut dst).is_err());
     }
+
+    /// FINDING 3/5 regression guard: `HarqBuffer::new(bg, 0)` followed by
+    /// `combine` used to divide-by-zero inside `rate_dematch_llr` (`z == 0`
+    /// makes `ncb == 0`). `rate_dematch_llr` now validates `z > 0` up front,
+    /// and `combine` propagates that `Err` rather than panicking.
+    #[test]
+    fn combine_with_zero_lifting_size_returns_err_not_panic() {
+        let mut buf = HarqBuffer::new(BaseGraph::Bg1, 0);
+        let e = vec![1.0f32; 8];
+        assert!(buf.combine(&e, 0, 1, 0).is_err());
+    }
 }

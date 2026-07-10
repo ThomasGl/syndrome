@@ -8,6 +8,8 @@
 
 use std::cmp;
 
+use crate::error::FecError;
+
 #[repr(align(64))]
 struct AlignedExp([u8; 512]);
 
@@ -96,6 +98,41 @@ pub struct ReedSolomon {
 }
 
 impl ReedSolomon {
+    /// Validate the `data`/`parity_out` shapes shared by every `encode_*`
+    /// variant, and return the common shard length on success.
+    ///
+    /// This is an entry-level precondition check only — it runs once per
+    /// `encode_*` call, never inside the per-byte inner loops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if the codec was constructed with
+    /// zero data shards, if `data.len()` does not equal
+    /// [`ReedSolomon::data_shards`], or if the shards have inconsistent
+    /// lengths. Returns [`FecError::BufferTooSmall`] if `parity_out` cannot
+    /// hold `parity_shards * shard_len` bytes.
+    #[inline]
+    fn validate_encode_inputs(&self, data: &[&[u8]], parity_out: &[u8]) -> Result<usize, FecError> {
+        if self.data_shards == 0 {
+            return Err(FecError::InvalidParam("data_shards must be > 0"));
+        }
+        if data.len() != self.data_shards {
+            return Err(FecError::InvalidParam("data length must equal data_shards"));
+        }
+        let shard_len = data.first().map_or(0, |s| s.len());
+        if data.iter().any(|s| s.len() != shard_len) {
+            return Err(FecError::InvalidParam("shard size mismatch"));
+        }
+        let required = self.parity_shards * shard_len;
+        if parity_out.len() < required {
+            return Err(FecError::BufferTooSmall {
+                required,
+                provided: parity_out.len(),
+            });
+        }
+        Ok(shard_len)
+    }
+
     /// Precompute multiplication lookup tables for all 256 possible coefficients.
     /// This trades memory for faster inner loops by replacing GF multiplications
     /// with a single table lookup per byte.
@@ -119,16 +156,26 @@ impl ReedSolomon {
     }
 
     /// Encode using precomputed multiplication tables for coefficients.
-    pub fn encode_with_tables(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if [`ReedSolomon::precompute_mul_tables`]
+    /// has not been called yet, or if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_with_tables(
+        &self,
+        data: &[&[u8]],
+        parity_out: &mut [u8],
+    ) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
-        assert!(self.mul_tables.is_some(), "mul tables not precomputed");
-        let tables = self.mul_tables.as_ref().unwrap();
-        let shard_len = data[0].len();
-        for s in data.iter().skip(1) {
-            assert!(s.len() == shard_len, "shard size mismatch");
-        }
-        assert!(parity_out.len() >= p * shard_len, "parity_out too small");
+        let Some(tables) = self.mul_tables.as_ref() else {
+            return Err(FecError::InvalidParam(
+                "mul tables not precomputed — call precompute_mul_tables() first",
+            ));
+        };
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
         for b in parity_out.iter_mut().take(p * shard_len) {
             *b = 0;
         }
@@ -147,22 +194,33 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
 
     /// Encode using precomputed multiplication tables but assemble 8-byte
     /// words from table lookups and XOR them as `u64` to reduce per-byte
     /// overhead. This combines table lookups (fast mul) with chunked
     /// word-wise XOR to approach the speed of pure XOR paths.
-    pub fn encode_with_tables_chunked(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if [`ReedSolomon::precompute_mul_tables`]
+    /// has not been called yet, or if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_with_tables_chunked(
+        &self,
+        data: &[&[u8]],
+        parity_out: &mut [u8],
+    ) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
-        assert!(self.mul_tables.is_some(), "mul tables not precomputed");
-        let tables = self.mul_tables.as_ref().unwrap();
-        let shard_len = data[0].len();
-        for s in data.iter().skip(1) {
-            assert!(s.len() == shard_len, "shard size mismatch");
-        }
-        assert!(parity_out.len() >= p * shard_len, "parity_out too small");
+        let Some(tables) = self.mul_tables.as_ref() else {
+            return Err(FecError::InvalidParam(
+                "mul tables not precomputed — call precompute_mul_tables() first",
+            ));
+        };
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
         for b in parity_out.iter_mut().take(p * shard_len) {
             *b = 0;
         }
@@ -194,16 +252,23 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
 
     /// Encode using SIMD for XOR-case (coef==1) to accelerate pure XOR
     /// accumulation. Other coefficients currently fall back to scalar mul.
-    pub fn encode_simd(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_simd(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         // Use stable word-sized XOR (u64) for the pure-XOR coefficient case
         // to accelerate accumulation without relying on unstable `std::simd`.
         let d = self.data_shards;
         let p = self.parity_shards;
-        let shard_len = data[0].len();
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
         for b in parity_out.iter_mut().take(p * shard_len) {
             *b = 0;
         }
@@ -236,35 +301,44 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
     /// Encode using AVX2 VPSHUFB for all non-zero coefficients.
     ///
     /// For each coefficient, decomposes the 256-byte GF multiply table into two
     /// 16-byte nibble tables and applies them 32 bytes at a time via VPSHUFB.
-    /// Falls back to [`ReedSolomon::encode_with_tables_chunked`] if AVX2 is not available or
-    /// `precompute_mul_tables` was not called.
-    ///
-    /// Requires `precompute_mul_tables()` to have been called first.
+    /// Falls back to [`ReedSolomon::encode_with_tables_chunked`] (or, if
+    /// `precompute_mul_tables` was never called, a plain scalar encode) when
+    /// AVX2 is not available at runtime.
     ///
     /// # Returns
     ///
     /// Throughput is typically 3–4× higher than the scalar chunked path on
     /// x86_64 with AVX2 (VPSHUFB: 32 bytes / cycle vs. 8 bytes / cycle).
-    pub fn encode_with_avx2(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small. Unlike [`ReedSolomon::encode_with_tables`], a missing
+    /// `precompute_mul_tables()` call is not an error here — this method
+    /// falls back to a scalar encode instead.
+    pub fn encode_with_avx2(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && self.mul_tables.is_some() {
-                return self.encode_with_avx2_inner(data, parity_out);
+                self.encode_with_avx2_inner(data, parity_out);
+                return Ok(());
             }
         }
         // Fallback: no AVX2 or tables not yet precomputed.
         if self.mul_tables.is_some() {
-            self.encode_with_tables_chunked(data, parity_out);
+            self.encode_with_tables_chunked(data, parity_out)
         } else {
             // Defensive: tables not ready; use scalar path via encode_into.
             let d = self.data_shards;
             let p = self.parity_shards;
-            let shard_len = data[0].len();
             for b in parity_out.iter_mut().take(p * shard_len) {
                 *b = 0;
             }
@@ -280,6 +354,7 @@ impl ReedSolomon {
                     }
                 }
             }
+            Ok(())
         }
     }
 
@@ -347,15 +422,16 @@ impl ReedSolomon {
     /// a slice of references to data shards (each with equal length). `parity_out`
     /// must be at least `parity_shards * shard_len` bytes. Parity rows are
     /// stored consecutively: row0[..], row1[..], ...
-    pub fn encode_into(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_into(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
-        assert!(data.len() == d, "data length mismatch");
-        let shard_len = data[0].len();
-        for s in data.iter().skip(1) {
-            assert!(s.len() == shard_len, "shard size mismatch");
-        }
-        assert!(parity_out.len() >= p * shard_len, "parity_out too small");
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
 
         // zero parity buffer
         for b in parity_out.iter_mut().take(p * shard_len) {
@@ -386,15 +462,22 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
 
     /// Alternative optimized encoder that processes in chunks for slightly
     /// better inner-loop locality. This is a drop-in replacement for
     /// microbenchmarking and may be extended with SIMD later.
-    pub fn encode_optimized(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_optimized(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
-        let shard_len = data[0].len();
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
         let chunk = 16usize;
         for i in 0..(p * shard_len) {
             parity_out[i] = 0;
@@ -424,15 +507,21 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
 
     /// Encode using a Struct-of-Arrays (SoA) temporary to improve cache
     /// locality for the per-byte accumulation across data shards.
-    pub fn encode_soa(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` / shard lengths are
+    /// inconsistent. Returns [`FecError::BufferTooSmall`] if `parity_out` is
+    /// too small.
+    pub fn encode_soa(&self, data: &[&[u8]], parity_out: &mut [u8]) -> Result<(), FecError> {
         let d = self.data_shards;
         let p = self.parity_shards;
-        let shard_len = data[0].len();
-        assert!(parity_out.len() >= p * shard_len, "parity_out too small");
+        let shard_len = self.validate_encode_inputs(data, parity_out)?;
 
         // Transpose data into SoA: transposed[k * d + j] = data[j][k]
         let mut transposed = vec![0u8; shard_len * d];
@@ -467,22 +556,28 @@ impl ReedSolomon {
                 }
             }
         }
+        Ok(())
     }
 
     /// Backwards-compatible encode: takes `Vec<Vec<u8>>` and returns parity as
     /// `Vec<Vec<u8>>`. Internally uses `encode_into` to avoid repeated allocation
     /// overhead when possible.
-    pub fn encode(&self, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `data.len()` does not equal
+    /// `data_shards` or shard lengths are inconsistent.
+    pub fn encode(&self, data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, FecError> {
         let shard_len = data.first().map(|v| v.len()).unwrap_or(0);
         let mut flat: Vec<u8> = vec![0u8; self.parity_shards * shard_len];
         let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-        self.encode_into(&refs, &mut flat);
+        self.encode_into(&refs, &mut flat)?;
         let mut out = Vec::with_capacity(self.parity_shards);
         for i in 0..self.parity_shards {
             let start = i * shard_len;
             out.push(flat[start..start + shard_len].to_vec());
         }
-        out
+        Ok(out)
     }
 
     /// Erasure-only decoder: attempts to reconstruct missing data shards in
@@ -509,15 +604,18 @@ impl ReedSolomon {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `shards.len()` does not match `data_shards +
-    /// parity_shards`, if shard lengths are inconsistent, if too many data
-    /// shards are missing to recover, if not enough parity shards are
-    /// present, or if the erasure/parity selection yields a singular
-    /// recovery matrix.
-    pub fn decode(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), &'static str> {
+    /// Returns [`FecError::BufferTooSmall`] if `shards.len()` does not match
+    /// `data_shards + parity_shards`. Returns [`FecError::InvalidParam`] if
+    /// shard lengths are inconsistent, if too many data shards are missing
+    /// to recover, if not enough parity shards are present, or if the
+    /// erasure/parity selection yields a singular recovery matrix.
+    pub fn decode(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), FecError> {
         let total = self.data_shards + self.parity_shards;
         if shards.len() != total {
-            return Err("shards length mismatch");
+            return Err(FecError::BufferTooSmall {
+                required: total,
+                provided: shards.len(),
+            });
         }
 
         // determine shard length
@@ -527,7 +625,7 @@ impl ReedSolomon {
             .unwrap_or(0);
         for s in shards.iter().filter_map(|s| s.as_ref()) {
             if s.len() != shard_len {
-                return Err("shard size mismatch");
+                return Err(FecError::InvalidParam("shard size mismatch"));
             }
         }
 
@@ -543,7 +641,7 @@ impl ReedSolomon {
         }
         let m = missing_data.len();
         if m > self.parity_shards {
-            return Err("too many data erasures to recover");
+            return Err(FecError::InvalidParam("too many data erasures to recover"));
         }
 
         // collect available parity rows indices
@@ -554,7 +652,7 @@ impl ReedSolomon {
             }
         }
         if available_parity_idx.len() < m {
-            return Err("not enough parity shards present");
+            return Err(FecError::InvalidParam("not enough parity shards present"));
         }
 
         // select first m available parity rows
@@ -571,7 +669,8 @@ impl ReedSolomon {
         // invert A. This is the only O(p^3) step and operates on a tiny m x m
         // matrix (m <= parity_shards), so it is negligible next to the
         // O(p^2 * shard_len) reconstruction multiply below.
-        let inv_a = invert_matrix_gf(&a, m, &self.tables).ok_or("matrix not invertible")?;
+        let inv_a = invert_matrix_gf(&a, m, &self.tables)
+            .ok_or(FecError::InvalidParam("matrix not invertible"))?;
 
         // Bulk reconstruction, restructured as flat SoA buffers (m rows x
         // shard_len) so the per-byte work happens inside `gf_muladd_bulk`
@@ -700,10 +799,13 @@ impl ReedSolomon {
     /// including error cases — are identical to `decode`; only the inner
     /// multiply strategy differs.
     #[cfg(test)]
-    fn decode_scalar_reference(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), &'static str> {
+    fn decode_scalar_reference(&self, shards: &mut [Option<Vec<u8>>]) -> Result<(), FecError> {
         let total = self.data_shards + self.parity_shards;
         if shards.len() != total {
-            return Err("shards length mismatch");
+            return Err(FecError::BufferTooSmall {
+                required: total,
+                provided: shards.len(),
+            });
         }
 
         let shard_len = shards
@@ -712,7 +814,7 @@ impl ReedSolomon {
             .unwrap_or(0);
         for s in shards.iter().filter_map(|s| s.as_ref()) {
             if s.len() != shard_len {
-                return Err("shard size mismatch");
+                return Err(FecError::InvalidParam("shard size mismatch"));
             }
         }
 
@@ -727,7 +829,7 @@ impl ReedSolomon {
         }
         let m = missing_data.len();
         if m > self.parity_shards {
-            return Err("too many data erasures to recover");
+            return Err(FecError::InvalidParam("too many data erasures to recover"));
         }
 
         let mut available_parity_idx = Vec::new();
@@ -737,7 +839,7 @@ impl ReedSolomon {
             }
         }
         if available_parity_idx.len() < m {
-            return Err("not enough parity shards present");
+            return Err(FecError::InvalidParam("not enough parity shards present"));
         }
 
         let parity_rows_sel = &available_parity_idx[0..m];
@@ -749,7 +851,8 @@ impl ReedSolomon {
             }
         }
 
-        let inv_a = invert_matrix_gf(&a, m, &self.tables).ok_or("matrix not invertible")?;
+        let inv_a = invert_matrix_gf(&a, m, &self.tables)
+            .ok_or(FecError::InvalidParam("matrix not invertible"))?;
 
         let mut outputs: Vec<Vec<u8>> = vec![vec![0u8; shard_len]; m];
 
@@ -878,7 +981,7 @@ mod tests {
     fn basic_encode_decode_erasure() {
         let rs = ReedSolomon::new(4, 2);
         let data: Vec<Vec<u8>> = vec![vec![1u8; 16], vec![2u8; 16], vec![3u8; 16], vec![4u8; 16]];
-        let parity = rs.encode(&data);
+        let parity = rs.encode(&data).unwrap();
         // form shards
         let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
         for d in &data {
@@ -904,7 +1007,7 @@ mod tests {
             // Use small RS
             let rs = ReedSolomon::new(2,1);
             let data = vec![d0.clone(), d1.clone()];
-            let parity = rs.encode(&data);
+            let parity = rs.encode(&data).unwrap();
             let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
             for d in &data { shards.push(Some(d.clone())); }
             for p in &parity { shards.push(Some(p.clone())); }
@@ -964,7 +1067,7 @@ mod tests {
                         xorshift_bytes(shard_len, seed)
                     })
                     .collect();
-                let parity = rs.encode(&data);
+                let parity = rs.encode(&data).unwrap();
 
                 // Try every erasure count from 1..=p, and a couple of index
                 // patterns per count (front-loaded and scattered).
@@ -1036,14 +1139,23 @@ mod tests {
     fn decode_error_cases_match_reference() {
         let rs = ReedSolomon::new(4, 2);
         let data: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 1) as u8; 32]).collect();
-        let parity = rs.encode(&data);
+        let parity = rs.encode(&data).unwrap();
 
         // Wrong total length.
         let mut too_short: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).take(3).collect();
-        assert_eq!(rs.decode(&mut too_short), Err("shards length mismatch"));
+        assert_eq!(
+            rs.decode(&mut too_short),
+            Err(FecError::BufferTooSmall {
+                required: 6,
+                provided: 3
+            })
+        );
         assert_eq!(
             rs.decode_scalar_reference(&mut too_short),
-            Err("shards length mismatch")
+            Err(FecError::BufferTooSmall {
+                required: 6,
+                provided: 3
+            })
         );
 
         // Too many data erasures (3 missing, only 2 parity shards).
@@ -1064,11 +1176,11 @@ mod tests {
         let mut too_many_ref = build();
         assert_eq!(
             rs.decode(&mut too_many_new),
-            Err("too many data erasures to recover")
+            Err(FecError::InvalidParam("too many data erasures to recover"))
         );
         assert_eq!(
             rs.decode_scalar_reference(&mut too_many_ref),
-            Err("too many data erasures to recover")
+            Err(FecError::InvalidParam("too many data erasures to recover"))
         );
 
         // Not enough parity shards present (2 data missing, only 1 parity present).
@@ -1089,11 +1201,11 @@ mod tests {
         let mut np_ref = build2();
         assert_eq!(
             rs.decode(&mut np_new),
-            Err("not enough parity shards present")
+            Err(FecError::InvalidParam("not enough parity shards present"))
         );
         assert_eq!(
             rs.decode_scalar_reference(&mut np_ref),
-            Err("not enough parity shards present")
+            Err(FecError::InvalidParam("not enough parity shards present"))
         );
     }
 }

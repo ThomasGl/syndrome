@@ -31,12 +31,29 @@
 //! ```
 //! use glezer_rsv::viterbi::ViterbiDecoder;
 //!
-//! let dec = ViterbiDecoder::new(7);
+//! let dec = ViterbiDecoder::new(7).unwrap();
 //! let info: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1];
 //! let coded = dec.encode(&info);
 //! let decoded = dec.decode_hard(&coded);
 //! assert_eq!(decoded, info);
 //! ```
+
+use crate::error::FecError;
+
+/// Largest constraint length accepted by [`ViterbiDecoder::new`]/
+/// [`ViterbiDecoder::with_generators`].
+///
+/// The trellis has $2^{K-1}$ states, so construction cost and per-step ACS
+/// work both grow exponentially in $K$. `K = 16` already means $2^{15} =
+/// 32768$ states — far beyond any practical Viterbi decoder (real-world
+/// codes stop at $K=9$; $K=7$ is the 3GPP/NASA standard) — so it is used
+/// as a hard ceiling: values above it are almost certainly a corrupted
+/// parameter, not a legitimate request, and left unchecked they are either
+/// an outright panic (`k >= 64`, left-shift-by->=bit-width in
+/// `default_generators`'s fallback arm) or an uncontrolled
+/// resource-exhaustion vector (`10 <= k < 64`, exponential trellis
+/// allocation).
+pub const MAX_CONSTRAINT_LENGTH: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Trellis transition table (built once at construction)
@@ -423,37 +440,61 @@ impl ViterbiDecoder {
     ///
     /// # Arguments
     ///
-    /// * `k` - Constraint length (≥ 1).  K=7 uses generators 0o133/0o171.
+    /// * `k` - Constraint length (`1..=`[`MAX_CONSTRAINT_LENGTH`]).  K=7 uses
+    ///   generators 0o133/0o171.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `k == 0` or
+    /// `k > MAX_CONSTRAINT_LENGTH`.
     ///
     /// # Examples
     ///
     /// ```
     /// use glezer_rsv::viterbi::ViterbiDecoder;
-    /// let dec = ViterbiDecoder::new(7);
+    /// let dec = ViterbiDecoder::new(7).unwrap();
     /// assert_eq!(dec.constraint_length, 7);
+    /// assert!(ViterbiDecoder::new(0).is_err());
+    /// assert!(ViterbiDecoder::new(65).is_err());
     /// ```
-    pub fn new(k: usize) -> Self {
-        let k = k.max(1);
+    pub fn new(k: usize) -> Result<Self, FecError> {
+        Self::check_k(k)?;
         let (g0, g1) = default_generators(k);
-        Self {
+        Ok(Self {
             constraint_length: k,
             trellis: TrellisTable::build(k, g0, g1),
-        }
+        })
     }
 
     /// Create a decoder with explicit generator polynomials.
     ///
     /// # Arguments
     ///
-    /// * `k`  - Constraint length (≥ 1).
+    /// * `k`  - Constraint length (`1..=`[`MAX_CONSTRAINT_LENGTH`]).
     /// * `g0` - First generator polynomial (K-bit integer, MSB = current input).
     /// * `g1` - Second generator polynomial.
-    pub fn with_generators(k: usize, g0: u32, g1: u32) -> Self {
-        let k = k.max(1);
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `k == 0` or
+    /// `k > MAX_CONSTRAINT_LENGTH`.
+    pub fn with_generators(k: usize, g0: u32, g1: u32) -> Result<Self, FecError> {
+        Self::check_k(k)?;
+        Ok(Self {
             constraint_length: k,
             trellis: TrellisTable::build(k, g0, g1),
+        })
+    }
+
+    /// Validate `k` is within `1..=MAX_CONSTRAINT_LENGTH`, shared by
+    /// [`ViterbiDecoder::new`] and [`ViterbiDecoder::with_generators`].
+    fn check_k(k: usize) -> Result<(), FecError> {
+        if k == 0 || k > MAX_CONSTRAINT_LENGTH {
+            return Err(FecError::InvalidParam(
+                "Viterbi constraint length must be in 1..=16",
+            ));
         }
+        Ok(())
     }
 
     /// Encode `info` bits as a zero-terminated rate-1/2 convolutional stream.
@@ -469,7 +510,7 @@ impl ViterbiDecoder {
     ///
     /// ```
     /// use glezer_rsv::viterbi::ViterbiDecoder;
-    /// let dec = ViterbiDecoder::new(7);
+    /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let coded = dec.encode(&[1, 0, 1]);
     /// assert_eq!(coded.len(), 2 * (3 + 6));  // 3 info + 6 tail
     /// ```
@@ -507,7 +548,7 @@ impl ViterbiDecoder {
     ///
     /// ```
     /// use glezer_rsv::viterbi::ViterbiDecoder;
-    /// let dec = ViterbiDecoder::new(7);
+    /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let info = vec![1u8, 1, 0, 1, 0, 0, 1, 1];
     /// let coded = dec.encode(&info);
     /// assert_eq!(dec.decode_hard(&coded), info);
@@ -637,7 +678,7 @@ impl ViterbiDecoder {
     ///
     /// ```
     /// use glezer_rsv::viterbi::ViterbiDecoder;
-    /// let dec = ViterbiDecoder::new(7);
+    /// let dec = ViterbiDecoder::new(7).unwrap();
     /// let info = vec![0u8; 8];
     /// let coded = dec.encode(&info);
     /// // Convert to soft LLR (error-free channel: 0→+10.0, 1→-10.0)
@@ -814,14 +855,14 @@ mod tests {
 
     #[test]
     fn create_decoder() {
-        let d = ViterbiDecoder::new(7);
+        let d = ViterbiDecoder::new(7).unwrap();
         assert_eq!(d.constraint_length, 7);
     }
 
     proptest! {
         #[test]
         fn decode_empty_returns_empty(k in 1usize..10usize) {
-            let d = ViterbiDecoder::new(k);
+            let d = ViterbiDecoder::new(k).unwrap();
             let out = d.decode(&[]);
             prop_assert!(out.is_empty());
         }
@@ -829,7 +870,7 @@ mod tests {
 
     #[test]
     fn encode_decode_hard_roundtrip_k7() {
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let info: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1];
         let coded = dec.encode(&info);
         // Encoded length = 2 * (n_info + K - 1)
@@ -840,7 +881,7 @@ mod tests {
 
     #[test]
     fn encode_decode_soft_roundtrip_k7() {
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let info: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1];
         let coded = dec.encode(&info);
         // Error-free soft channel: 0-bit → +8.0 LLR, 1-bit → -8.0 LLR.
@@ -855,7 +896,7 @@ mod tests {
     #[test]
     fn single_bit_error_corrected_k7() {
         // Introduce a single coded-bit error; K=7 code can correct it.
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let info: Vec<u8> = vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 0];
         let mut coded = dec.encode(&info);
         coded[4] ^= 1; // flip one bit
@@ -869,7 +910,7 @@ mod tests {
     #[test]
     fn all_zeros_encodes_to_all_zeros() {
         // All-zero input → all-zero codeword for any linear code.
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let coded = dec.encode(&[0u8; 8]);
         assert!(coded.iter().all(|&b| b == 0));
     }
@@ -877,8 +918,8 @@ mod tests {
     #[test]
     fn with_generators_k7_standard() {
         // Explicit generators must produce same result as default K=7.
-        let dec1 = ViterbiDecoder::new(7);
-        let dec2 = ViterbiDecoder::with_generators(7, 0o133, 0o171);
+        let dec1 = ViterbiDecoder::new(7).unwrap();
+        let dec2 = ViterbiDecoder::with_generators(7, 0o133, 0o171).unwrap();
         let info: Vec<u8> = vec![1, 0, 0, 1, 1, 0, 1];
         assert_eq!(dec1.encode(&info), dec2.encode(&info));
         let coded = dec1.encode(&info);
@@ -890,7 +931,7 @@ mod tests {
         fn encode_decode_roundtrip_arbitrary_bits(
             bits in prop::collection::vec(0u8..=1u8, 1..=32)
         ) {
-            let dec = ViterbiDecoder::new(7);
+            let dec = ViterbiDecoder::new(7).unwrap();
             let coded = dec.encode(&bits);
             let decoded = dec.decode_hard(&coded);
             prop_assert_eq!(decoded, bits);
@@ -924,7 +965,7 @@ mod tests {
             eprintln!("skipping: host has no AVX2");
             return;
         }
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let mut seed = 0xC0FF_EE00_1234_5678u64;
         for trial in 0..50 {
             let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
@@ -959,7 +1000,7 @@ mod tests {
             eprintln!("skipping: host has no AVX2");
             return;
         }
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let mut seed = 0x1357_9BDF_2468_ACE0u64;
         for trial in 0..50 {
             let len = 100 + (splitmix64(&mut seed) as usize % 1901); // 100..=2000
@@ -987,7 +1028,7 @@ mod tests {
         // Round-trip correctness at moderate noise (not just error-free or
         // single-bit-flip): a fixed, reproducible noisy LLR channel that
         // stays well within the K=7 code's correction capability.
-        let dec = ViterbiDecoder::new(7);
+        let dec = ViterbiDecoder::new(7).unwrap();
         let mut seed = 0xFEED_FACE_C0DE_BEEFu64;
         let info: Vec<u8> = (0..500)
             .map(|_| (splitmix64(&mut seed) & 1) as u8)
