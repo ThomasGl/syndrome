@@ -39,6 +39,24 @@
 //! produce a genuine `[24,12,8]` self-dual code (weight enumerator
 //! $1 + 759x^8 + 2576x^{12} + 759x^{16} + x^{24}$).
 //!
+//! Schematically, $B$'s "bordered circulant" shape is an $11\times11$
+//! QR-difference core (built by the private `quadratic_residues_mod_11`) framed by an
+//! all-ones border row/column (except the corner), matching the case split
+//! in `build_b_rows` line for line:
+//!
+//! ```text
+//!          0   1   2  ...  10   ∞
+//!        +---------------------+---+
+//!    0   |                     | 1 |
+//!    1   |   11x11 core:       | 1 |
+//!    .   |   B[i][j] = 1 iff   | . |   (border column: all 1s)
+//!    .   |   i==j, or          | . |
+//!   10   |   (i-j) mod 11 ∈ QR | 1 |
+//!        +---------------------+---+
+//!    ∞   |  1   1   1  ...  1  | 0 |   (border row: all 1s except corner)
+//!        +---------------------+---+
+//! ```
+//!
 //! Note on symmetry: since $-1$ is a quadratic *non*-residue mod $11$
 //! ($11 \equiv 3 \pmod 4$), the off-diagonal QR-difference structure is
 //! provably a tournament (for every $i \ne j$ exactly one of $B_{ij}$,

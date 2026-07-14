@@ -15,11 +15,20 @@ CI runs exactly these; run them locally to get a green review:
 
 ```bash
 cargo build --release            # builds the library + binaries
-cargo test --all                 # 81 unit + 7 integration + 4 media tests
-cargo test --doc                 # 43 doctests
+cargo test --all                 # unit + integration + media + reference-vector + robustness tests
+cargo test --doc                 # doctests (one per documented public API example)
 cargo clippy --all-targets -- -D warnings   # zero-warning lint gate
 cargo fmt --all -- --check       # formatting gate
 ```
+
+The exact test counts change as the library grows, so they aren't hardcoded
+here (a stale number in this file is worse than no number). The one place
+that's kept current at every commit is the `Tests` badge at the top of
+`README.md` — after running `cargo test --all` locally, the total in your
+terminal output should match that badge. `README.md` §4 ("Test Suite") also
+breaks the total down by category (unit / integration / media / reference
+vectors / robustness / doctests) if you want to see where a new test should
+live.
 
 ## Lint policy
 

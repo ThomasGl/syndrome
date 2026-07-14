@@ -74,6 +74,50 @@
 //! reused across calls to [`TurboDecoder::decode`]; the per-iteration loop
 //! performs no heap allocation. Each half-iteration is
 //! $O(K \cdot 8)$, so `decode` runs in $O(K \cdot 8 \cdot \text{iters})$ time.
+//!
+//! # Iterative exchange between the two decoders
+//!
+//! The hardest part of "turbo" decoding to get from code alone: each
+//! constituent decoder only ever sees one encoder's own parity bits, so
+//! neither can converge alone. What makes them converge *together* is that
+//! each one's output splits into two parts — a total a posteriori LLR, and
+//! the *extrinsic* part of it (the total minus what the channel and the
+//! other decoder already contributed) — and only the extrinsic part is
+//! fed to the other decoder as its next a priori input, through the same
+//! interleaver $\Pi$ the encoder used:
+//!
+//! ```text
+//!   channel LLRs (sys, par1, par2)
+//!            │
+//!            ▼
+//!   ┌─────────────────────┐   a priori1 (= extrinsic2, deinterleaved Π⁻¹)
+//!   │   SISO decoder 1     │◀───────────────────────────────────────┐
+//!   │  (natural order)     │                                        │
+//!   └──────────┬───────────┘                                        │
+//!              │ extrinsic1 = scale·(total1 − channel_sys − a priori1)
+//!              ▼                                                    │
+//!         [ interleave Π ]                                          │
+//!              │ a priori2                                          │
+//!              ▼                                                    │
+//!   ┌─────────────────────┐                                        │
+//!   │   SISO decoder 2     │                                        │
+//!   │ (interleaved order)  │                                        │
+//!   └──────────┬───────────┘                                        │
+//!              │ extrinsic2 = scale·(total2 − channel_sys_il − a priori2)
+//!              ▼                                                    │
+//!         [ deinterleave Π⁻¹ ] ──────────────────────────────────────┘
+//!
+//!   repeat for up to `max_iters` full iterations, or stop early as soon
+//!   as decoder 1 and decoder 2 agree on every hard-decision bit; final
+//!   output = decoder 1's hard decisions.
+//! ```
+//!
+//! Only the *extrinsic* increment crosses the interleaver, never the raw
+//! channel LLR or the other decoder's own prior a priori input — feeding
+//! that back would double-count the same evidence and stop the exchange
+//! from adding new information each round. See
+//! `TurboDecoder::decode_with_backend`'s implementation for exactly where
+//! `extrinsic1`/`extrinsic2_nat` are computed and crossed through `self.pi`.
 
 use crate::error::FecError;
 

@@ -19,6 +19,45 @@
 //! The decoder recovers the maximum-likelihood input sequence by searching all
 //! $2^{K-1}$ states with an ACS forward pass followed by a traceback.
 //!
+//! # Trellis intuition: Add-Compare-Select (ACS)
+//!
+//! A convolutional trellis is a graph with one node per encoder state at
+//! each time step and one edge per possible input bit leaving each node.
+//! Exactly two edges *converge* on every state (one for input 0, one for
+//! input 1, from two different predecessor states): the decoder's entire
+//! job, at every state and every step, is to keep only the better of the
+//! two incoming paths and remember which one won.
+//!
+//! Below is a simplified $K=3$ (4-state) slice of the real trellis, showing
+//! the two edges that converge on destination state $0$ (the actual $K=7$
+//! trellis has 64 states and up to 128 edges per step, built the same way
+//! by `TrellisTable::build`, but the ACS step performed at every single
+//! state is exactly this):
+//!
+//! ```text
+//!   step t (states, path metric so far)          step t+1
+//!
+//!   state 0 (metric M0) ──input 0──┐
+//!                                   ├──▶ state 0:  candidates =
+//!   state 1 (metric M1) ──input 0──┘        M0 + bm(0→0),  M1 + bm(1→0)
+//!                                            new metric = best(candidates)
+//!                                            traceback[0] = winning predecessor
+//! ```
+//!
+//! * **Add**: extend each candidate path by its branch metric (`M_i + bm`) —
+//!   Hamming distance for hard decisions, max-log-MAP correlation for soft.
+//! * **Compare**: rank the two (in general, $2^{K-1}$-many across all
+//!   destination states) candidates that land on this state.
+//! * **Select**: keep only the winner's metric and record its predecessor in
+//!   the traceback table; the loser is discarded entirely. Discarding
+//!   losers at every step is exactly what keeps Viterbi decoding linear in
+//!   trellis size rather than exponential in sequence length.
+//!
+//! Repeating ACS at all $2^{K-1}$ states for every received symbol, then
+//! walking the traceback table backward from the known terminal state
+//! (state 0, since frames are zero-terminated — see below), recovers the
+//! maximum-likelihood input sequence.
+//!
 //! # Zero termination
 //!
 //! The encoder is assumed to start and end in state 0 (zero-terminated frame):
@@ -725,6 +764,11 @@ impl ViterbiDecoder {
     /// * `k` - Constraint length (`1..=`[`MAX_CONSTRAINT_LENGTH`]).  K=7 uses
     ///   generators 0o133/0o171.
     ///
+    /// # Returns
+    ///
+    /// A ready-to-use [`ViterbiDecoder`] with a precomputed $2^{k-1}$-state
+    /// trellis (see the private `TrellisTable::build`).
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if `k == 0` or
@@ -759,10 +803,22 @@ impl ViterbiDecoder {
     /// * `g0` - First generator polynomial (K-bit integer, MSB = current input).
     /// * `g1` - Second generator polynomial.
     ///
+    /// # Returns
+    ///
+    /// A ready-to-use [`ViterbiDecoder`] using the given generators.
+    ///
     /// # Errors
     ///
     /// Returns [`FecError::InvalidParam`] if `k == 0` or
     /// `k > MAX_CONSTRAINT_LENGTH`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::viterbi::ViterbiDecoder;
+    /// let dec = ViterbiDecoder::with_generators(7, 0o133, 0o171).unwrap();
+    /// assert_eq!(dec.constraint_length, 7);
+    /// ```
     pub fn with_generators(k: usize, g0: u32, g1: u32) -> Result<Self, FecError> {
         Self::check_k(k)?;
         let trellis = TrellisTable::build(k, g0, g1);
@@ -789,6 +845,10 @@ impl ViterbiDecoder {
     ///
     /// Appends $K-1$ tail zeros after `info` to force the encoder to end in
     /// state 0, then outputs pairs `(c0, c1)` for each input bit.
+    ///
+    /// # Arguments
+    ///
+    /// * `info` - Information bits (values `0`/`1`), any length.
     ///
     /// # Returns
     ///
@@ -827,6 +887,11 @@ impl ViterbiDecoder {
     /// `coded` must contain flat pairs `[c0, c1, c0, c1, …]` of 0/1 values
     /// (length must be a multiple of 2).  The frame must be zero-terminated:
     /// the encoder appended $K-1$ tail zeros, so `coded.len()/2 ≥ K-1`.
+    ///
+    /// # Arguments
+    ///
+    /// * `coded` - Flat `[c0, c1, c0, c1, ...]` pairs of 0/1 values, length a
+    ///   multiple of 2 (see the zero-termination requirement above).
     ///
     /// # Returns
     ///
@@ -1029,6 +1094,11 @@ impl ViterbiDecoder {
     ///
     /// The branch metric is $\sum_j (1 - 2\,c_j)\,L_j$ (maximized), which
     /// is the max-log-MAP approximation.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` - Flat `[L0, L1, L0, L1, ...]` paired LLR values (see the
+    ///   sign convention above), length a multiple of 2.
     ///
     /// # Returns
     ///
@@ -1253,7 +1323,27 @@ impl ViterbiDecoder {
 
     /// Decode hard-decision coded bits (alias for [`ViterbiDecoder::decode_hard`]).
     ///
-    /// Kept for backward compatibility with the original stub API.
+    /// Kept for backward compatibility with the original stub API; see
+    /// [`decode_hard`](Self::decode_hard) for the full contract (argument
+    /// layout, zero-termination requirement, return value).
+    ///
+    /// # Arguments
+    ///
+    /// * `bits` - Same layout as [`decode_hard`](Self::decode_hard)'s `coded`.
+    ///
+    /// # Returns
+    ///
+    /// Same as [`decode_hard`](Self::decode_hard).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::viterbi::ViterbiDecoder;
+    /// let dec = ViterbiDecoder::new(7).unwrap();
+    /// let info = vec![1u8, 0, 1, 1];
+    /// let coded = dec.encode(&info);
+    /// assert_eq!(dec.decode(&coded), info);
+    /// ```
     pub fn decode(&self, bits: &[u8]) -> Vec<u8> {
         self.decode_hard(bits)
     }
