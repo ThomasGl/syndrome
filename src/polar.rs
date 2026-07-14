@@ -44,6 +44,40 @@
 //! metric.
 //! CRC-aided SCL (CA-SCL, the 5G NR configuration) selects the path that
 //! passes the CRC from the surviving list.
+//!
+//! ### SCL decode-tree shape
+//!
+//! SC and SCL walk the *same* binary recursion tree over `llr`; SCL just
+//! carries a whole list of candidate paths through it instead of one. Each
+//! internal node splits its `length`-wide LLR block into a left half (fed
+//! through `f_kernel`) and a right half (fed through `g_kernel`, once the
+//! left half's hard decision is known); a leaf is a single bit — frozen
+//! (forced to 0) or an information bit (forks the path list in two):
+//!
+//! ```text
+//!                 [ length=N, level=0 ]
+//!                /                      \
+//!         f: left half              g: right half (needs left's
+//!         (length=N/2)               partial sum first)
+//!              ...                          ...
+//!               \                          /
+//!            [ length=1 ]              [ length=1 ]
+//!          frozen: fix 0           info: fork into {0,1},
+//!          (no fork)                sort by path metric,
+//!                                   keep best `list_size`
+//! ```
+//!
+//! # Input contract: LLRs must be finite
+//!
+//! [`PolarDecoder::decode_sc`] and [`PolarDecoder::decode_scl`] both reject
+//! any `llr` slice containing `NaN` or `±infinity` with
+//! [`FecError::InvalidParam`] before doing any path-metric arithmetic. A
+//! `NaN` LLR is not meaningful soft information (there is no sensible "how
+//! confident is the channel" reading for it), and letting one reach the
+//! path-metric sort would either panic (`f32::partial_cmp` returns `None`
+//! for `NaN`) or, if silently tolerated via `total_cmp`, produce a
+//! decode result with no relationship to the actual transmitted codeword --
+//! worse than an error, because it looks like a normal answer.
 
 use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
@@ -1048,7 +1082,10 @@ impl PolarDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`FecError::BufferTooSmall`] on length mismatch.
+    /// Returns [`FecError::BufferTooSmall`] on length mismatch, or
+    /// [`FecError::InvalidParam`] if any `llr` value is `NaN` or `±infinity`
+    /// (see [`Self::decode_scl`]'s doc comment for why non-finite LLRs are
+    /// rejected outright rather than silently tolerated).
     pub fn decode_sc(&self, llr: &[f32], out: &mut [u8]) -> Result<(), FecError> {
         if llr.len() != self.n {
             return Err(FecError::BufferTooSmall {
@@ -1061,6 +1098,11 @@ impl PolarDecoder {
                 required: self.k,
                 provided: out.len(),
             });
+        }
+        if llr.iter().any(|v| !v.is_finite()) {
+            return Err(FecError::InvalidParam(
+                "polar decode_sc: llr contains NaN or infinite value",
+            ));
         }
 
         let mut scratch_ref = self.sc_scratch.borrow_mut();
@@ -1103,7 +1145,15 @@ impl PolarDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`FecError::BufferTooSmall`] on size mismatch.
+    /// Returns [`FecError::BufferTooSmall`] on size mismatch, or
+    /// [`FecError::InvalidParam`] if any `llr` value is `NaN` or `±infinity`.
+    /// `f32::partial_cmp` returns `None` for a `NaN` operand, which the path
+    /// metric sort below relies on being `Some` (via `.unwrap()`); rather
+    /// than silently reordering with `total_cmp` or letting the corruption
+    /// propagate deep into path-metric arithmetic, a non-finite LLR is
+    /// rejected here, at the boundary, since it is not meaningful soft
+    /// information and decoding through it would not produce a meaningful
+    /// answer, just a well-formed-looking wrong one.
     pub fn decode_scl(&self, llr: &[f32], out: &mut [u8]) -> Result<(), FecError> {
         if llr.len() != self.n {
             return Err(FecError::BufferTooSmall {
@@ -1116,6 +1166,11 @@ impl PolarDecoder {
                 required: self.k,
                 provided: out.len(),
             });
+        }
+        if llr.iter().any(|v| !v.is_finite()) {
+            return Err(FecError::InvalidParam(
+                "polar decode_scl: llr contains NaN or infinite value",
+            ));
         }
 
         // For list_size=1, fall back to the efficient SC path.
@@ -1261,33 +1316,10 @@ mod tests {
             .collect()
     }
 
-    /// Minimal deterministic xorshift64 PRNG for reproducible tests (same
-    /// shift triplet as `channel_sim::AwgnChannel` and `bch::tests`).
-    struct Xorshift64 {
-        state: u64,
-    }
-
-    impl Xorshift64 {
-        fn new(seed: u64) -> Self {
-            Self { state: seed | 1 }
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.state = x;
-            x
-        }
-
-        fn next_bit(&mut self) -> u8 {
-            (self.next_u64() & 1) as u8
-        }
-    }
+    use crate::test_util::Xorshift64;
 
     fn random_bits(rng: &mut Xorshift64, len: usize) -> Vec<u8> {
-        (0..len).map(|_| rng.next_bit()).collect()
+        (0..len).map(|_| rng.next_bool() as u8).collect()
     }
 
     #[test]

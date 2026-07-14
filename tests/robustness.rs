@@ -308,6 +308,61 @@ fn finding_polar_scl_list_size_zero_rejected() {
     ));
 }
 
+/// FINDING (fixed): `decode_scl`/`decode_sc` sorted candidate paths by
+/// `f32::partial_cmp(...).unwrap()`, which panics whenever a `NaN` reaches
+/// the comparison (`partial_cmp` returns `None` for any `NaN` operand). A
+/// corrupted upstream soft-demapper producing a `NaN` LLR (e.g. from
+/// `log(0.0)`) would reach this panic through ordinary use, not just
+/// adversarial input, breaking this crate's "zero panics from public APIs"
+/// convention.
+///
+/// Fix (`src/polar.rs`): both `decode_sc` and `decode_scl` now validate every
+/// `llr` value for finiteness at the top of the function, before any
+/// path-metric computation, returning `FecError::InvalidParam` instead of
+/// reaching the panicking sort deep in the recursion.
+#[test]
+fn finding_polar_nan_llr_rejected_not_panicking() {
+    let n = 8usize;
+    let k = 4usize;
+
+    // decode_sc (list_size = 1): NaN anywhere in llr must be rejected.
+    let dec_sc = PolarDecoder::new(n, k, 1, None).unwrap();
+    let mut llr = vec![1.0f32; n];
+    llr[3] = f32::NAN;
+    let mut out = vec![0u8; k];
+    assert!(matches!(
+        dec_sc.decode_sc(&llr, &mut out),
+        Err(FecError::InvalidParam(_))
+    ));
+
+    // decode_scl (list_size > 1): same NaN input must be rejected, not
+    // panic in the path-metric sort.
+    let dec_scl = PolarDecoder::new(n, k, 4, None).unwrap();
+    assert!(matches!(
+        dec_scl.decode_scl(&llr, &mut out),
+        Err(FecError::InvalidParam(_))
+    ));
+
+    // Infinity is also non-finite and must be rejected the same way.
+    let mut llr_inf = vec![1.0f32; n];
+    llr_inf[0] = f32::INFINITY;
+    llr_inf[1] = f32::NEG_INFINITY;
+    assert!(matches!(
+        dec_sc.decode_sc(&llr_inf, &mut out),
+        Err(FecError::InvalidParam(_))
+    ));
+    assert!(matches!(
+        dec_scl.decode_scl(&llr_inf, &mut out),
+        Err(FecError::InvalidParam(_))
+    ));
+
+    // Sanity check: an all-finite llr of the right length still decodes
+    // successfully (the new check doesn't accidentally reject valid input).
+    let good_llr = vec![10.0f32; n];
+    assert!(dec_sc.decode_sc(&good_llr, &mut out).is_ok());
+    assert!(dec_scl.decode_scl(&good_llr, &mut out).is_ok());
+}
+
 /// FINDING 9 (fixed; was the most severe finding in this suite):
 /// `compute_segmentation` used to panic for the *majority* of transport
 /// block sizes that require more than one code block. The multi-CB branch
@@ -752,7 +807,16 @@ fn fuzz_polar_sc_and_scl_adversarial() {
                 let r = no_panic("polar decode_sc adversarial", || {
                     dec.decode_sc(&llr, &mut out)
                 });
-                assert!(r.is_ok());
+                // `next_llrs` may include NaN/Inf (adversarial soft input).
+                // Those are now rejected with `InvalidParam` (see
+                // `finding_polar_nan_llr_rejected_not_panicking`) instead of
+                // being decoded through or panicking; any all-finite llr
+                // must still decode successfully.
+                match r {
+                    Ok(()) => {}
+                    Err(FecError::InvalidParam(_)) => assert!(llr.iter().any(|v| !v.is_finite())),
+                    Err(e) => panic!("unexpected error from decode_sc: {e:?}"),
+                }
 
                 // Wrong-length LLR / output buffers.
                 let bad_llr = rng.next_llrs(n.saturating_sub(1));
@@ -771,7 +835,11 @@ fn fuzz_polar_sc_and_scl_adversarial() {
                 let r = no_panic("polar decode_scl adversarial", || {
                     sdec.decode_scl(&llr, &mut out)
                 });
-                assert!(r.is_ok());
+                match r {
+                    Ok(()) => {}
+                    Err(FecError::InvalidParam(_)) => assert!(llr.iter().any(|v| !v.is_finite())),
+                    Err(e) => panic!("unexpected error from decode_scl: {e:?}"),
+                }
             }
         }
     }
