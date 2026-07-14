@@ -14,6 +14,39 @@
 //! Bits are processed MSB-first over a bit-string represented as a `&[u8]` of
 //! 0/1 values, matching the 3GPP bit-string convention.
 //!
+//! # How it works, in plain English
+//!
+//! A CRC is a remainder from long division of the message by a fixed
+//! polynomial $g(x)$ over $GF(2)$ (i.e. binary coefficients, addition = XOR).
+//! The classic hardware way to compute that remainder is a Linear Feedback
+//! Shift Register (LFSR): an `L`-bit register that shifts one input bit in
+//! at a time, XORing in the generator polynomial whenever the bit shifted
+//! *out* of the top was a `1`:
+//!
+//! ```text
+//!  input bit
+//!      │
+//!      ▼
+//!  ┌───┴────────────────────────────┐
+//!  │  reg[L-1]  reg[L-2] ... reg[0] │  ◀── shift left each step
+//!  └────┬───────────────────────────┘
+//!       │ (bit shifted out, i.e. old reg[L-1] XOR input)
+//!       ▼
+//!   feedback ──▶ XOR into every tap position where g(x) has a `1` bit
+//! ```
+//!
+//! `bit_serial_step` (a private helper below) is exactly this: one
+//! shift-and-conditionally-XOR step.
+//! Running it once per input bit (see `compute_bit_serial`, the
+//! test-only reference) is correct but slow -- 1 bit of work per bit of
+//! input. [`Crc24::compute`] instead precomputes, once per [`Crc24::new`],
+//! what 8 (or 4, for `Crc6`) consecutive `bit_serial_step` calls do to the
+//! register for every possible input byte (or nibble) -- a 256-entry (or
+//! 16-entry) lookup table -- so encoding processes a whole byte per table
+//! lookup instead of 8 individual bit shifts. The two paths are equivalent
+//! *by construction*, and additionally cross-checked against each other over
+//! randomized inputs by `table_matches_bit_serial_reference` below.
+//!
 //! # Examples
 //!
 //! ```
@@ -381,27 +414,11 @@ mod tests {
         assert!(!crc.check(&[0u8; 10]));
     }
 
-    /// Minimal deterministic PRNG (xorshift64), avoids adding a dev-dependency
-    /// just for reproducible test bit-strings.
-    struct Xorshift64(u64);
+    use crate::test_util::Xorshift64;
 
-    impl Xorshift64 {
-        fn next_u64(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-
-        /// Random length in `1..=max` (inclusive), deliberately including
-        /// lengths not divisible by 8 (or 4).
-        fn next_len(&mut self, max: usize) -> usize {
-            (self.next_u64() as usize % max) + 1
-        }
-
-        fn next_bits(&mut self, len: usize) -> Vec<u8> {
-            (0..len).map(|_| (self.next_u64() & 1) as u8).collect()
-        }
+    /// Draw `len` random 0/1 bits from `rng` (see `crate::test_util`).
+    fn next_bits(rng: &mut Xorshift64, len: usize) -> Vec<u8> {
+        (0..len).map(|_| rng.next_bool() as u8).collect()
     }
 
     /// Table-driven `compute` must match the bit-serial reference exactly,
@@ -424,10 +441,10 @@ mod tests {
             let poly = kind.poly() & mask;
 
             // Seed varies per kind so the 6 sweeps don't share a sequence.
-            let mut rng = Xorshift64(0x9E3779B97F4A7C15 ^ (kind as u64 + 1));
+            let mut rng = Xorshift64::new(0x9E3779B97F4A7C15 ^ (kind as u64 + 1));
             for _ in 0..200 {
                 let n = rng.next_len(2000);
-                let bits = rng.next_bits(n);
+                let bits = next_bits(&mut rng, n);
                 let table_driven = crc.compute(&bits);
                 let bit_serial = compute_bit_serial(&bits, len, poly, mask);
                 assert_eq!(

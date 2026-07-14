@@ -4,6 +4,47 @@
 //! QC-LDPC codes using the real BG1 and BG2 base graphs from
 //! 3GPP TS 38.212 Tables 5.3.2-2 and 5.3.2-3.
 //!
+//! # What LOMS actually computes
+//!
+//! A QC-LDPC code's parity-check matrix $H$ is tiled from $Z \times Z$
+//! cyclically-shifted identity (or zero) blocks, so the whole decode graph
+//! reduces to *layers* (block rows) of a base graph, each layer touching a
+//! small, fixed set of variable-node blocks. "Layered" means each layer's
+//! check-node update is applied immediately — using the freshest available
+//! variable beliefs — rather than waiting for a full flooding-schedule
+//! sweep; this converges in roughly half as many passes as classic
+//! flooding belief propagation for the same numerical work.
+//!
+//! For each layer (check-node row) with connected variables $v \in
+//! \mathcal{N}(c)$, standard offset min-sum computes, per edge:
+//!
+//! $$ Q_{v \to c} = \mathrm{LLR}_v - R_{c \to v}^{\text{(previous)}} $$
+//!
+//! $$ R_{c \to v} = \left(\prod_{v' \in \mathcal{N}(c) \setminus v}
+//! \operatorname{sign}(Q_{v' \to c})\right) \cdot \max\!\left(
+//! \min_{v' \in \mathcal{N}(c) \setminus v} \lvert Q_{v' \to c} \rvert -
+//! \beta,\; 0 \right) $$
+//!
+//! $$ \mathrm{LLR}_v \mathrel{+}= R_{c \to v}^{\text{(new)}} - R_{c \to
+//! v}^{\text{(previous)}} $$
+//!
+//! where $\beta$ is `offset_beta` — a small positive correction that
+//! compensates for min-sum's tendency to overstate confidence relative to
+//! the (much more expensive) exact sum-product update.
+//!
+//! Naively, computing $\min_{v' \neq v} \lvert Q_{v'} \rvert$ for every edge
+//! in a layer is $O(\text{degree}^2)$. [`QcLdpcDecoder::decode_layered_offset_min_sum`]
+//! avoids that with the standard two-pass trick: pass 1 walks every edge
+//! once and tracks only the smallest (`min1`) and second-smallest (`min2`)
+//! magnitude in the layer plus the XOR of all signs; pass 2 revisits each
+//! edge and picks `min2` for the one edge that *was* the layer minimum
+//! (excluding itself is required by the sum above) and `min1` for every
+//! other edge — turning the update into two $O(\text{degree})$ passes total.
+//! This is exactly what the scalar fallback in the hot loop does; the AVX2
+//! (`crate::simd_avx2`) and NEON (`crate::simd_neon`) kernels vectorize the
+//! same two passes across the `z_idx in 0..Z` axis, which is independent
+//! per lane.
+//!
 //! # Lifting size sets (3GPP Table 5.3.2-1)
 //!
 //! | iLS | Lifting sizes Z                           |
@@ -347,7 +388,19 @@ fn build_layout(
 }
 
 impl QcLdpcParams {
-    /// Build the runtime parameters for `bg` at lifting size `z`.
+    /// Build the runtime parameters for the 3GPP base graph `bg` at lifting
+    /// size `z`.
+    ///
+    /// **Use this constructor** whenever you are working with an actual 5G
+    /// NR base graph (BG1 or BG2, TS 38.212 §5.3.2): it looks up `z`'s
+    /// lifting-size *set* (iLS, Table 5.3.2-1) and uses the 3GPP shift
+    /// tables (`entry_col_shift`), which are expressed as one shift-per-iLS
+    /// (not one shift-per-`z`) and must be *scaled* by the actual `z` before
+    /// use. That scaling step is exactly what distinguishes this path from
+    /// [`QcLdpcParams::from_raw_edges`], which takes already-final,
+    /// absolute per-`z` shifts and does no 3GPP-specific lookup or scaling
+    /// at all — reach for `from_raw_edges` only when your base graph is not
+    /// a 3GPP one (e.g. IEEE 802.11 Wi-Fi LDPC).
     ///
     /// # Errors
     ///
@@ -669,6 +722,15 @@ impl QcLdpcDecoder {
 
     /// Decode a block of LLRs using layered offset min-sum with caller-owned
     /// message and scratch buffers.
+    ///
+    /// This is the hot-path entry point: it runs `iterations` layered
+    /// passes over the base graph, each pass updating every check-node
+    /// layer's outgoing extrinsic messages (`edge_r`) and folding the update
+    /// straight back into `llr` in place, then checks the syndrome to allow
+    /// early exit once every parity equation is satisfied. See the
+    /// [module-level documentation](self) for the exact LOMS update
+    /// equations and the two-pass min-tracking trick used to keep each
+    /// layer's update at $O(\text{degree})$ instead of $O(\text{degree}^2)$.
     ///
     /// No heap allocation occurs inside this function; the hot path is
     /// strictly allocation-free.
@@ -1853,37 +1915,33 @@ mod tests {
 
     // -- Sparse structured encoder: equivalence + syndrome validation ------
 
-    /// Tiny deterministic PRNG (xorshift64*) so tests don't need a `rand`
-    /// dependency; only used to generate reproducible pseudo-random info
-    /// bits for the tests below.
-    struct XorShift64(u64);
-    impl XorShift64 {
-        fn new(seed: u64) -> Self {
-            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
-        }
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn random_bits(&mut self, n: usize) -> Vec<u8> {
-            let mut bits = Vec::with_capacity(n);
-            let mut word = 0u64;
-            let mut avail = 0u32;
-            for _ in 0..n {
-                if avail == 0 {
-                    word = self.next_u64();
-                    avail = 64;
-                }
-                bits.push((word & 1) as u8);
-                word >>= 1;
-                avail -= 1;
+    // Uses the crate-shared `Xorshift64` (see `crate::test_util`) rather than
+    // a local copy. This file's info-bit generator extracts individual bits
+    // directly from consecutive raw words (see `random_bits` below), which
+    // is exactly the case where xorshift's known weak low-order-bit
+    // statistics would matter — so it deliberately uses
+    // [`crate::test_util::Xorshift64::next_u64_mixed`] (the xorshift64*
+    // output-mixing variant) instead of plain `next_u64`, preserving the
+    // extra multiply this file's original standalone PRNG copy had.
+    use crate::test_util::Xorshift64;
+
+    /// Generate `n` pseudo-random info bits from `rng`, one bit per call to
+    /// [`Xorshift64::next_u64_mixed`] bit position (LSB first, 64 bits drawn
+    /// from each word before requesting the next one).
+    fn random_bits(rng: &mut Xorshift64, n: usize) -> Vec<u8> {
+        let mut bits = Vec::with_capacity(n);
+        let mut word = 0u64;
+        let mut avail = 0u32;
+        for _ in 0..n {
+            if avail == 0 {
+                word = rng.next_u64_mixed();
+                avail = 64;
             }
-            bits
+            bits.push((word & 1) as u8);
+            word >>= 1;
+            avail -= 1;
         }
+        bits
     }
 
     /// Check every parity equation directly over hard `0/1` bits — the
@@ -1947,8 +2005,8 @@ mod tests {
             let enc = QcLdpcEncoder::new(BaseGraph::Bg1, z).unwrap();
             let k = enc.info_bit_count();
             let n = enc.codeword_bit_count();
-            let mut rng = XorShift64::new(0xC0FFEE ^ z as u64);
-            let info = rng.random_bits(k);
+            let mut rng = Xorshift64::new(0xC0FFEE ^ z as u64);
+            let info = random_bits(&mut rng, k);
 
             let mut sparse_cw = vec![0u8; n];
             let mut dense_cw = vec![0u8; n];
@@ -1968,8 +2026,8 @@ mod tests {
             let enc = QcLdpcEncoder::new(BaseGraph::Bg2, z).unwrap();
             let k = enc.info_bit_count();
             let n = enc.codeword_bit_count();
-            let mut rng = XorShift64::new(0xBADC0DE ^ z as u64);
-            let info = rng.random_bits(k);
+            let mut rng = Xorshift64::new(0xBADC0DE ^ z as u64);
+            let info = random_bits(&mut rng, k);
 
             let mut sparse_cw = vec![0u8; n];
             let mut dense_cw = vec![0u8; n];
@@ -1991,8 +2049,8 @@ mod tests {
                 let enc = QcLdpcEncoder::new(bg, z).unwrap();
                 let k = enc.info_bit_count();
                 let n = enc.codeword_bit_count();
-                let mut rng = XorShift64::new(0x5EED ^ ((bg as u64) << 32) ^ z as u64);
-                let info = rng.random_bits(k);
+                let mut rng = Xorshift64::new(0x5EED ^ ((bg as u64) << 32) ^ z as u64);
+                let info = random_bits(&mut rng, k);
 
                 let mut codeword = vec![0u8; n];
                 enc.encode(&info, &mut codeword).unwrap();

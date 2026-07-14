@@ -1,5 +1,22 @@
 //! Binary BCH codes over $GF(2^8)$ — systematic encode and algebraic decode.
 //!
+//! # How it works, in plain English
+//!
+//! A BCH code adds a block of parity bits to a message such that, if a
+//! bounded number of bits `t` get flipped in transit, the *exact positions*
+//! of those flipped bits can be recovered algebraically -- not just detected
+//! (as a CRC does), but pinpointed and corrected, with no retransmission
+//! needed. The trick is to treat the codeword as a polynomial over a finite
+//! field and choose the parity so that the polynomial is divisible by a
+//! carefully constructed generator $g(x)$; every bit error then leaves a
+//! distinctive algebraic "fingerprint" (the syndromes) from which the
+//! error locations can be solved for directly, the same way you can
+//! sometimes tell exactly which digit of a checksummed number was mistyped.
+//! Encoding is a shift-register division (cheap); decoding runs three
+//! classical steps -- syndromes, then Berlekamp–Massey to find *which*
+//! positions are wrong, then Chien search to find *where* -- each detailed
+//! below.
+//!
 //! Implements primitive, narrow-sense binary Bose–Chaudhuri–Hocquenghem (BCH)
 //! codes with block length $n = 255$ built over $GF(2^8)$, for a configurable
 //! error-correction capability $t \in \{1, \ldots, 10\}$. The generator
@@ -1011,38 +1028,11 @@ impl BchCode {
 mod tests {
     use super::*;
 
-    /// Minimal deterministic xorshift64 PRNG for reproducible tests (same
-    /// shift triplet as `channel_sim::AwgnChannel`).
-    struct Xorshift64 {
-        state: u64,
-    }
+    use crate::test_util::Xorshift64;
 
-    impl Xorshift64 {
-        fn new(seed: u64) -> Self {
-            Self { state: seed | 1 }
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.state = x;
-            x
-        }
-
-        fn next_bit(&mut self) -> u8 {
-            (self.next_u64() & 1) as u8
-        }
-
-        /// Uniform integer in `0..bound`.
-        fn next_range(&mut self, bound: usize) -> usize {
-            (self.next_u64() % bound as u64) as usize
-        }
-    }
-
+    /// Draw `len` random 0/1 bits from `rng` (see `crate::test_util`).
     fn random_bits(rng: &mut Xorshift64, len: usize) -> Vec<u8> {
-        (0..len).map(|_| rng.next_bit()).collect()
+        (0..len).map(|_| rng.next_bool() as u8).collect()
     }
 
     /// Flip exactly `count` distinct, randomly chosen bit positions in
@@ -1051,7 +1041,7 @@ mod tests {
         let mut used = [false; N];
         let mut positions = Vec::with_capacity(count);
         while positions.len() < count {
-            let pos = rng.next_range(buf.len());
+            let pos = rng.next_below(buf.len());
             if !used[pos] {
                 used[pos] = true;
                 positions.push(pos);

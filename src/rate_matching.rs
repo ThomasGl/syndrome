@@ -5,6 +5,36 @@
 //! and applies bit interleaving.  Filler/`<NULL>` positions are skipped
 //! during selection.
 //!
+//! # Why this exists, in plain English
+//!
+//! An LDPC encoder always emits a fixed-size codeword (systematic bits +
+//! parity bits), but a real transmission needs some other, arbitrary number
+//! of bits `E` -- exactly enough to fill the modulation symbols scheduled for
+//! this transmission opportunity, no more, no less. Rate matching is the
+//! adapter between those two sizes: it walks the codeword bits in a fixed,
+//! wraparound (circular) order and copies out exactly `E` of them, skipping
+//! placeholder "filler" bits that carry no information. Different
+//! redundancy versions (RVs) start that walk from different offsets, which
+//! is what lets HARQ retransmissions send different (or overlapping)
+//! subsets of the same codeword rather than a byte-identical repeat.
+//!
+//! ```text
+//! codeword:      [ 2Z punctured ][   systematic bits   ][   parity bits   ]
+//!                                 └── K'..K = filler ───┘
+//!                                        (skipped)
+//! circular buf:  [   systematic (minus punctured/filler)  ][ parity ]
+//!                 0                                                N_cb-1
+//!                        ▲
+//!                        k0 (RV-dependent start offset)
+//!
+//! bit selection:  walk (k0 + j) mod N_cb, j = 0, 1, 2, ...
+//!                 skip positions inside the filler range
+//!                 take the first E survivors  ──▶  e[0..E]
+//!
+//! bit interleaving: write e[] row-by-row into a (E/Qm) x Qm matrix,
+//!                   read it back out column-by-column
+//! ```
+//!
 //! # Mathematical Summary
 //!
 //! The circular buffer for code block $r$ contains $N_{cb}$ entries ordered as:
@@ -124,6 +154,10 @@ fn deinterleave_f32(e: &mut [f32], qm: usize) {
 /// * `n_filler`  - Number of filler bits ($K - K'$) at positions
 ///   $(K' .. K)$ of the systematic section. These positions are
 ///   skipped (treated as `<NULL>`) during selection.
+///
+/// # Returns
+///
+/// `Ok(())` on success; `e_out` holds the `E` rate-matched, interleaved bits.
 ///
 /// # Errors
 ///
@@ -247,6 +281,10 @@ pub fn rate_match(
 /// * `bg`        - Base graph.
 /// * `z`         - Lifting size.
 /// * `n_filler`  - Number of filler bits.
+///
+/// # Returns
+///
+/// `Ok(())` on success; `cb_llr` has the de-interleaved LLRs added in.
 ///
 /// # Errors
 ///
@@ -467,6 +505,19 @@ pub struct RateMatchCache {
 impl RateMatchCache {
     /// Create an empty cache. The first call to either `_into` method below
     /// builds the tables; subsequent calls with the same key reuse them.
+    ///
+    /// # Returns
+    ///
+    /// A [`RateMatchCache`] with no tables built yet (built lazily on first
+    /// use).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::rate_matching::RateMatchCache;
+    /// let cache = RateMatchCache::new();
+    /// drop(cache); // no tables allocated until first rate_match_into call
+    /// ```
     pub fn new() -> Self {
         Self {
             key: None,
@@ -504,10 +555,40 @@ impl RateMatchCache {
     /// gathers directly from `codeword` into `e_out` with no intermediate
     /// `Vec` allocation.
     ///
+    /// # Arguments
+    ///
+    /// Same as [`rate_match`], plus `self`, which owns the memoized index
+    /// tables (rebuilt only when the `(bg, z, rv, qm, n_filler, e_bits)` key
+    /// changes from the previous call on this cache).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success; `e_out` holds the `E` rate-matched, interleaved
+    /// bits, bit-for-bit identical to what [`rate_match`] would produce for
+    /// the same inputs.
+    ///
     /// # Errors
     ///
     /// Same conditions as [`rate_match`]: `rv >= 4`, `qm == 0`, `z == 0`, or
     /// `e_out.len() % qm != 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::rate_matching::{RateMatchCache, rate_match};
+    /// use syndrome::qc_ldpc::BaseGraph;
+    ///
+    /// let z = 2usize;
+    /// let codeword = vec![1u8; 66 * z];
+    /// let mut cache = RateMatchCache::new();
+    /// let mut e_cached = vec![0u8; 32];
+    /// cache
+    ///     .rate_match_into(&codeword, &mut e_cached, 0, 1, BaseGraph::Bg1, z, 0)
+    ///     .unwrap();
+    /// let mut e_direct = vec![0u8; 32];
+    /// rate_match(&codeword, &mut e_direct, 0, 1, BaseGraph::Bg1, z, 0).unwrap();
+    /// assert_eq!(e_cached, e_direct);
+    /// ```
     pub fn rate_match_into(
         &mut self,
         codeword: &[u8],
@@ -556,10 +637,40 @@ impl RateMatchCache {
     /// scatter-accumulate, but reuses this cache's index table when the key
     /// matches, with no intermediate `Vec` allocation.
     ///
+    /// # Arguments
+    ///
+    /// Same as [`rate_dematch_llr`], plus `self`, which owns the memoized
+    /// index table (rebuilt only when the `(bg, z, rv, qm, n_filler,
+    /// e_bits)` key changes from the previous call on this cache).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success; `cb_llr` has the de-interleaved LLRs added in,
+    /// bit-for-bit identical to what [`rate_dematch_llr`] would produce for
+    /// the same inputs.
+    ///
     /// # Errors
     ///
     /// Same conditions as [`rate_dematch_llr`]: `rv >= 4`, `qm == 0`, `z ==
     /// 0`, or `e_llr.len() % qm != 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::rate_matching::{RateMatchCache, rate_dematch_llr};
+    /// use syndrome::qc_ldpc::BaseGraph;
+    ///
+    /// let z = 2usize;
+    /// let e_llr = vec![1.0f32; 32];
+    /// let mut cache = RateMatchCache::new();
+    /// let mut cb_cached = vec![0.0f32; 66 * z];
+    /// cache
+    ///     .rate_dematch_llr_into(&e_llr, &mut cb_cached, 0, 1, BaseGraph::Bg1, z, 0)
+    ///     .unwrap();
+    /// let mut cb_direct = vec![0.0f32; 66 * z];
+    /// rate_dematch_llr(&e_llr, &mut cb_direct, 0, 1, BaseGraph::Bg1, z, 0).unwrap();
+    /// assert_eq!(cb_cached, cb_direct);
+    /// ```
     pub fn rate_dematch_llr_into(
         &mut self,
         e_llr: &[f32],
@@ -697,26 +808,7 @@ mod tests {
         assert!(rate_dematch_llr(&e_llr, &mut cb, 0, 1, BaseGraph::Bg1, 0, 0).is_err());
     }
 
-    /// Minimal deterministic xorshift64 PRNG (same shift triplet used
-    /// elsewhere in this crate, e.g. `polar::tests::Xorshift64`).
-    struct Xorshift64 {
-        state: u64,
-    }
-
-    impl Xorshift64 {
-        fn new(seed: u64) -> Self {
-            Self { state: seed | 1 }
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.state = x;
-            x
-        }
-    }
+    use crate::test_util::Xorshift64;
 
     /// Task-2 equivalence guard: [`RateMatchCache::rate_match_into`] must
     /// match the uncached [`rate_match`] bit-for-bit, across several (bg,

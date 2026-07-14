@@ -27,6 +27,8 @@ pub mod reed_solomon;
 pub mod segmentation;
 pub mod sixg;
 pub mod spsc_queue;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod transport_block;
 pub mod turbo;
 pub mod viterbi;
