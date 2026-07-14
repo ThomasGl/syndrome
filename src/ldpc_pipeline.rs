@@ -5,7 +5,34 @@
 //! run the LOMS kernel; coordination between the caller and the workers uses
 //! only [`SpscRing`] SPSC queues — no OS mutexes are touched on the hot path.
 //!
-//! # Frame lifecycle
+//! # Multi-worker architecture
+//!
+//! Each worker owns exactly one dedicated pair of rings — a *work ring*
+//! (caller → worker) and a *done ring* (worker → caller) — rather than all
+//! workers sharing one queue. An [`SpscRing`] is single-producer
+//! single-consumer by construction, so an MPSC/SPMC shared queue is simply
+//! not an option without adding a different (heavier) synchronization
+//! primitive; N independent SPSC pairs sidesteps that entirely, at the cost
+//! of the caller having to fan work out and fan results back in itself:
+//!
+//! ```text
+//!                    worker 0 ── work_ring[0] ──►│decode│── done_ring[0] ──┐
+//!                   /                                                      \
+//! submit() ── round robin                                                  ├──► try_recv()
+//!                   \                                                      /   (polls each
+//!                    worker 1 ── work_ring[1] ──►│decode│── done_ring[1] ──┘    done ring
+//!                                                                                in order)
+//! ```
+//!
+//! [`LdpcPipeline::submit`] hands a frame's pool slot index to the next
+//! worker in round-robin order; [`LdpcPipeline::try_recv`] polls every done
+//! ring in turn and returns the first completed frame it finds. Because
+//! each worker gets its own decoder clone (see [`QcLdpcDecoder`]'s `Clone`),
+//! there is no shared mutable decode state between workers either — only
+//! the ring indices themselves are shared, and those are lock-free atomics
+//! (see [`crate::spsc_queue`]).
+//!
+//! # One frame's path through the pipeline (single worker shown)
 //!
 //! ```text
 //! acquire() ──► fill llr_mut() ──► submit()
@@ -17,9 +44,24 @@
 //!                           try_recv() ──► read hard() ──► release()
 //! ```
 //!
-//! All 16 frame slots are pre-allocated at construction time.  The ring
-//! protocol guarantees that exactly one entity (caller or a worker) holds each
-//! slot at any moment, so there is no concurrent access.
+//! All 16 frame slots (the `FrameSlot` pool) are pre-allocated at
+//! construction time and never reallocated. The ring protocol guarantees
+//! that exactly one entity (the caller, or exactly one worker) holds each
+//! slot index at any moment: a slot index only ever exists in one ring (or
+//! the caller's `free_list`) at a time, so there is no concurrent access to
+//! the `FrameSlot` it points to — this is what makes the raw `*mut
+//! FrameSlot` pointers in [`LdpcFrame`] sound to hand across threads without
+//! any lock.
+//!
+//! # Worker count: hardware-aware by default
+//!
+//! [`LdpcPipeline::new`] sizes the worker pool from
+//! [`std::thread::available_parallelism`] (falling back to 1 if the OS
+//! cannot report it), clamped to `1..=POOL_SIZE/2` (8) — the same ceiling
+//! [`LdpcPipeline::with_workers`] has always enforced, since more workers
+//! than that would starve for slots against only 16 preallocated frames.
+//! Use [`LdpcPipeline::with_workers`] directly to pick an explicit worker
+//! count instead (e.g. exactly 1, for deterministic tests).
 //!
 //! # Example
 //!
@@ -126,14 +168,38 @@ pub struct LdpcPipeline {
 }
 
 impl LdpcPipeline {
-    /// Create a single-worker pipeline. Equivalent to `with_workers(decoder, iterations, 1)`.
+    /// Create a pipeline sized to the host's available hardware parallelism.
+    ///
+    /// Earlier versions of this constructor hardcoded exactly one worker
+    /// thread regardless of the host, which left every additional core idle
+    /// by default — a caller had to already know about
+    /// [`LdpcPipeline::with_workers`] to get any parallelism at all. `new`
+    /// now queries [`std::thread::available_parallelism`] and sizes the
+    /// worker pool to match, falling back to `1` only if the OS cannot
+    /// report a core count (e.g. some sandboxes/containers).
+    ///
+    /// The detected count is passed straight to
+    /// [`LdpcPipeline::with_workers`], which clamps it to `1..=POOL_SIZE/2`
+    /// (8) — that ceiling is unchanged and still deliberate: with only 16
+    /// preallocated frame slots, more than 8 concurrent workers would leave
+    /// each worker less than one slot of headroom on average, causing
+    /// [`LdpcPipeline::acquire`] to stall constantly instead of gaining
+    /// throughput.
+    ///
+    /// Call [`LdpcPipeline::with_workers`] directly whenever you need to
+    /// override the auto-detected count explicitly — for example, pinning
+    /// to exactly 1 worker for deterministic single-threaded tests, or
+    /// deliberately under-subscribing a shared host.
     ///
     /// # Arguments
     ///
     /// * `decoder`    - Fully constructed decoder. The pipeline takes ownership.
     /// * `iterations` - LOMS iteration count applied to every frame.
     pub fn new(decoder: QcLdpcDecoder, iterations: usize) -> Self {
-        Self::with_workers(decoder, iterations, 1)
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        Self::with_workers(decoder, iterations, n_workers)
     }
 
     /// Create a pipeline with `n_workers` background decode threads.
@@ -245,6 +311,15 @@ impl LdpcPipeline {
             stop_flag,
             workers,
         }
+    }
+
+    /// Returns the number of background worker threads actually running.
+    ///
+    /// Reflects whatever [`LdpcPipeline::new`] auto-detected (clamped to
+    /// `1..=POOL_SIZE/2`) or the explicit value passed to
+    /// [`LdpcPipeline::with_workers`] (after the same clamp).
+    pub fn worker_count(&self) -> usize {
+        self.n_workers
     }
 
     /// Borrow a free decode slot. Returns `None` when all 16 slots are in
@@ -386,6 +461,29 @@ mod tests {
             }
         }
         assert_eq!(received, FRAMES);
+    }
+
+    #[test]
+    fn new_uses_available_hardware_parallelism() {
+        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let pipe = LdpcPipeline::new(decoder, 3);
+
+        // Compute the expected worker count exactly the way `new` does, so
+        // this assertion is correct on any host instead of hardcoding a
+        // number that would be wrong (and flaky) on CI runners with a
+        // different core count.
+        let detected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = detected.clamp(1, POOL_SIZE / 2);
+        assert_eq!(pipe.worker_count(), expected);
+
+        // On any genuinely multi-core host this must exceed the old
+        // hardcoded default of 1 worker. Skip the strict `>1` check on a
+        // single-core host so the test isn't flaky there.
+        if detected > 1 {
+            assert!(pipe.worker_count() > 1);
+        }
     }
 
     #[test]
