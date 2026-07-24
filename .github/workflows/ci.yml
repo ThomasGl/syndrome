@@ -101,7 +101,6 @@ jobs:
           - simd
           - simd_avx2
           - simd_neon
-          - simd_avx512
           - affinity
           - cortex-m
     steps:

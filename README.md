@@ -657,7 +657,7 @@ The **~8.3 dB coding gain** over the repetition code corresponds to 6.7× less t
 
 **Zero-allocation hot path.** The decode inner loops make no heap allocations.  All buffers (`llr`, `edge_r`, `layer_scratch`) are owned by the caller and reused across calls.  The 4.5 KiB per-layer scratch (`min1`, `min2`, `sign_xor`) is stack-allocated inside `decode_layered_offset_min_sum`.
 
-**Flat memory layout.** The extrinsic buffer is indexed as `edge_r[global_edge * Z + z_pos]` — shape `(E, Z)`, row-major.  This keeps all $Z$ z-positions for one edge contiguous, enabling a future AVX2 kernel to load them as a single SIMD register.
+**Flat memory layout.** The extrinsic buffer is indexed as `edge_r[global_edge * Z + z_pos]` — shape `(E, Z)`, row-major.  This keeps all $Z$ z-positions for one edge contiguous, which is what lets the AVX2 kernel below load them as a single SIMD register.
 
 **Syndrome-check early termination.** After each full layer sweep, `check_syndrome_f32` XORs hard decisions across all parity equations.  A clean syndrome exits before `max_iters`; `decode_layered_offset_min_sum` returns the number of iterations actually used.
 
@@ -668,6 +668,10 @@ The **~8.3 dB coding gain** over the repetition code corresponds to 6.7× less t
 **AVX2 kernel.** `src/simd_avx2.rs` is wired via `is_x86_feature_detected!("avx2")` at runtime — no compile-time feature flag needed.
 - Pass 1: 8-wide `_mm256_blendv_ps` branchless min1/min2 update; `_mm256_xor_si256` sign accumulation.
 - Pass 2: `_mm256_cmp_ps` + `_mm256_blendv_ps` exclusive-min select; `_mm256_or_ps` sign application.
+
+For the full mathematical derivation of LOMS, the hardware-tier compilation
+strategy, and an explicit list of what is real versus aspirational, see
+[system_architecture.md](system_architecture.md).
 
 ---
 
