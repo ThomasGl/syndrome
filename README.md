@@ -773,59 +773,13 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 ## 10. Learning Path
 
-### Week 0 — run before you read
+A full self-study route — a textbook-chapter map for every module, a 3-month
+roadmap, and a table connecting an EEE communications course to this codebase —
+lives in **[LEARNING_PATH.md](LEARNING_PATH.md)**.
 
-No theory needed: `cargo run --example 01_hamming_first_steps` and work down
-the examples table in §2. Each example prints what it's doing and why; by
-example 06 you will have *watched* the full 5G NR chain survive a noisy
-channel. Then come back here for the theory.
-
-### Algorithm ↔ textbook map (Lin & Costello, *Error Control Coding* 2e [20])
-
-| Module | Book chapter | Also see |
-|---|---|---|
-| `hamming.rs` | Ch. 3 (linear block codes) | Hamming 1950 [18] |
-| `golay.rs` | Ch. 4 (important block codes) | Golay 1949 [16] |
-| `bch.rs` | Ch. 6 (BCH), Ch. 7 (BM decoding) | [15] |
-| `reed_solomon.rs` | Ch. 7 (nonbinary BCH/RS) | Reed & Solomon 1960 [10] |
-| `viterbi.rs` | Ch. 11–12 (convolutional, Viterbi) | Viterbi 1967 [17] |
-| `turbo.rs` | Ch. 16 (Turbo coding) | Berrou 1993 [14] |
-| `qc_ldpc.rs` | Ch. 17 (LDPC) | MacKay Ch. 47 [3], Gallager [2] |
-| `polar.rs` | — (post-book) | Arıkan 2009 [12], Tal & Vardy [13] |
-
-### Suggested 3-month roadmap (EEE BSc background)
-
-```
-Month 1 — Theory
-  Week 1-2  MacKay Ch. 1 (probability) + Ch. 16 (factor graphs) + Ch. 47 (LDPC)
-            [free at inference.org.uk]
-  Week 3    Work through a 4×8 LDPC decode by hand. Write it in Python.
-  Week 4    Ryan & Lin Ch. 5 (LDPC) + Ch. 13 (QC-LDPC)
-            Read 3GPP TS 38.212 §5.3.2 (base graphs) — just the tables.
-
-Month 2 — Implementation
-  Week 5    Read src/qc_ldpc.rs top-to-bottom; trace one call with Z=2.
-  Week 6    Implement GF(256) multiply from scratch in 50 lines of Rust.
-  Week 7    Read src/simd_avx2.rs alongside the Intel Intrinsics Guide.
-  Week 8    Modify the scalar fallback to print intermediate LLRs; verify
-            against the sum-product equations from Month 1.
-
-Month 3 — Performance and systems
-  Week 9    Read Agner Fog "Optimizing Software in C++" (free) — Ch. 7 & 13.
-  Week 10   Implement your own SPSC ring in 50 lines; run the same tests.
-  Week 11   BER simulation: add uncoded BPSK to the waterfall; observe coding gain.
-  Week 12   Read the AFF3CT paper (Cassagne et al. 2019); compare to ldpc_pipeline.rs.
-```
-
-### Your BSc connections to this codebase
-
-| What you know | How it connects here |
-|---|---|
-| **Hamming(7,4)** | LDPC is the same idea: $H\mathbf{c} = 0$. Hamming decodes algebraically; LDPC decodes iteratively. |
-| **BER curves** | The BER waterfall in §5.3 *is* that curve for a practical code near the Shannon limit. |
-| **QAM decision regions** | The LLR input to the LDPC decoder is $\Lambda = \ln P(\text{bit}=0|y)/P(\text{bit}=1|y)$ — the soft probability at each decision boundary. |
-| **FFT for OFDM** | 5G NR places LDPC *after* the OFDM FFT demodulator. This library is the last step in the chain. |
-| **Quantisation / ADC** | Hardware LDPC decoders quantise LLRs to 6–8 bits; `src/quantize.rs` is that step. |
+If you only do one thing: run `cargo run --example 01_hamming_first_steps`, then
+work down the examples ladder in [§2](#2-quickstart). By example 06 you will have
+watched a full 5G NR chain survive a noisy channel.
 
 ---
 

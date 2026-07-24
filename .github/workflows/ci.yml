@@ -84,6 +84,38 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Run Clippy with every feature enabled
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Every feature flag must build on its own. Enabling only the umbrella
+  # `simd` feature once silently pulled in a nightly-only `portable_simd`
+  # path that no default-feature job ever compiled, so the advertised
+  # feature was broken on stable without CI noticing. Check each in turn.
+  features:
+    name: Feature Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - simd
+          - simd_avx2
+          - simd_neon
+          - simd_avx512
+          - affinity
+          - cortex-m
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check --features ${{ matrix.feature }}
+        run: cargo check --all-targets --features ${{ matrix.feature }}
+
+      - name: Check --no-default-features
+        run: cargo check --no-default-features
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

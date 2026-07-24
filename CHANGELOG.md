@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-07-15 — first public release
 
 ### Fixed
 - **All 8 panics discovered by the robustness suite are eliminated.** The
@@ -179,7 +179,11 @@ a tested reference, and is proven output-equivalent on seeded random inputs):
 - Resolved all Clippy warnings so `cargo clippy --all-targets -- -D warnings`
   passes cleanly, without altering numeric kernels.
 
-## [0.1.0] — initial
+## Pre-release development history
+
+Everything below predates the first crates.io publish and is folded into
+0.1.0; it is kept separate only to record the order in which the library
+was built.
 
 ### Added
 - 5G NR TS 38.212 transport-block chain: CRC (24A/B/C, 16/11/6), code-block
