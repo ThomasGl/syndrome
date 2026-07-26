@@ -7,8 +7,7 @@ license = "MIT"
 description = "Multi-standard Forward Error Correction in safe Rust: 5G NR TS 38.212 (QC-LDPC LOMS), Wi-Fi 6/7, Reed-Solomon, Viterbi and Polar codes, with AVX2/NEON SIMD and lock-free pipelining."
 authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
 readme = "README.md"
-# NOTE: update `repository` if the GitHub slug differs when the remote is created.
-repository = "https://github.com/thomas-glezer/syndrome"
+repository = "https://github.com/ThomasGl/syndrome"
 keywords = ["fec", "ldpc", "5g", "reed-solomon", "simd"]
 # "no-std" deliberately NOT claimed: the crate currently requires std (threads,
 # Vec-based construction). Add the category if and when a real #![no_std] core
