@@ -48,11 +48,11 @@ Reading the table top-to-bottom is a history of coding theory: from hand-decodab
 FEC. Wi-Fi 7 (802.11be) reuses the 802.11ax LDPC codes and the K=7 BCC —
 i.e. the QC-LDPC and Viterbi rows above; [`wifi.rs`](src/wifi.rs) supplies
 its MCS 0–13 tables (up to 4096-QAM) and LDPC parameter selection, and
-[`wifi_ldpc_tables.rs`](src/wifi_ldpc_tables.rs) now carries the real
+[`wifi_ldpc_tables.rs`](src/wifi_ldpc_tables.rs) carries the real
 802.11 Annex R/F shift matrices for all 12 $(Z, R)$ combinations
 ($Z \in \{27, 54, 81\}$, $R \in \{1/2, 2/3, 3/4, 5/6\}$), cross-validated
 against the IEEE 802.11n-2009 standard text itself — so a full,
-unshortened, unpunctured 802.11 codeword now genuinely encodes and decodes
+unshortened, unpunctured 802.11 codeword genuinely encodes and decodes
 through the same LOMS kernel as 5G NR (`tests/wifi_ldpc_integration.rs`).
 Shortening and puncturing/rate-matching (the per-MCS coded-bit selection)
 are not implemented yet — see the `wifi`/`wifi_ldpc_tables` module docs. 6G
@@ -445,21 +445,23 @@ All numbers are produced by running the code on this machine (`bench/run_all.sh`
 
 ### 5.0 Cross-algorithm comparison — all nine cores, one metric
 
-Uniform metric: **information-bit throughput** (payload bits per second — parity overhead not counted), single thread, x86-64 with AVX2. The *before* column is the original scalar implementation; *after* is the current SIMD/table-optimized code (every decoder was vectorized or table-accelerated in a dedicated optimization pass, each proven output-equivalent to its scalar reference by seeded randomized tests).
+Uniform metric: **information-bit throughput** (payload bits per second — parity overhead not counted), single thread, x86-64 with AVX2.
 
-| Algorithm | Configuration | Encode | Decode (before → after) | How the decode was accelerated |
+| Algorithm | Configuration | Encode | Decode | Decoder implementation |
 |---|---|---|---|---|
-| Reed-Solomon | RS(10,4), 4 KiB shards | **82 Gbit/s** | 972 Mbit/s → **63.8 Gbit/s** (66×) | Removed 8 192 hidden per-call heap allocations; routed reconstruction through the same AVX2 VPSHUFB kernel as encode |
-| CRC-24A | 6144-bit block | 1.05 → **3.95 Gbit/s** (3.8×) | — (detection) | Bit-serial LFSR → 256-entry byte table (nibble table for CRC-6) |
-| Golay | (24,12), syndrome table | 1.86 Gbit/s | 654 Mbit/s | Already O(1) table decode by design |
-| Hamming | (7,4), table | 2.59 Gbit/s | 1.54 Gbit/s | Already table lookups |
-| BCH | (255,223,t=4) | 551 Mbit/s → **1.17 Gbit/s** (2.1×) | 64 → **209 Mbit/s** (3.3×) | Weight-proportional syndrome tables + per-β Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
-| Viterbi | K=7, R=1/2, soft | 557 Mbit/s | 5.1 → **29.9 Mbit/s** (5.9×) | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
-| Polar | (1024,512), SC | 133 Mbit/s | 5.9 → **35.0 Mbit/s** (6.0×) | Killed ~3 000 recursion allocations; partial sums O(N log²N) → O(N log N) via GF(2) linearity; branch-free f/g kernels |
-| Turbo | LTE K=1024, 8 iter | 328 Mbit/s | 3.1 → **13.4 Mbit/s** (4.3×) | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact ±1 arithmetic, no FMA) |
-| QC-LDPC | BG1 Z=384, 10 iter | 3.0 Mbit/s → **1.66 Gbit/s** (≈550×) | 11.6 Mbit/s | Encode: dense generator multiply replaced by the standard sparse double-diagonal solve, derived programmatically from the 3GPP tables; decode already AVX2/NEON (§5.2) |
+| Reed-Solomon | RS(10,4), 4 KiB shards | **82 Gbit/s** | **63.8 Gbit/s** | Reconstruction runs through the same AVX2 VPSHUFB kernel as encode; allocation-free per call |
+| CRC-24A | 6144-bit block | **3.95 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
+| Golay | (24,12), syndrome table | 1.86 Gbit/s | 654 Mbit/s | $O(1)$ syndrome-table lookup |
+| Hamming | (7,4), table | 2.59 Gbit/s | 1.54 Gbit/s | Table lookup |
+| BCH | (255,223,t=4) | **1.17 Gbit/s** | **209 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
+| Viterbi | K=7, R=1/2, soft | 557 Mbit/s | **29.9 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
+| Polar | (1024,512), SC | 133 Mbit/s | **35.0 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
+| Turbo | LTE K=1024, 8 iter | 328 Mbit/s | **13.4 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
+| QC-LDPC | BG1 Z=384, 10 iter | **1.66 Gbit/s** | 11.6 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
 
-The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3). Every optimization above kept the scalar implementation as a tested reference: SIMD paths are runtime-detected and proven equivalent, never assumed.
+The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3).
+
+Every SIMD path keeps its scalar implementation as a tested reference, and the two are proven output-equivalent by seeded randomized round-trips rather than assumed equivalent. §5.2 measures that scalar path against the vectorized one on the same input, so the speed-up attributable to SIMD is reproducible on your own machine.
 
 Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algos.json` → `python bench/dashboard/gen_charts.py`.
 
