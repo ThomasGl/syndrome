@@ -19,8 +19,9 @@ This file defines the technical constraints, software paradigms, style guideline
 3. Multi-Architecture SIMD
 
 - Algorithm Target: Implement the Layered Offset Min-Sum (LOMS) algorithm for 5G NR QC-LDPC decoding with exact 3GPP lifting parameter structures.
-- Portable SIMD: Leverage `core::simd` / `portable-simd` where stable, and provide fallback scalar implementations for non-vectorized targets.
-- Architecture Layers: Support bare-metal ARM Cortex-M `no_std`, aarch64 Neon, and x86_64 AVX2/AVX-512 paths without changing the algorithm semantics.
+- Portable SIMD: Do NOT use `core::simd` / `portable-simd`. It requires nightly Rust and this crate builds on stable, so reaching for it produces code that does not compile for users. SIMD is hand-written `core::arch` intrinsics (`core::arch::x86_64`, `core::arch::aarch64`), and every vectorized path keeps a tested scalar fallback it is proven equivalent to by seeded randomized tests. Revisit only if portable-simd stabilizes.
+- Architecture Layers (current): x86_64 AVX2, selected at runtime via `is_x86_feature_detected!`; aarch64 NEON, gated on `#[cfg(target_arch = "aarch64")]`; and the scalar reference everywhere else. Adding a layer must not change algorithm semantics.
+- Architecture Layers (future targets, not implemented): bare-metal ARM Cortex-M `no_std` and x86_64 AVX-512. Neither exists in the crate today. Do not declare a Cargo feature, a module, or a documentation claim for either until it gates real, tested code — an advertised switch that gates nothing is a defect, and removing one after publication is a breaking change.
 
 4. Lock-Free Synchronization Queueing
 
