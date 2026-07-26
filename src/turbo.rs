@@ -1040,28 +1040,40 @@ mod avx2_kernel {
 
     const TABLES: Tables = build_tables();
 
+    // The three helpers below call `core::arch` intrinsics from inside an
+    // `unsafe fn`. Rust 1.87 made those intrinsics safe to call once the
+    // required target feature is statically enabled, but our MSRV is 1.85
+    // (see `rust-version` in Cargo.toml), where omitting the `unsafe` block
+    // warns under edition 2024's `unsafe_op_in_unsafe_fn`. The block is
+    // therefore mandatory on the minimum toolchain and merely redundant on
+    // current stable, so `unused_unsafe` is allowed to keep both warning-free.
+    #[allow(unused_unsafe)]
     #[target_feature(enable = "avx2")]
     unsafe fn load_idx(t: &[i32; 8]) -> __m256i {
-        _mm256_setr_epi32(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7])
+        unsafe { _mm256_setr_epi32(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]) }
     }
 
+    #[allow(unused_unsafe)]
     #[target_feature(enable = "avx2")]
     unsafe fn load_signs(t: &[f32; 8]) -> __m256 {
-        _mm256_setr_ps(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7])
+        unsafe { _mm256_setr_ps(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]) }
     }
 
     /// Horizontal max of the 8 lanes of `v`. Order-independent (max is
     /// associative/commutative for the non-NaN finite values used here), so
     /// this yields the exact same value as the scalar kernel's sequential
     /// `>`-comparison reduction over the same 8 numbers.
+    #[allow(unused_unsafe)]
     #[target_feature(enable = "avx2")]
     unsafe fn hmax(v: __m256) -> f32 {
-        let hi = _mm256_extractf128_ps(v, 1);
-        let lo = _mm256_castps256_ps128(v);
-        let m1 = _mm_max_ps(hi, lo);
-        let m2 = _mm_max_ps(m1, _mm_movehl_ps(m1, m1));
-        let m3 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
-        _mm_cvtss_f32(m3)
+        unsafe {
+            let hi = _mm256_extractf128_ps(v, 1);
+            let lo = _mm256_castps256_ps128(v);
+            let m1 = _mm_max_ps(hi, lo);
+            let m2 = _mm_max_ps(m1, _mm_movehl_ps(m1, m1));
+            let m3 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+            _mm_cvtss_f32(m3)
+        }
     }
 
     /// Subtract the row max from all 8 lanes of `row` (AVX2 counterpart of

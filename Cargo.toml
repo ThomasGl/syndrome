@@ -11,9 +11,28 @@ readme = "README.md"
 repository = "https://github.com/thomas-glezer/syndrome"
 keywords = ["fec", "ldpc", "5g", "reed-solomon", "simd"]
 # "no-std" deliberately NOT claimed: the crate currently requires std (threads,
-# Vec-based construction). Re-add the category once the cortex-m feature
-# actually gates a #![no_std] core build.
+# Vec-based construction). Add the category if and when a real #![no_std] core
+# build exists.
 categories = ["algorithms", "encoding"]
+
+# The published tarball is the library, its examples, and its tests. The
+# development apparatus stays in the git repository.
+#
+# `src/bin/` matters most here: those six benchmark exporters are auto-discovered
+# as binary targets, so publishing them would make `cargo install syndrome` drop
+# `rs_bench`, `ber_sim`, `bench_export`, ... into the user's ~/.cargo/bin under
+# names generic enough to collide with other crates. Only the `syndrome` demo
+# binary (src/main.rs) should be installable. `bench/` goes with them because
+# `bench/run_all.sh` drives those exporters — shipping one without the other
+# would leave a harness that cannot run.
+exclude = [
+    "src/bin/",
+    "bench/",
+    "tools/",
+    ".github/",
+    "proptest-regressions/",
+    "CLAUDE.md",
+]
 
 [dependencies]
 core_affinity = { version = "0.6", optional = true }
@@ -23,15 +42,21 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_json = "1.0"
 
 [features]
-# enable architecture-specific SIMD optimizations
-simd_avx2 = []
-simd_neon = []
-# convenience umbrella feature to enable any SIMD backend
-simd = ["simd_avx2", "simd_neon"]
-# enable thread-affinity helpers (depends on core_affinity)
+# Enable thread-affinity helpers. This is the crate's only feature: it is the
+# only one that gates real code (`#[cfg(feature = "affinity")]` in src/affinity.rs),
+# and it exists because it pulls an optional dependency.
+#
+# There are deliberately NO `simd`/`simd_avx2`/`simd_neon` features. SIMD is not
+# opt-in: the AVX2 kernels dispatch at runtime via `is_x86_feature_detected!` and
+# the NEON kernels are gated on `#[cfg(target_arch = "aarch64")]`, so both are
+# always available wherever the hardware supports them. Earlier versions declared
+# those flags plus `simd_avx512` and `cortex-m`; none of them gated a single line
+# of code, so enabling them did nothing while implying a choice that did not exist.
+# Removing a feature is a breaking change once published, so they are gone before
+# 0.1.0 rather than after. If a genuine compile-time SIMD or `#![no_std]` switch is
+# added later, introducing a feature for it is backward-compatible.
 affinity = ["core_affinity"]
-# enable no_std Cortex-M compatible builds (requires additional setup)
-cortex-m = []
+
 [dev-dependencies]
 proptest = "1.4"
 once_cell = "1.20"
@@ -42,8 +67,10 @@ name = "fec_bench"
 harness = false
 
 # Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`. Only three
-# lints are allowed, each for a concrete reason; everything else is fixed in the
-# source rather than suppressed.
+# clippy lints are allowed, each for a concrete reason; everything else is fixed
+# in the source rather than suppressed. (One rustc lint is also allowed, scoped
+# to three functions in src/turbo.rs — see the comment there; it resolves a
+# conflict between our MSRV and current stable that no single spelling satisfies.)
 [lints.clippy]
 # Performance-intentional. CLAUDE.md mandates index-based, branch-free hot loops
 # (SoA + SIMD friendliness) in the LDPC/RS/Viterbi kernels. Rewriting these into

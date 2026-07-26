@@ -142,8 +142,10 @@ Concurrency:
 
 **Aspirational / deferred — not implemented:**
 - i8 (rather than f32) LOMS decode path, and an AVX2 8-bit kernel over it
-- `#![no_std]` Cortex-M build (the `cortex-m` feature exists but does not yet
-  gate a real no-std core)
+- `#![no_std]` Cortex-M build. The crate requires `std` today (threads,
+  `Vec`-based construction). A `cortex-m` feature flag used to be declared for
+  this, but it gated no code at all, so it was removed rather than left as an
+  advertised switch that did nothing.
 - `core::simd` portable-SIMD path — tried once, required nightly, and was
   never exercised by any call site; removed rather than left half-built
 - AVX-512 kernels — no AVX-512 code exists in this crate; do not infer support

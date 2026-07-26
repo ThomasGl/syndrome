@@ -91,6 +91,8 @@ jobs:
   # `simd` feature once silently pulled in a nightly-only `portable_simd`
   # path that no default-feature job ever compiled, so the advertised
   # feature was broken on stable without CI noticing. Check each in turn.
+  # (`affinity` is now the crate's only feature — see [features] in Cargo.toml
+  # for why the inert SIMD/cortex-m flags were removed.)
   features:
     name: Feature Matrix
     runs-on: ubuntu-latest
@@ -98,11 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         feature:
-          - simd
-          - simd_avx2
-          - simd_neon
           - affinity
-          - cortex-m
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +112,9 @@ jobs:
 
       - name: Check --no-default-features
         run: cargo check --no-default-features
+
+      - name: Check --all-features
+        run: cargo check --all-targets --all-features
 
   fmt:
     name: Rustfmt
@@ -150,10 +151,24 @@ jobs:
             ${{ runner.os }}-msrv-
 
       # Build the library and binaries only; dev-dependencies (criterion,
-      # hotpath, ...) may track a newer toolchain and are not part of the
+      # proptest, ...) may track a newer toolchain and are not part of the
       # public MSRV contract.
+      #
+      # `+1.85.0` is load-bearing. rust-toolchain.toml pins `channel = "stable"`,
+      # and a toolchain file outranks the `rustup default` that the setup action
+      # sets — so a bare `cargo build` here silently compiled with stable and
+      # this job proved nothing about the declared MSRV. An explicit `+toolchain`
+      # is the only override with higher precedence than the file.
+      # The MSRV contract is "builds cleanly", not merely "compiles", so the
+      # build output is failed on any warning rather than only on a nonzero exit.
       - name: Build on MSRV
-        run: cargo build --release
+        run: |
+          set -o pipefail
+          cargo +1.85.0 build --release 2>&1 | tee msrv-build.log
+          if grep -q '^warning' msrv-build.log; then
+            echo "::error::MSRV build emitted warnings (see log above)"
+            exit 1
+          fi
 
   audit:
     name: Security Audit
