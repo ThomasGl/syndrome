@@ -99,9 +99,8 @@ Think of it like a smarter parity bit: a 5G base station transmits 26,000-bit bl
 7. [Design Notes](#7-design-notes)
 8. [Real-World Applications](#8-real-world-applications)
 9. [References](#9-references)
-10. [Learning Path](#10-learning-path)
-11. [Similar Projects](#11-similar-projects)
-12. [Topics & Keywords](#12-topics--keywords)
+10. [Similar Projects](#10-similar-projects)
+11. [Topics & Keywords](#11-topics--keywords)
 
 ---
 
@@ -771,23 +770,11 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 [19] 3GPP, "E-UTRA; Multiplexing and channel coding," TS 36.212 (LTE Turbo coding, QPP interleaver Table 5.1.3-3).
 
-[20] S. Lin and D. J. Costello, *Error Control Coding*, 2nd ed., Prentice Hall, 2004 — the standard textbook covering Hamming, Golay, BCH, RS, convolutional/Viterbi, and Turbo codes as taught in this library's learning path.
+[20] S. Lin and D. J. Costello, *Error Control Coding*, 2nd ed., Prentice Hall, 2004 — the standard textbook covering Hamming, Golay, BCH, RS, convolutional/Viterbi, and Turbo codes, and the text whose chapter order this library roughly follows.
 
 ---
 
-## 10. Learning Path
-
-A full self-study route — a textbook-chapter map for every module, a 3-month
-roadmap, and a table connecting an EEE communications course to this codebase —
-lives in **[LEARNING_PATH.md](LEARNING_PATH.md)**.
-
-If you only do one thing: run `cargo run --example 01_hamming_first_steps`, then
-work down the examples ladder in [§2](#2-quickstart). By example 06 you will have
-watched a full 5G NR chain survive a noisy channel.
-
----
-
-## 11. Similar Projects
+## 10. Similar Projects
 
 | Project | Language | Domain | Notes |
 |---|---|---|---|
@@ -799,7 +786,7 @@ watched a full 5G NR chain survive a noisy channel.
 
 ---
 
-## 12. Topics & Keywords
+## 11. Topics & Keywords
 
 A term index of what this library covers, for search and discovery.
 

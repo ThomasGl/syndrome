@@ -13,6 +13,10 @@ Thumbs.db
 # Claude Code session state
 /.claude/
 
+# Local working notes (study guide, scratch write-ups) — not part of the
+# published library or its documentation.
+/notes/
+
 # Large 3GPP spec source archive (downloaded reference, not redistributed)
 /38212-gf0.zip
 
