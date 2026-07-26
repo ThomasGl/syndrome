@@ -41,3 +41,21 @@ This file defines the technical constraints, software paradigms, style guideline
 - Add new modules incrementally with tests and example usage.
 - Update `README.md` and architecture documentation when new components or targets are introduced.
 - Keep `Cargo.toml` lightweight and avoid adding dependencies unless the target architecture or queue abstraction strictly requires them.
+
+7. Public Documentation Voice (Non-Negotiable)
+
+Everything the library ships — `README.md`, `CHANGELOG.md`, `system_architecture.md`, and rustdoc — describes what the library does now, for a reader who has never seen it before. The governing distinction:
+
+- **A statement about a past state of this codebase is a liability. A statement about its current state, including its gaps, is an asset.** These look similar and must be treated as opposites.
+
+- Document the present, not the path taken to it. No "before → after" columns, no speed-up multipliers measured against code that was deleted, no "previously X only did Y", no "now carries", no "every panic it originally discovered is now fixed". A reader has no prior version to compare against, so a relative statement carries no information for them — it only advertises defects in code nobody ever ran.
+
+- Never delete a limitation to make the library look more complete. Statements of present scope are load-bearing and stay: that Wi-Fi shortening and puncturing are not implemented, that no AVX-512 code exists in this crate, the deferred list in `system_architecture.md`. A reviewer who finds an undocumented gap concludes the author did not know it was there; one who finds it documented concludes the author scoped deliberately. These statements are what make every other claim in the documentation credible, and removing them costs more than the gap they admit.
+
+- Every published number must be reproducible by running the current tree (`bench/run_all.sh`, `algo_bench_export`). Never hand-write a benchmark figure. A comparison is legitimate only when both sides still exist and are tested — scalar versus SIMD, Rust versus the C++ port — never against a deleted earlier implementation, because nobody can re-run it.
+
+- A changelog is written for users, not for the author. At a version nobody could have installed there is nothing to have `Fixed`, `Changed` or `Performance`-improved; a first release gets a single `Added` list of what the library provides.
+
+- Working notes stay out of the published repository. `/notes/` is gitignored — self-study plans, progress reports, and personal roadmaps do not belong in a public library, and a document that reads as written *to* the author rather than *for* a reader belongs there.
+
+- **Commit history is exempt from this section.** Commit messages are the engineering record and should stay detailed and candid about what was fixed and why. This section governs the documentation the library ships, not git history.
