@@ -391,8 +391,8 @@ Reed-Solomon against CCSDS conventions, Hamming/Golay/BCH against published
 generator and parity-check matrices — so a refactor that silently changes the
 algorithm fails loudly even when every round-trip test still passes. The
 **robustness suite** drives every public API with adversarial byte streams and
-degenerate parameters; every panic it originally discovered is now fixed and
-kept as a regression test asserting a typed `FecError`. Six libFuzzer targets
+degenerate parameters, asserting that each one returns a typed `FecError`
+rather than panicking, whatever it is fed. Six libFuzzer targets
 in [`fuzz/`](fuzz/) extend the same idea to coverage-guided input generation.
 
 Highlights of what the tests actually *prove* (not just exercise):

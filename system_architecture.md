@@ -55,10 +55,10 @@ syndrome targets different vectorization pathways per platform tier:
 | SBC gateway (Raspberry Pi 4/5) | ARM Cortex-A (aarch64) | NEON via `core::arch::aarch64` intrinsics | Thread affinity pinned to performance cores |
 | Desktop / cloud RAN (AMD, Intel) | x86_64 | AVX2 via `core::arch::x86_64` intrinsics, runtime-detected | Ring-buffered, cache-line-padded queues |
 
-Both SIMD paths are hand-written intrinsics, not `core::simd` (portable-SIMD,
-which requires nightly Rust) — see [Current Implementation
-Status](#current-implementation-status) for why that path was tried and
-removed rather than shipped half-working.
+Both SIMD paths are hand-written intrinsics rather than `core::simd`, because
+portable-SIMD requires nightly Rust and this crate builds on stable. See
+[Current Implementation Status](#current-implementation-status) for the full
+list of what is implemented versus deferred.
 
 ### Memory layout for L1/L2 cache efficiency
 
@@ -142,12 +142,10 @@ Concurrency:
 
 **Aspirational / deferred — not implemented:**
 - i8 (rather than f32) LOMS decode path, and an AVX2 8-bit kernel over it
-- `#![no_std]` Cortex-M build. The crate requires `std` today (threads,
-  `Vec`-based construction). A `cortex-m` feature flag used to be declared for
-  this, but it gated no code at all, so it was removed rather than left as an
-  advertised switch that did nothing.
-- `core::simd` portable-SIMD path — tried once, required nightly, and was
-  never exercised by any call site; removed rather than left half-built
+- `#![no_std]` Cortex-M build — the crate requires `std` today (threads,
+  `Vec`-based construction), and declares no feature flag implying otherwise
+- `core::simd` portable-SIMD path — it requires nightly Rust, so the SIMD
+  kernels here are hand-written `core::arch` intrinsics instead
 - AVX-512 kernels — no AVX-512 code exists in this crate; do not infer support
   from the AFF3CT comparison in the README's "Similar Projects" table, which
   describes AFF3CT, not this library
