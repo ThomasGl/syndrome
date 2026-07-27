@@ -1,6 +1,6 @@
 [package]
 name = "syndrome"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -32,6 +32,14 @@ exclude = [
     "proptest-regressions/",
     "CLAUDE.md",
 ]
+
+# rustdoc renders `$...$` in doc comments as literal text — it has no math
+# support of its own. `katex-header.html` loads KaTeX so the LaTeX that CLAUDE.md
+# mandates throughout the API docs actually typesets on docs.rs. To get the same
+# locally: RUSTDOCFLAGS="--html-in-header katex-header.html" cargo doc --open
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "katex-header.html"]
+all-features = true
 
 [dependencies]
 core_affinity = { version = "0.6", optional = true }

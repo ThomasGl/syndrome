@@ -1,0 +1,48 @@
+<!--
+  Math rendering for rustdoc.
+
+  rustdoc has no built-in LaTeX support: `$...$` in a doc comment is emitted as
+  literal text. This header is injected via `--html-in-header` (see
+  [package.metadata.docs.rs] in Cargo.toml) so KaTeX typesets the math client-side
+  after the page loads.
+
+  Subresource-integrity hashes are the real SHA-384 digests of KaTeX 0.18.1 on
+  jsDelivr; if the version is bumped, recompute them rather than dropping the
+  attribute:
+
+      curl -sL https://cdn.jsdelivr.net/npm/katex@<ver>/dist/katex.min.js \
+        | openssl dgst -sha384 -binary | openssl base64 -A
+
+  auto-render skips `pre` and `code` by default, so `$` inside code blocks and
+  shell examples is left alone.
+-->
+<link
+  rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css"
+  integrity="sha384-1vdNCNel6Tx/NQa8IR1mGOGKsbGreCkOPfbtPPnUURJ5Tu2PRVfQ/7KLZC+Pi1p1"
+  crossorigin="anonymous">
+
+<script
+  defer
+  src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.js"
+  integrity="sha384-ycJ6GAwiS15LoUPipwJOrWTvkUHl/YqELValBwI5I4awP1EeEQJYarj+w85ntcz7"
+  crossorigin="anonymous"></script>
+
+<script
+  defer
+  src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/contrib/auto-render.min.js"
+  integrity="sha384-bjyGPfbij8/NDKJhSGZNP/khQVgtHUE5exjm4Ydllo42FwIgYsdLO2lXGmRBf5Mz"
+  crossorigin="anonymous"></script>
+
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    renderMathInElement(document.body, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "$", right: "$", display: false },
+      ],
+      // Do not abort the whole page because one expression is malformed.
+      throwOnError: false,
+    });
+  });
+</script>
