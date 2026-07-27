@@ -18,14 +18,14 @@
 //! For each layer (check-node row) with connected variables $v \in
 //! \mathcal{N}(c)$, standard offset min-sum computes, per edge:
 //!
-//! $$ Q_{v \to c} = \mathrm{LLR}_v - R_{c \to v}^{\text{(previous)}} $$
+//! $$ Q\_{v \to c} = \mathrm{LLR}\_v - R\_{c \to v}^{\text{(previous)}} $$
 //!
 //! $$ R_{c \to v} = \left(\prod_{v' \in \mathcal{N}(c) \setminus v}
 //! \operatorname{sign}(Q_{v' \to c})\right) \cdot \max\!\left(
 //! \min_{v' \in \mathcal{N}(c) \setminus v} \lvert Q_{v' \to c} \rvert -
 //! \beta,\; 0 \right) $$
 //!
-//! $$ \mathrm{LLR}_v \mathrel{+}= R_{c \to v}^{\text{(new)}} - R_{c \to
+//! $$ \mathrm{LLR}\_v \mathrel{+}= R\_{c \to v}^{\text{(new)}} - R\_{c \to
 //! v}^{\text{(previous)}} $$
 //!
 //! where $\beta$ is `offset_beta` — a small positive correction that

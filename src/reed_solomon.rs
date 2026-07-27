@@ -32,7 +32,7 @@
 //!
 //! # GF(256) arithmetic (why log/exp tables multiply correctly)
 //!
-//! `GF(256)` is the field of polynomials over $\mathbb{F}_2$ modulo an
+//! `GF(256)` is the field of polynomials over $\mathbb{F}\_2$ modulo an
 //! irreducible degree-8 polynomial (here the standard primitive
 //! `0x11D` = $x^8 + x^4 + x^3 + x^2 + 1$). Addition is bitwise XOR (no
 //! carries). The nonzero elements form a cyclic group of order 255 under
@@ -68,8 +68,8 @@
 //! indexed by a subset of powers of $\alpha$, columns by a subset of
 //! exponents). The key lemma:
 //!
-//! $$\det V = \det\!\left[\alpha^{i_r \cdot j_c}\right]_{r,c=1}^{e} =
-//! \prod_{r < r'} \left(\alpha^{i_{r'}} - \alpha^{i_r}\right) \cdot
+//! $$\det V = \det\!\left[\alpha^{i_r \cdot j_c}\right]\_{r,c=1}^{e} =
+//! \prod\_{r < r'} \left(\alpha^{i_{r'}} - \alpha^{i_r}\right) \cdot
 //! (\text{unit factor}) \neq 0 \iff \alpha^{i_1}, \dots, \alpha^{i_e}
 //! \text{ are pairwise distinct}$$
 //!

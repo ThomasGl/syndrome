@@ -25,8 +25,8 @@
 //!
 //! In general $C$ does **not** divide $B'$ evenly. The literal 3GPP text
 //! handles this by splitting the $C$ code blocks into two groups: $C_+ =
-//! B' \bmod C$ blocks of size $K'_+ = \lceil B'/C \rceil$ and the remaining
-//! $C - C_+$ blocks of size $K'_- = \lfloor B'/C \rfloor$, so that the sizes
+//! B' \bmod C$ blocks of size $K'\_+ = \lceil B'/C \rceil$ and the remaining
+//! $C - C\_+$ blocks of size $K'\_- = \lfloor B'/C \rfloor$, so that the sizes
 //! sum to exactly $B'$.
 //!
 //! This module deliberately uses a **simpler, documented approximation**:

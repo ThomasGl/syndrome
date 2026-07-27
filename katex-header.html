@@ -1,21 +1,6 @@
-<!--
-  Math rendering for rustdoc.
-
-  rustdoc has no built-in LaTeX support: `$...$` in a doc comment is emitted as
-  literal text. This header is injected via `--html-in-header` (see
-  [package.metadata.docs.rs] in Cargo.toml) so KaTeX typesets the math client-side
-  after the page loads.
-
-  Subresource-integrity hashes are the real SHA-384 digests of KaTeX 0.18.1 on
-  jsDelivr; if the version is bumped, recompute them rather than dropping the
-  attribute:
-
-      curl -sL https://cdn.jsdelivr.net/npm/katex@<ver>/dist/katex.min.js \
-        | openssl dgst -sha384 -binary | openssl base64 -A
-
-  auto-render skips `pre` and `code` by default, so `$` inside code blocks and
-  shell examples is left alone.
--->
+<!-- KaTeX for rustdoc math. Rationale and the SRI-recompute command are in
+     Cargo.toml under [package.metadata.docs.rs]; this file is copied verbatim
+     into the <head> of every generated page, so it is kept short. -->
 <link
   rel="stylesheet"
   href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css"

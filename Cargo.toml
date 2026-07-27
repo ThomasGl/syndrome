@@ -35,8 +35,17 @@ exclude = [
 
 # rustdoc renders `$...$` in doc comments as literal text — it has no math
 # support of its own. `katex-header.html` loads KaTeX so the LaTeX that CLAUDE.md
-# mandates throughout the API docs actually typesets on docs.rs. To get the same
-# locally: RUSTDOCFLAGS="--html-in-header katex-header.html" cargo doc --open
+# mandates throughout the API docs actually typesets on docs.rs.
+#
+# Preview locally exactly as docs.rs will build it:
+#   RUSTDOCFLAGS="--html-in-header katex-header.html" cargo doc --no-deps --all-features
+#   python3 -m http.server 8000 --directory target/doc
+#   # then open http://localhost:8000/syndrome/index.html
+#
+# The header pins KaTeX with subresource-integrity hashes. On a version bump,
+# recompute them rather than dropping the attribute:
+#   curl -sL https://cdn.jsdelivr.net/npm/katex@<ver>/dist/katex.min.js \
+#     | openssl dgst -sha384 -binary | openssl base64 -A
 [package.metadata.docs.rs]
 rustdoc-args = ["--html-in-header", "katex-header.html"]
 all-features = true
