@@ -774,6 +774,13 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 [20] S. Lin and D. J. Costello, *Error Control Coding*, 2nd ed., Prentice Hall, 2004 — the standard textbook covering Hamming, Golay, BCH, RS, convolutional/Viterbi, and Turbo codes, and the text whose chapter order this library roughly follows.
 
+### Video introductions
+
+- 3Blue1Brown, "But what are Hamming codes? The origin of error correction," YouTube — a visual derivation of the code implemented in `src/hamming.rs`. https://www.youtube.com/watch?v=X8jsijhllIA
+- 3Blue1Brown, "Hamming codes part 2: The one-line implementation," YouTube — the matrix-multiplication view of the same encoder/decoder. https://www.youtube.com/watch?v=b3NxrZOu_CE
+- Veritasium, "The Most Underrated Algorithm," YouTube — the history of the Fast Fourier Transform, the frequency-domain step that feeds the OFDM receive chain described in §8. https://www.youtube.com/watch?v=nmgFG7PUHfo
+- Computerphile, "Reed Solomon Encoding," YouTube — an intuitive walkthrough of the algorithm implemented in `src/reed_solomon.rs`. https://www.youtube.com/watch?v=fBRMaEAFLE0
+
 ---
 
 ## 10. Similar Projects
