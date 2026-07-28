@@ -57,6 +57,45 @@ The dashboard (`bench/dashboard/`) uses [Highcharts](https://www.highcharts.com/
 forking this project for **commercial** use must obtain a separate Highcharts license or replace
 the charting library (e.g., with Apache-licensed ECharts).
 
+## LDPC convergence GIF
+
+The animated GIF at the top of `README.md` is generated entirely from real
+decoder output — no hand-authored error pattern or convergence curve.
+
+```bash
+# From repo root:
+cargo run --release --bin ldpc_convergence_export
+python3 bench/dashboard/gen_convergence_gif.py
+```
+
+1. `cargo run --release --bin ldpc_convergence_export` encodes a real 802.11
+   Wi-Fi LDPC codeword (`Z=27`, rate 1/2, `N=648`, via
+   [`wifi_ldpc_tables::wifi_ldpc_encoder`](../src/wifi_ldpc_tables.rs)),
+   transmits it through a simulated BPSK/AWGN channel
+   ([`channel_sim::AwgnChannel`](../src/channel_sim.rs)), and decodes it with
+   [`QcLdpcDecoder::decode_layered_offset_min_sum_traced`](../src/qc_ldpc.rs)
+   — a small library addition that runs the *exact same* layered offset
+   min-sum kernel as the production decode path, but also invokes a
+   per-iteration observer closure so the hard-decision bits can be snapshotted
+   after every completed pass, from one continuous decode call (calling the
+   untraced decoder once per iteration count would reset its extrinsic
+   message buffer each time and not reproduce the real trajectory). The
+   program searches a small grid of `(Eb/N0, seed)` combinations for one real
+   trial whose initial corruption and iteration count make a legible
+   animation, then writes the full per-iteration trace to
+   `bench/results/ldpc_convergence.json`.
+2. `bench/dashboard/gen_convergence_gif.py` reads that JSON and renders it to
+   `bench/dashboard/exports/ldpc_convergence.gif` — a bit grid (correct vs.
+   wrong, colored) beside a bit-error-count-vs-iteration line, one frame per
+   real decode iteration recorded in the JSON. The only liberty taken past
+   the raw numbers is holding the final (zero-error) frame for a couple of
+   extra, identical repeats so the GIF loop reads clearly.
+
+| File | Contents |
+|------|----------|
+| `bench/results/ldpc_convergence.json` | Per-iteration hard-decision trace from one real encode→AWGN→LOMS-decode cycle |
+| `bench/dashboard/exports/ldpc_convergence.gif` | Rendered animation embedded in `README.md` |
+
 ## Output files
 
 | File | Contents |

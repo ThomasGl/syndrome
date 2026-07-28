@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `QcLdpcDecoder::decode_layered_offset_min_sum_traced` — the same layered
+  offset min-sum decode, with a callback invoked once per completed layered
+  pass so a caller can record a real per-iteration convergence trace from a
+  single continuous run. Re-invoking the untraced decoder once per iteration
+  count cannot reproduce the trajectory, because the extrinsic message buffer
+  is reset at the start of every call. The callback is a monomorphized
+  generic, so the untraced entry point compiles to the same code as before.
+
 ## [0.1.1] — 2026-07-26
 
 ### Fixed

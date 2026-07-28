@@ -666,6 +666,21 @@ impl QcLdpcDecoder {
     /// On success returns the number of iterations actually performed.  When
     /// the syndrome check passes before `iterations` complete, the loop exits
     /// early and the returned count will be less than `iterations`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
+    /// let n = dec.variable_node_count();
+    /// let mut llr = vec![5.0f32; n];
+    /// let mut edge_r = vec![0.0f32; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0.0f32; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// dec.decode_layered_offset_min_sum(&mut llr, &mut edge_r, &mut scratch, &mut hard, 5)
+    ///     .unwrap();
+    /// ```
     pub fn decode_layered_offset_min_sum(
         &self,
         llr: &mut [f32],
@@ -674,6 +689,69 @@ impl QcLdpcDecoder {
         hard_output: &mut [u8],
         iterations: usize,
     ) -> Result<usize, FecError> {
+        self.decode_layered_offset_min_sum_traced(
+            llr,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            |_iteration, _llr| {},
+        )
+    }
+
+    /// Identical algorithm and numerics to
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`], with one addition:
+    /// `on_iteration` is invoked once per completed layered pass — after every
+    /// layer in that pass has updated `llr` and `edge_r`, but before the
+    /// early-exit syndrome check — with the 1-based iteration index and the
+    /// current a-posteriori LLR buffer.
+    ///
+    /// This exists so a caller can record a genuine per-iteration convergence
+    /// trace (e.g. hard-decision snapshots for a diagnostic or visualization
+    /// tool) from a single continuous decode run, instead of re-invoking the
+    /// decoder once per iteration count — which would reset the extrinsic
+    /// message buffer (`edge_r`) at the top of every call and therefore not
+    /// reproduce the real iterative trajectory.
+    ///
+    /// `on_iteration` is called with a monomorphized generic, so passing a
+    /// no-op closure (as [`QcLdpcDecoder::decode_layered_offset_min_sum`]
+    /// does) compiles to the same code as if the callback were absent —
+    /// the hot path pays nothing when tracing is not requested.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`QcLdpcDecoder::decode_layered_offset_min_sum`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
+    /// let n = dec.variable_node_count();
+    /// let mut llr = vec![5.0f32; n];
+    /// let mut edge_r = vec![0.0f32; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0.0f32; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// let mut trace = Vec::new();
+    /// dec.decode_layered_offset_min_sum_traced(
+    ///     &mut llr, &mut edge_r, &mut scratch, &mut hard, 5,
+    ///     |iteration, llr| trace.push((iteration, llr.iter().filter(|&&v| v < 0.0).count())),
+    /// ).unwrap();
+    /// assert!(!trace.is_empty());
+    /// ```
+    pub fn decode_layered_offset_min_sum_traced<F>(
+        &self,
+        llr: &mut [f32],
+        edge_r: &mut [f32],
+        layer_scratch: &mut [f32],
+        hard_output: &mut [u8],
+        iterations: usize,
+        mut on_iteration: F,
+    ) -> Result<usize, FecError>
+    where
+        F: FnMut(usize, &[f32]),
+    {
         let n = self.variable_node_count();
         if llr.len() != n {
             return Err(FecError::InvalidParam(
@@ -872,6 +950,8 @@ impl QcLdpcDecoder {
                     }
                 } // end cfg(not(aarch64)) scalar fallback
             }
+
+            on_iteration(iters_used, llr);
 
             // Early termination: all parity checks satisfied → quit.
             if self.check_syndrome_f32(llr) {
