@@ -107,3 +107,23 @@ python3 bench/dashboard/gen_convergence_gif.py
 | `bench/results/rust.checksum` | Hex parity bytes for correctness gate |
 | `bench/results/cpp.checksum` | Same, from C++ |
 | `bench/results/python_same_algo.checksum` | Same, from Python |
+| `bench/results/ldpc_rust.json` | LDPC decode, Rust, AVX2 selected at runtime |
+| `bench/results/ldpc_cpp.json` | LDPC decode, C++ scalar `-O3 -march=native` |
+| `bench/results/ldpc_pipeline_rust.json` | SPSC pipeline frame rate — see the caveat below |
+
+### Caveat: `ldpc_pipeline_bench` does not measure decode throughput
+
+`src/bin/ldpc_pipeline_bench.rs` fills every frame's LLR buffer with the
+constant `+5.0`, which is an error-free codeword at high confidence. The
+syndrome check therefore passes on the first pass and the decoder returns after
+one iteration instead of ten. Its `melem_per_s` is nevertheless computed as
+`n_variable_nodes × 10 / ns_per_frame`, so the figure counts nine iterations of
+work that never ran and is roughly an order of magnitude above what the same
+frames would cost with real channel noise.
+
+The number is consequently not comparable to `ldpc_rust.json` and is not quoted
+in the README. What the binary does measure honestly is the ring-buffer and
+worker-handoff machinery — frames per second through the SPSC pipeline with a
+negligible payload. Making it a throughput benchmark means feeding
+AWGN-corrupted codewords (as `src/bin/ldpc_convergence_export.rs` does) and
+dividing by the iterations actually consumed.

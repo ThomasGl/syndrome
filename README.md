@@ -43,7 +43,7 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Tests** | 295 total on x86-64 (296 on AArch64, +1 NEON-only) — 161 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 75 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
-| **Benchmarks** | RS: ~82/64 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~119 Melem/s · all numbers from running code |
+| **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~204 Melem/s · all numbers from running code |
 
 ### The algorithm portfolio — one library, every generation
 
@@ -466,19 +466,19 @@ Uniform metric: **information-bit throughput** (payload bits per second — pari
 
 | Algorithm | Configuration | Encode | Decode | Decoder implementation |
 |---|---|---|---|---|
-| Reed-Solomon | RS(10,4), 4 KiB shards | **82 Gbit/s** | **63.8 Gbit/s** | Reconstruction runs through the same AVX2 VPSHUFB kernel as encode; allocation-free per call |
-| CRC-24A | 6144-bit block | **3.95 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
-| Golay | (24,12), syndrome table | 1.86 Gbit/s | 654 Mbit/s | $O(1)$ syndrome-table lookup |
-| Hamming | (7,4), table | 2.59 Gbit/s | 1.54 Gbit/s | Table lookup |
-| BCH | (255,223,t=4) | **1.17 Gbit/s** | **209 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
-| Viterbi | K=7, R=1/2, soft | 557 Mbit/s | **29.9 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
-| Polar | (1024,512), SC | 133 Mbit/s | **35.0 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
-| Turbo | LTE K=1024, 8 iter | 328 Mbit/s | **13.4 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
-| QC-LDPC | BG1 Z=384, 10 iter | **1.66 Gbit/s** | 11.6 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
+| Reed-Solomon | RS(10,4), 4 KiB shards | **89.0 Gbit/s** | **66.0 Gbit/s** | Reconstruction runs through the same AVX2 VPSHUFB kernel as encode; allocation-free per call |
+| CRC-24A | 6144-bit block | **3.71 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
+| Golay | (24,12), syndrome table | 1.82 Gbit/s | 625 Mbit/s | $O(1)$ syndrome-table lookup |
+| Hamming | (7,4), table | 2.46 Gbit/s | 1.09 Gbit/s | Table lookup |
+| BCH | (255,223,t=4) | **976 Mbit/s** | **243 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
+| Viterbi | K=7, R=1/2, soft | 545 Mbit/s | **29.2 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
+| Polar | (1024,512), SC | 123 Mbit/s | **37.2 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
+| Turbo | LTE K=1024, 8 iter | 313 Mbit/s | **11.6 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
+| QC-LDPC | BG1 Z=384, 10 iter | **1.55 Gbit/s** | 10.9 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
 
 The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3).
 
-Every SIMD path keeps its scalar implementation as a tested reference, and the two are proven output-equivalent by seeded randomized round-trips rather than assumed equivalent. §5.2 measures that scalar path against the vectorized one on the same input, so the speed-up attributable to SIMD is reproducible on your own machine.
+Every SIMD path keeps its scalar implementation as a tested reference, and the two are proven output-equivalent by seeded randomized round-trips rather than assumed equivalent. §5.2 puts the vectorized decoder next to the same algorithm compiled from C++, both measured in one run of `bench/run_all.sh`, so the comparison is reproducible on your own machine.
 
 Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algos.json` → `python bench/dashboard/gen_charts.py`.
 
@@ -490,11 +490,12 @@ Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algo
 
 | Implementation | 256 B | 1 KiB | 4 KiB | 16 KiB |
 |---|---|---|---|---|
-| **Rust `encode_with_avx2` (VPSHUFB)** | **~5 GiB/s** | **~10 GiB/s** | **~8.5 GiB/s** | **~10 GiB/s** |
-| Rust `encode_with_tables_chunked` | ~740 MiB/s | ~810 | ~770 | ~740 |
-| Rust `encode_into` | ~590 MiB/s | ~660 | ~690 | ~570 |
-| C++ same-algorithm `-O3 -march=native` | within ~5% of scalar Rust | | | |
-| Python same-algorithm | ~2.7 MiB/s | ~2.5 | ~2.4 | ~2.4 |
+| **Rust `encode_with_avx2` (VPSHUFB)** | **~7.4 GiB/s** | **~9.8 GiB/s** | **~10.7 GiB/s** | **~8.7 GiB/s** |
+| Rust `encode_with_tables_chunked` | ~729 MiB/s | ~762 | ~844 | ~776 |
+| Rust `encode_into` | ~613 MiB/s | ~618 | ~638 | ~585 |
+| C++ same-algorithm `-O3 -march=native` | ~588 MiB/s | ~594 | ~592 | ~594 |
+| Python same-algorithm | ~2.7 MiB/s | ~2.4 | ~2.3 | ~2.3 |
+| Python `reedsolo` library | ~2.1 MiB/s | ~2.3 | ~2.2 | ~2.2 |
 
 The AVX2 path uses VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, processing 32 bytes/cycle.  Rust and C++ produce **byte-identical parity output** (checksum-gated).
 
@@ -507,10 +508,18 @@ Metric: $N \times \text{iters} / t_{\text{call}}$ (variable-node-iterations/s).
 
 | Implementation | Throughput | Wall-clock / call |
 |---|---|---|
-| **Rust AVX2 (runtime-detected)** | **~119 Melem/s** | **~2.2 ms** |
-| Rust multi-worker (4 threads, AVX2) | ~108 Melem/s × workers | ~2.4 ms/frame |
-| Rust scalar | ~65 Melem/s | ~4.0 ms |
-| C++ scalar `-O3 -march=native` | ~66 Melem/s | ~3.9 ms |
+| **Rust, AVX2 selected at runtime** | **~204 Melem/s** | **~1.28 ms** |
+| C++ scalar `-O3 -march=native` | ~67 Melem/s | ~3.88 ms |
+
+Both rows come from the same run of `bench/run_all.sh`, decoding the same
+codeword for the same number of iterations, on the machine recorded in
+`bench/results/meta.json`. Rust's scalar path is not listed as a separate row
+because nothing in the tree currently benchmarks it in isolation — the decoder
+selects AVX2 through `is_x86_feature_detected!` and there is no entry point
+that forces the scalar kernel, so a scalar figure could not be reproduced by
+running this repository. The scalar implementation itself is still present and
+is proven output-equivalent to the SIMD kernels by seeded randomized tests;
+only its throughput is unmeasured.
 
 AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar path):
 1. **Loop inversion** — Z-inner loop (384 independent iterations) gives LLVM a vectorisable axis.

@@ -65,7 +65,7 @@ fn main() {
     println!("Melem/s        : {melem_per_s:.2}");
 
     let record = format!(
-        r#"  {{"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns:.1},"mib_per_s":0,"melem_per_s":{melem_per_s:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
+        r#"  {{"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns:.1},"mib_per_s":0,"melem_per_s":{melem_per_s:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
     );
 
     let json = format!("[\n{record}\n]\n");

@@ -5,7 +5,7 @@
   "n_variable_nodes": 26112,
   "n_iters": 10,
   "n_frames": 500,
-  "ns_per_frame": 2419587.99,
-  "frames_per_s": 413.2935045689328,
-  "melem_per_s": 107.91919991303973
+  "ns_per_frame": 69651.15,
+  "frames_per_s": 14357.26474006531,
+  "melem_per_s": 3748.9689689258544
 }

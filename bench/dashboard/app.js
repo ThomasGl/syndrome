@@ -145,7 +145,7 @@ function renderLdpc(ldpcRecords) {
   }
 
   const series = [{
-    name: "Rust loms_scalar",
+    name: "Rust loms (AVX2 at runtime)",
     color: LDPC_COLORS.rust,
     data: [byLang["rust"] ?? null],
   }, {
