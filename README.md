@@ -3,7 +3,7 @@
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-295%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-297%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -40,10 +40,10 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 295 total on x86-64 (296 on AArch64, +1 NEON-only) — 161 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 75 doctests |
+| **Tests** | 297 total on x86-64 (298 on AArch64, +1 NEON-only) — 162 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 76 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
-| **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~204 Melem/s · all numbers from running code |
+| **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~215 Melem/s · all numbers from running code |
 
 ### The algorithm portfolio — one library, every generation
 
@@ -390,7 +390,7 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (295 tests total on x86-64; 296 on AArch64)
+### 4.1 Component coverage (297 tests total on x86-64; 298 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
@@ -508,18 +508,22 @@ Metric: $N \times \text{iters} / t_{\text{call}}$ (variable-node-iterations/s).
 
 | Implementation | Throughput | Wall-clock / call |
 |---|---|---|
-| **Rust, AVX2 selected at runtime** | **~204 Melem/s** | **~1.28 ms** |
+| **Rust, AVX2 selected at runtime** | **~215 Melem/s** | **~1.22 ms** |
+| Rust, scalar kernel forced | ~66 Melem/s | ~3.95 ms |
 | C++ scalar `-O3 -march=native` | ~67 Melem/s | ~3.88 ms |
 
-Both rows come from the same run of `bench/run_all.sh`, decoding the same
+All three rows come from one run of `bench/run_all.sh`, decoding the same
 codeword for the same number of iterations, on the machine recorded in
-`bench/results/meta.json`. Rust's scalar path is not listed as a separate row
-because nothing in the tree currently benchmarks it in isolation — the decoder
-selects AVX2 through `is_x86_feature_detected!` and there is no entry point
-that forces the scalar kernel, so a scalar figure could not be reproduced by
-running this repository. The scalar implementation itself is still present and
-is proven output-equivalent to the SIMD kernels by seeded randomized tests;
-only its throughput is unmeasured.
+`bench/results/meta.json`. The two Rust rows differ only in which kernel is
+selected: [`decode_layered_offset_min_sum`](src/qc_ldpc.rs) probes the CPU at
+runtime, `decode_layered_offset_min_sum_scalar` forces the scalar fallback, and
+both enter the same implementation — so this measures vectorization, not two
+separate decoders. A unit test asserts the two produce identical hard-decision
+output and identical iteration counts on the same input, which is what makes
+the comparison meaningful rather than merely apples-to-apples-looking.
+
+Rust's scalar kernel lands within ~2% of the C++ scalar build of the same
+algorithm, and AVX2 buys ~3.3× over it.
 
 AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar path):
 1. **Loop inversion** — Z-inner loop (384 independent iterations) gives LLVM a vectorisable axis.

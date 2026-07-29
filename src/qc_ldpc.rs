@@ -460,6 +460,26 @@ pub struct QcLdpcDecoder {
     offset_beta: f32,
 }
 
+/// Selects which per-layer kernel [`QcLdpcDecoder::decode_layered_offset_min_sum_dispatch`]
+/// (the private implementation shared by every public decode entry point) is
+/// allowed to pick for a given call.
+///
+/// This is resolved to a plain `bool`/branch *once per call*, outside the
+/// iteration and layer loops — exactly like the existing `use_avx2` runtime
+/// probe — so forcing the scalar kernel costs nothing extra inside the hot
+/// path itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelChoice {
+    /// Pick the fastest kernel available on the host CPU at runtime: AVX2 on
+    /// x86_64 when `is_x86_feature_detected!("avx2")`, NEON on aarch64, or
+    /// the scalar fallback everywhere else.
+    Auto,
+    /// Always run the portable scalar kernel, regardless of what the host
+    /// CPU supports. Used by [`QcLdpcDecoder::decode_layered_offset_min_sum_scalar`]
+    /// to make the scalar path directly benchmarkable/testable on any machine.
+    Scalar,
+}
+
 impl QcLdpcDecoder {
     /// Create a decoder with the default lifting size for each base graph.
     ///
@@ -747,11 +767,126 @@ impl QcLdpcDecoder {
         layer_scratch: &mut [f32],
         hard_output: &mut [u8],
         iterations: usize,
+        on_iteration: F,
+    ) -> Result<usize, FecError>
+    where
+        F: FnMut(usize, &[f32]),
+    {
+        self.decode_layered_offset_min_sum_dispatch(
+            llr,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            KernelChoice::Auto,
+            on_iteration,
+        )
+    }
+
+    /// Identical algorithm and numerics to
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`], except the kernel
+    /// selection is forced to the pure scalar reference path on every
+    /// architecture — AVX2 (x86_64) and NEON (aarch64) are never selected,
+    /// even when the host CPU supports them.
+    ///
+    /// This exists so a caller (e.g. a benchmark harness) can measure the
+    /// scalar kernel's throughput in isolation. Without it, there is no way
+    /// to force the scalar path on a machine whose CPU supports AVX2/NEON,
+    /// since [`QcLdpcDecoder::decode_layered_offset_min_sum`] always probes
+    /// the host and prefers the vectorized kernel when available.
+    ///
+    /// Internally this shares the exact same layered-decode implementation as
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`] — only a private
+    /// kernel-selection flag differs, resolved once per call, outside the
+    /// hot iteration/layer loops — so there is only ever one copy of the
+    /// LOMS algorithm to maintain.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr`           - Channel LLR input; overwritten with a-posteriori values.
+    ///   Length must equal [`QcLdpcDecoder::variable_node_count`].
+    /// * `edge_r`        - Preallocated flat C→V extrinsic buffer.
+    ///   Minimum length: [`QcLdpcDecoder::required_edge_buffer`].
+    /// * `layer_scratch` - Per-layer V→C scratch buffer.
+    ///   Minimum length: [`QcLdpcDecoder::required_layer_buffer`].
+    /// * `hard_output`   - Bit-wise hard-decision output.
+    ///   Length must equal [`QcLdpcDecoder::variable_node_count`].
+    /// * `iterations`    - Number of full layered passes.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed (`Ok(iters_used)`).
+    /// `iters_used <= iterations`; it is smaller than `iterations` when the
+    /// syndrome check passes early.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`QcLdpcDecoder::decode_layered_offset_min_sum`]:
+    /// returns [`FecError::InvalidParam`] if `llr` or `hard_output` do not
+    /// have exactly length [`QcLdpcDecoder::variable_node_count`], or
+    /// [`FecError::BufferTooSmall`] if `edge_r` or `layer_scratch` are
+    /// smaller than [`QcLdpcDecoder::required_edge_buffer`] /
+    /// [`QcLdpcDecoder::required_layer_buffer`] respectively.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
+    /// let n = dec.variable_node_count();
+    /// let mut llr = vec![5.0f32; n];
+    /// let mut edge_r = vec![0.0f32; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0.0f32; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// dec.decode_layered_offset_min_sum_scalar(&mut llr, &mut edge_r, &mut scratch, &mut hard, 5)
+    ///     .unwrap();
+    /// ```
+    pub fn decode_layered_offset_min_sum_scalar(
+        &self,
+        llr: &mut [f32],
+        edge_r: &mut [f32],
+        layer_scratch: &mut [f32],
+        hard_output: &mut [u8],
+        iterations: usize,
+    ) -> Result<usize, FecError> {
+        self.decode_layered_offset_min_sum_dispatch(
+            llr,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            KernelChoice::Scalar,
+            |_iteration, _llr| {},
+        )
+    }
+
+    /// Shared implementation behind every public LOMS decode entry point
+    /// ([`QcLdpcDecoder::decode_layered_offset_min_sum`],
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_traced`], and
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_scalar`]). `kernel`
+    /// selects AVX2/NEON-if-available (`KernelChoice::Auto`) or forces the
+    /// scalar fallback (`KernelChoice::Scalar`); the choice is resolved to
+    /// plain booleans once, before the iteration loop, so it never costs a
+    /// branch inside the hot per-edge/per-`z` passes.
+    fn decode_layered_offset_min_sum_dispatch<F>(
+        &self,
+        llr: &mut [f32],
+        edge_r: &mut [f32],
+        layer_scratch: &mut [f32],
+        hard_output: &mut [u8],
+        iterations: usize,
+        kernel: KernelChoice,
         mut on_iteration: F,
     ) -> Result<usize, FecError>
     where
         F: FnMut(usize, &[f32]),
     {
+        // Referenced unconditionally so this parameter is never flagged as
+        // unused on architectures other than x86_64/aarch64 (where it is
+        // otherwise only read inside arch-gated `cfg` blocks below).
+        let _ = kernel;
+
         let n = self.variable_node_count();
         if llr.len() != n {
             return Err(FecError::InvalidParam(
@@ -797,9 +932,16 @@ impl QcLdpcDecoder {
 
         // Detect SIMD capability once per call (is_x86_feature_detected! is a
         // single cached atomic read — negligible overhead per call). Only
-        // bound on x86_64: every use site is behind the same cfg.
+        // bound on x86_64: every use site is behind the same cfg. Gated on
+        // `kernel` so `KernelChoice::Scalar` always resolves to `false`,
+        // forcing every layer through the scalar fallback below.
         #[cfg(target_arch = "x86_64")]
-        let use_avx2 = is_x86_feature_detected!("avx2");
+        let use_avx2 = matches!(kernel, KernelChoice::Auto) && is_x86_feature_detected!("avx2");
+
+        // NEON has no runtime feature probe (it's part of the aarch64
+        // baseline ABI), so the only thing gating it is `kernel` itself.
+        #[cfg(target_arch = "aarch64")]
+        let use_neon = matches!(kernel, KernelChoice::Auto);
 
         let mut iters_used = 0usize;
         for _ in 0..iterations {
@@ -865,7 +1007,7 @@ impl QcLdpcDecoder {
                     continue;
                 }
                 #[cfg(target_arch = "aarch64")]
-                {
+                if use_neon {
                     unsafe {
                         crate::simd_neon::decode_layer_passes_neon(
                             z,
@@ -885,10 +1027,14 @@ impl QcLdpcDecoder {
                     continue;
                 }
 
-                // Scalar fallback (non-x86_64/aarch64, or no AVX2 at runtime).
-                // Compiled out on aarch64, where the NEON block above always
-                // takes the layer and this code would be unreachable.
-                #[cfg(not(target_arch = "aarch64"))]
+                // Scalar fallback: reached whenever neither the AVX2 branch
+                // (x86_64) nor the NEON branch (aarch64) took the `continue`
+                // above — either because the host lacks the feature, this is
+                // a third architecture entirely, or `kernel ==
+                // KernelChoice::Scalar` forced this path deliberately.
+                // Always compiled (no `not(aarch64)` gate) so this is the
+                // single copy of the scalar algorithm reachable from every
+                // architecture, including aarch64 when scalar is forced.
                 {
                     // Pass 1: accumulate min1, min2, sign-XOR across edges.
                     // The inner loop over z is the vectorisation axis (Z=384 trips,
@@ -948,7 +1094,7 @@ impl QcLdpcDecoder {
                             llr[var_idx] += new_r - old_r;
                         }
                     }
-                } // end cfg(not(aarch64)) scalar fallback
+                } // end scalar fallback
             }
 
             on_iteration(iters_used, llr);
@@ -2069,5 +2215,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Forced-scalar kernel vs. runtime-dispatched kernel equivalence -----
+
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_scalar`] must produce
+    /// bit-identical results to [`QcLdpcDecoder::decode_layered_offset_min_sum`]
+    /// (which picks AVX2/NEON at runtime when available) on the same noisy
+    /// input, since both share the exact same `decode_layered_offset_min_sum_dispatch`
+    /// implementation and only differ in which kernel `KernelChoice` selects.
+    /// This is what makes forcing the scalar kernel for benchmarking safe:
+    /// it is not a second, potentially-diverging implementation.
+    #[test]
+    fn scalar_forced_matches_runtime_dispatch() {
+        let z = 32usize; // valid 3GPP lifting size (iLS=0), small enough for a fast test
+        let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, z, 0.25).unwrap();
+        let n = dec.variable_node_count();
+
+        // Seeded, deterministic noisy LLR input. Values don't need to
+        // correspond to a valid codeword -- this test only checks that the
+        // two kernels agree bit-for-bit on whatever input they are given,
+        // and a mix of small-magnitude, mixed-sign LLRs is exactly what
+        // forces genuine multi-iteration decode work (rather than an
+        // instant one-pass syndrome-satisfied exit).
+        let mut rng = Xorshift64::new(0xC0FFEE ^ z as u64);
+        let llr0: Vec<f32> = (0..n)
+            .map(|_| {
+                let word = rng.next_u64_mixed();
+                // Map to a modest [-3.0, 3.0) LLR range with mixed signs.
+                ((word >> 40) as f32 / (1u32 << 24) as f32) * 6.0 - 3.0
+            })
+            .collect();
+
+        let edge_len = dec.required_edge_buffer();
+        let scratch_len = dec.required_layer_buffer();
+
+        let mut llr_auto = llr0.clone();
+        let mut edge_auto = vec![0.0f32; edge_len];
+        let mut scratch_auto = vec![0.0f32; scratch_len];
+        let mut hard_auto = vec![0u8; n];
+        let iters_auto = dec
+            .decode_layered_offset_min_sum(
+                &mut llr_auto,
+                &mut edge_auto,
+                &mut scratch_auto,
+                &mut hard_auto,
+                10,
+            )
+            .unwrap();
+
+        let mut llr_scalar = llr0.clone();
+        let mut edge_scalar = vec![0.0f32; edge_len];
+        let mut scratch_scalar = vec![0.0f32; scratch_len];
+        let mut hard_scalar = vec![0u8; n];
+        let iters_scalar = dec
+            .decode_layered_offset_min_sum_scalar(
+                &mut llr_scalar,
+                &mut edge_scalar,
+                &mut scratch_scalar,
+                &mut hard_scalar,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(
+            iters_auto, iters_scalar,
+            "runtime-dispatched and forced-scalar kernels must consume the same \
+             number of iterations on identical input"
+        );
+        assert_eq!(
+            hard_auto, hard_scalar,
+            "runtime-dispatched and forced-scalar kernels must produce identical \
+             hard-decision output on identical input"
+        );
     }
 }

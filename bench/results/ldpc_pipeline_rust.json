@@ -3,9 +3,10 @@
   "impl": "loms_pipeline_spsc",
   "backend": "avx2_if_available",
   "n_variable_nodes": 26112,
-  "n_iters": 10,
+  "n_iters_budget": 10,
   "n_frames": 500,
-  "ns_per_frame": 69651.15,
-  "frames_per_s": 14357.26474006531,
-  "melem_per_s": 3748.9689689258544
+  "mean_iters_per_frame": 5.0,
+  "ns_per_frame": 179048.696,
+  "frames_per_s": 5585.0727893600515,
+  "melem_per_s": 729.1871033788483
 }

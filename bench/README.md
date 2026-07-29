@@ -109,21 +109,21 @@ python3 bench/dashboard/gen_convergence_gif.py
 | `bench/results/python_same_algo.checksum` | Same, from Python |
 | `bench/results/ldpc_rust.json` | LDPC decode, Rust, AVX2 selected at runtime |
 | `bench/results/ldpc_cpp.json` | LDPC decode, C++ scalar `-O3 -march=native` |
-| `bench/results/ldpc_pipeline_rust.json` | SPSC pipeline frame rate — see the caveat below |
+| `bench/results/ldpc_pipeline_rust.json` | SPSC pipeline throughput on real AWGN-corrupted frames |
 
-### Caveat: `ldpc_pipeline_bench` does not measure decode throughput
+### What `ldpc_pipeline_bench` measures
 
-`src/bin/ldpc_pipeline_bench.rs` fills every frame's LLR buffer with the
-constant `+5.0`, which is an error-free codeword at high confidence. The
-syndrome check therefore passes on the first pass and the decoder returns after
-one iteration instead of ten. Its `melem_per_s` is nevertheless computed as
-`n_variable_nodes × 10 / ns_per_frame`, so the figure counts nine iterations of
-work that never ran and is roughly an order of magnitude above what the same
-frames would cost with real channel noise.
+`src/bin/ldpc_pipeline_bench.rs` runs the SPSC pipeline (`LdpcPipeline`) end
+to end on genuinely noisy frames: a real BG1 Z=384 codeword is produced with
+`QcLdpcEncoder`, corrupted once through `AwgnChannel` at a fixed `Eb/N0` and
+PRNG seed, and that same noisy LLR vector is submitted as every frame's
+input. Because each frame is real noisy data rather than an error-free
+codeword, the decoder performs genuine layered passes instead of exiting
+after one.
 
-The number is consequently not comparable to `ldpc_rust.json` and is not quoted
-in the README. What the binary does measure honestly is the ring-buffer and
-worker-handoff machinery — frames per second through the SPSC pipeline with a
-negligible payload. Making it a throughput benchmark means feeding
-AWGN-corrupted codewords (as `src/bin/ldpc_convergence_export.rs` does) and
-dividing by the iterations actually consumed.
+The decoder's actual per-frame iteration count is read back via
+[`LdpcFrame::iterations_used`](../src/ldpc_pipeline.rs) and recorded as
+`mean_iters_per_frame` in the JSON; `melem_per_s` is derived from that real
+count (`n_variable_nodes × total_iterations_used / elapsed_ns`), not from the
+configured iteration budget. `frames_per_s` and `ns_per_frame` report the
+ring-buffer/worker-handoff throughput directly, timed the same way.

@@ -1,3 +1,4 @@
 [
-  {"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":1281445.0,"mib_per_s":0,"melem_per_s":203.77,"n_variable_nodes":26112,"n_iters":10}
+  {"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":1216667.0,"mib_per_s":0,"melem_per_s":214.62,"n_variable_nodes":26112,"n_iters":10},
+  {"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":3952426.0,"mib_per_s":0,"melem_per_s":66.07,"n_variable_nodes":26112,"n_iters":10}
 ]

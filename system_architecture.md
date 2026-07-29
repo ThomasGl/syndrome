@@ -104,8 +104,8 @@ hand-written.
 
 ## Current Implementation Status
 
-*(295 tests on x86-64 / 296 on AArch64: 161 unit, 10 integration + media, 31
-robustness, 75 doctests — see the [README test-suite section](README.md#4-test-suite)
+*(297 tests on x86-64 / 298 on AArch64: 162 unit, 10 integration + media, 31
+robustness, 76 doctests — see the [README test-suite section](README.md#4-test-suite)
 for the up-to-date breakdown; the count above is a snapshot, that section is
 the source of truth.)*
 

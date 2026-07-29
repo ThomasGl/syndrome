@@ -5,9 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.2] — 2026-07-29
 
 ### Added
+
+- `QcLdpcDecoder::decode_layered_offset_min_sum_scalar` — the same layered
+  offset min-sum decode with the scalar kernel forced on every architecture,
+  bypassing the runtime AVX2 probe and the compile-gated NEON path. It exists
+  so the scalar fallback can be benchmarked against the vectorized kernels on
+  one machine; a unit test asserts the two produce identical hard-decision
+  output and identical iteration counts on the same input. Kernel selection is
+  resolved once per call, before the iteration and layer loops, so the
+  runtime-dispatched entry points are unchanged.
+- `LdpcFrame::iterations_used` — the number of layered passes the decoder
+  actually consumed for that frame, which may be fewer than the configured
+  budget when the syndrome check terminates early.
 
 - `QcLdpcDecoder::decode_layered_offset_min_sum_traced` — the same layered
   offset min-sum decode, with a callback invoked once per completed layered

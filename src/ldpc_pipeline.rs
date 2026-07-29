@@ -103,6 +103,11 @@ struct FrameSlot {
     edge_r: Vec<f32>,
     scratch: Vec<f32>,
     hard: Vec<u8>,
+    /// Number of LOMS iterations the worker actually consumed decoding this
+    /// slot's most recent frame (`<=` the pipeline's configured iteration
+    /// budget; smaller when the syndrome check passed early). `0` until the
+    /// first decode completes.
+    iterations_used: usize,
 }
 
 /// A borrowed decode slot.  Obtained via [`LdpcPipeline::acquire`].
@@ -140,6 +145,22 @@ impl LdpcFrame {
     pub fn hard(&self) -> &[u8] {
         // SAFETY: exclusive access is guaranteed by the pool protocol.
         unsafe { &(*self.ptr).hard }
+    }
+
+    /// Number of LOMS iterations the worker actually consumed decoding this
+    /// frame. Valid only after receiving via [`LdpcPipeline::try_recv`].
+    ///
+    /// This is the real per-frame iteration count returned by
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`] — smaller than the
+    /// iteration budget passed to [`LdpcPipeline::new`]/[`LdpcPipeline::with_workers`]
+    /// whenever the syndrome check is satisfied before the budget is
+    /// exhausted. Callers computing decode throughput (e.g.
+    /// `src/bin/ldpc_pipeline_bench.rs`) should sum/average this value
+    /// across frames rather than assuming every frame consumed the full
+    /// configured iteration count.
+    pub fn iterations_used(&self) -> usize {
+        // SAFETY: exclusive access is guaranteed by the pool protocol.
+        unsafe { (*self.ptr).iterations_used }
     }
 }
 
@@ -227,6 +248,7 @@ impl LdpcPipeline {
                     edge_r: vec![0.0f32; n_edge],
                     scratch: vec![0.0f32; n_scr],
                     hard: vec![0u8; n],
+                    iterations_used: 0,
                 })
             })
             .collect();
@@ -273,13 +295,15 @@ impl LdpcPipeline {
                             // edge_r must start at zero each decode call.
                             slot.edge_r.iter_mut().for_each(|r| *r = 0.0);
 
-                            let _ = dec.decode_layered_offset_min_sum(
-                                &mut slot.llr,
-                                &mut slot.edge_r,
-                                &mut slot.scratch,
-                                &mut slot.hard,
-                                iterations,
-                            );
+                            slot.iterations_used = dec
+                                .decode_layered_offset_min_sum(
+                                    &mut slot.llr,
+                                    &mut slot.edge_r,
+                                    &mut slot.scratch,
+                                    &mut slot.hard,
+                                    iterations,
+                                )
+                                .unwrap_or(0);
 
                             // Spin if the done ring is momentarily full (caller lagging).
                             while done_tx.try_push(idx).is_err() {
