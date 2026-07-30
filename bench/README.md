@@ -96,6 +96,44 @@ python3 bench/dashboard/gen_convergence_gif.py
 | `bench/results/ldpc_convergence.json` | Per-iteration hard-decision trace from one real encode→AWGN→LOMS-decode cycle |
 | `bench/dashboard/exports/ldpc_convergence.gif` | Rendered animation embedded in `README.md` |
 
+## Reed-Solomon erasure-recovery GIF
+
+The animation in README §5.1 is likewise generated entirely from real
+encoder/decoder output — no hand-drawn "before/after" image.
+
+```bash
+# From repo root:
+cargo run --release --bin rs_erasure_export
+python3 bench/dashboard/gen_rs_erasure_gif.py
+```
+
+1. `cargo run --release --bin rs_erasure_export` generates an 80×80 grayscale
+   test image from a deterministic arithmetic pattern (concentric rings —
+   not a loaded external asset, so the payload is fully specified by the
+   code that produces it), encodes it as RS(10,4) with the same
+   [`ReedSolomon::encode_with_avx2`](../src/reed_solomon.rs) kernel measured
+   in §5.1, erases 4 of the 10 data shards (shard indices 1/3/5/7 — the
+   maximum this code tolerates), and reconstructs them with the real
+   [`ReedSolomon::decode`](../src/reed_solomon.rs). The exporter asserts the
+   reconstruction is byte-for-byte identical to the original **before**
+   writing `bench/results/rs_erasure.json` — a mismatch panics the program
+   rather than exporting an unverified result.
+2. `bench/dashboard/gen_rs_erasure_gif.py` reads that JSON and renders the
+   three real phases (original / corrupted / recovered) to
+   `bench/dashboard/exports/rs_erasure.gif`, with a shard-status strip
+   (green = present or recovered, red = erased, blue = parity) beneath the
+   image. The only liberties taken past the raw bytes are which colors mean
+   "erased" vs. "present" and how long each phase is held on screen — GIF
+   optimization then merges the held duplicate frames and combines their
+   durations, so the file's stored frame count is smaller than the number of
+   phases rendered; the script re-opens its own output to report the true
+   count rather than assuming its pre-save frame list.
+
+| File | Contents |
+|------|----------|
+| `bench/results/rs_erasure.json` | Original/corrupted/recovered image bytes from one real encode→erase→decode cycle |
+| `bench/dashboard/exports/rs_erasure.gif` | Rendered animation embedded in `README.md` |
+
 ## Output files
 
 | File | Contents |

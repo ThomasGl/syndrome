@@ -499,6 +499,22 @@ Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algo
 
 The AVX2 path uses VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, processing 32 bytes/cycle.  Rust and C++ produce **byte-identical parity output** (checksum-gated).
 
+The throughput above is what RS(10,4) costs; this is what it buys — a real
+80×80 test image, RS(10,4)-encoded, with 4 of its 10 data shards (the maximum
+this code tolerates) erased and reconstructed by the actual decoder in
+[`src/reed_solomon.rs`](src/reed_solomon.rs):
+
+![Reed-Solomon erasure recovery: a real image with 4 of 10 data shards erased, reconstructed byte-for-byte by the real decoder](bench/dashboard/exports/rs_erasure.gif)
+
+Every pixel in every frame is real: `cargo run --release --bin rs_erasure_export`
+generates the test pattern arithmetically (concentric rings, not a loaded
+asset), encodes it with the same `encode_with_avx2` kernel measured above,
+erases shards 1/3/5/7, and calls the real `ReedSolomon::decode`. The exporter
+asserts the reconstruction is byte-for-byte identical to the original before
+writing anything — a mismatch would be a bug, and the program panics rather
+than export an unverified result. See [`bench/README.md`](bench/README.md) to
+regenerate.
+
 ### 5.2 QC-LDPC LOMS decode throughput
 
 ![QC-LDPC decode comparison](bench/dashboard/exports/ldpc_comparison.png)
