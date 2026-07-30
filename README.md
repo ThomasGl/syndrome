@@ -530,6 +530,39 @@ AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar p
 2. **Conditional subtract** — replaces `% Z` (integer divide) with `if s >= Z { s - Z } else { s }`.
 3. **Sign bit XOR** — `bits & 0x8000_0000` accumulation replaces float multiply.
 
+### 5.2.1 Lock-free multi-worker pipeline scaling
+
+BG1 Z=384, real AWGN-corrupted codewords (not the clean, single-iteration
+codeword an easier benchmark would use — see below), 1000 frames/worker-count,
+median iteration count 5.0/frame. `cargo run --release --bin ldpc_pipeline_bench`
+sweeps worker counts through [`LdpcPipeline`](src/ldpc_pipeline.rs), the
+lock-free SPSC ring architecture described in §6.
+
+| Workers | Aggregate throughput | Speed-up vs. 1 worker | Efficiency vs. ideal linear |
+|---|---|---|---|
+| 1 | 162 Melem/s | 1.00× | 100% |
+| 2 | 292 Melem/s | 1.80× | 90% |
+| 4 | 471 Melem/s | 2.91× | 73% |
+| 8 | 757 Melem/s | 4.67× | 58% |
+
+Scaling is close to linear through 2 workers, then falls off — 8 workers
+deliver 4.67× rather than 8×. The lock-free rings themselves add no
+serialization at any worker count; what caps scaling here is this machine's
+memory subsystem feeding that many concurrent AVX2 kernels streaming through
+26,112-element buffers, not the queue protocol. The number worth comparing to
+§5.2's single-threaded 215 Melem/s is the 1-worker row here (162 Melem/s): the
+~25% gap between them is the pipeline's genuine submit/receive/atomic overhead
+on top of the same decode kernel, not a different kernel.
+
+This table replaces an earlier, incorrect one. An earlier version of
+`ldpc_pipeline_bench` called `LdpcPipeline::new` — which sizes its worker pool
+from `available_parallelism()`, clamped to 8 — while printing a hardcoded
+`"1 worker thread"` banner, so on any multi-core machine every number it ever
+produced was really a multi-worker aggregate mislabeled as single-threaded.
+That is why the figure did not reconcile with the single-threaded number
+above; it was never actually measuring one worker. Explicitly sweeping via
+`LdpcPipeline::with_workers` (see `bench/README.md`) fixed it.
+
 ### 5.3 BER Waterfall (5G NR BG1)
 
 ![BER/BLER waterfall](bench/dashboard/exports/ber_waterfall.png)

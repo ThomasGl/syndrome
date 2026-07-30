@@ -127,3 +127,19 @@ The decoder's actual per-frame iteration count is read back via
 count (`n_variable_nodes × total_iterations_used / elapsed_ns`), not from the
 configured iteration budget. `frames_per_s` and `ns_per_frame` report the
 ring-buffer/worker-handoff throughput directly, timed the same way.
+
+The benchmark sweeps worker counts `{1, 2, 4, 8}` explicitly via
+`LdpcPipeline::with_workers`, so `ldpc_pipeline_rust.json` is a JSON array —
+one record per worker count — rather than a single measurement. Each record
+also carries `n_workers` and `speedup_vs_1_worker`.
+
+**Why an explicit sweep, and why `with_workers` rather than `new`.** An
+earlier version called `LdpcPipeline::new` once and printed a hardcoded
+`"1 worker thread"` banner. `new` sizes its worker pool from
+`std::thread::available_parallelism()` (clamped to 8), so on any multi-core
+host that banner was false, and every Melem/s figure the benchmark ever
+produced was really an N-worker aggregate mislabeled as a single-worker
+number — the reason this file's throughput never reconciled with
+`ldpc_bench_export`'s single-threaded figure. `with_workers` makes the count
+explicit and the sweep reproducible across machines with different core
+counts, instead of silently depending on `nproc`.
