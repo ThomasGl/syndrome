@@ -703,17 +703,19 @@ The `sixg` module captures confirmed 3GPP / ITU-R research directions for IMT-20
 
 | Code | $E_b/N_0$ required | Gap to Shannon limit |
 |---|---|---|
-| Uncoded BPSK | ≈ 9.8 dB | — |
+| Uncoded BPSK | ≈ 9.6 dB | — |
 | Repetition(3) — trivial | ≈ 9.0 dB | ≈ 9.6 dB |
 | **LDPC BG1 — this library** | **≈ 0.7 dB** | **≈ 1.3 dB** |
 | Shannon limit (rate 1/3, real AWGN) | ≈ −0.6 dB | 0 dB |
 
 The **~8.3 dB coding gain** over the repetition code corresponds to 6.7× less transmit power for the same reliability.
 
-**RS packet-loss recovery (RS(10, 4) on a 2 Mbps video stream at 1% packet loss):**
+**RS packet-loss recovery (RS(10, 4) on a 2 Mbps video stream at 1% independent packet loss, 1500-byte packets, iid loss model):**
 
-- No FEC: visible glitch every **0.5 s**.
-- With RS(10, 4): expected failure once every **70 hours** — at 40% bandwidth overhead.
+- No FEC: mean packets between losses is $1/p = 100$, i.e. a glitch roughly every **0.6 s** at ~167 packets/s.
+- With RS(10, 4): a 14-packet stripe survives unless more than 4 of its 14 packets are lost. $P(\text{stripe failure}) = \sum_{x=5}^{14} \binom{14}{x} p^x (1-p)^{14-x} \approx 1.86 \times 10^{-7}$ at $p=0.01$, against $\approx 11.9$ stripes/s — an expected failure once every **≈126 hours**, at 40% bandwidth overhead.
+
+(Recompute with `math.comb` and the formula above for any other packet size, bitrate, or loss rate — the number moves with those assumptions, so treat it as illustrative of the *shape* of the reliability gain, not a fixed constant.)
 
 ---
 
@@ -817,7 +819,7 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 [10] I. S. Reed and G. Solomon, "Polynomial Codes over Certain Finite Fields," *J. SIAM*, vol. 8, no. 2, pp. 300–304, 1960.
 
-[11] 3GPP, "NR; Multiplexing and channel coding," TS 38.212 V16.15.0, Dec. 2025.
+[11] 3GPP, "NR; Multiplexing and channel coding," TS 38.212 V16.15.0, Feb. 2026.
 
 [12] E. Arıkan, "Channel Polarization: A Method for Constructing Capacity-Achieving Codes for Symmetric Binary-Input Memoryless Channels," *IEEE Trans. Inf. Theory*, vol. 55, no. 7, pp. 3051–3073, July 2009.
 
