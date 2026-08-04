@@ -549,35 +549,68 @@ AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar p
 ### 5.2.1 Lock-free multi-worker pipeline scaling
 
 BG1 Z=384, real AWGN-corrupted codewords (not the clean, single-iteration
-codeword an easier benchmark would use — see below), 1000 frames/worker-count,
-median iteration count 5.0/frame. `cargo run --release --bin ldpc_pipeline_bench`
+codeword an easier benchmark would use — see below), 1000 frames/worker-count.
+Every frame decodes the identical noisy codeword (one fixed channel seed), so
+the iteration count is exactly 5, not merely typically 5.
+`cargo run --release --bin ldpc_pipeline_bench`
 sweeps worker counts through [`LdpcPipeline`](src/ldpc_pipeline.rs), the
 lock-free SPSC ring architecture described in §6.
 
 | Workers | Aggregate throughput | Speed-up vs. 1 worker | Efficiency vs. ideal linear |
 |---|---|---|---|
-| 1 | 162 Melem/s | 1.00× | 100% |
-| 2 | 292 Melem/s | 1.80× | 90% |
-| 4 | 471 Melem/s | 2.91× | 73% |
-| 8 | 757 Melem/s | 4.67× | 58% |
+| 1 | 111 Melem/s | 1.00× | 100% |
+| 2 | 214 Melem/s | 1.93× | 97% |
+| 4 | 428 Melem/s | 3.87× | 97% |
+| 8 | 657 Melem/s | 5.94× | 74% |
 
-Scaling is close to linear through 2 workers, then falls off — 8 workers
-deliver 4.67× rather than 8×. The lock-free rings themselves add no
-serialization at any worker count; what caps scaling here is this machine's
-memory subsystem feeding that many concurrent AVX2 kernels streaming through
-26,112-element buffers, not the queue protocol. The number worth comparing to
-§5.2's single-threaded 215 Melem/s is the 1-worker row here (162 Melem/s): the
-~25% gap between them is the pipeline's genuine submit/receive/atomic overhead
-on top of the same decode kernel, not a different kernel.
+Scaling is close to linear through 4 workers here, then falls off at 8. The
+lock-free rings themselves add no serialization at any worker count; what
+caps scaling is this machine's memory subsystem feeding that many concurrent
+AVX2 kernels streaming through 26,112-element buffers, not the queue
+protocol. Take the exact multiplier at each worker count as a snapshot of one
+run rather than a hardware constant — this crate develops on a shared,
+virtualized host (WSL2) whose available throughput swings with whatever else
+the underlying machine is doing; a repeat run below shows the 1-worker figure
+alone ranging from 97 to 154 Melem/s.
 
-This table replaces an earlier, incorrect one. An earlier version of
+**This is not directly comparable to §5.2's 215 Melem/s single-threaded
+figure — the two decode different workloads, not just through different
+harnesses.** §5.2 decodes a synthetic, never-converging LLR pattern for a
+fixed 10-iteration budget; the per-iteration syndrome check fails on the
+first parity row every time, so it costs almost nothing. The table above
+decodes a real codeword that converges in ~5 iterations, and the *successful*
+check that ends the decode scans the full parity matrix — work costing
+roughly as much as one more AVX2 iteration, which `Melem/s` does not count
+as an "iteration" (confirmed by capping the real codeword's iteration budget
+below its convergence point, so no early exit fires: its per-iteration cost
+then matches the synthetic pattern's within ~1%). On top of that, the
+pipeline's own ring/dispatch overhead — measured directly by `cargo run
+--release --bin ldpc_pipeline_bench`, which alternates a plain decode loop
+against the 1-worker pipeline on identical input, several rounds, within one
+process; see `bench/README.md` — is real but modest, nowhere near the ~25%
+a same-workload-blind comparison first suggested. Its exact size is not a
+fixed number: eleven same-process interleaved measurements taken across two
+work sessions on this host ranged from 0.4% to 21.8%, typically single
+digits when the host is otherwise idle. This machine's wall-clock throughput
+drifted by a comparable amount between separate process invocations during
+this investigation, which is why the overhead figure has to come from one
+interleaved run rather than from comparing this table to §5.2 directly — and
+why no single percentage is asserted here as the answer. Run the benchmark
+yourself for the figure on your machine, under your load.
+
+This table replaces an earlier, incorrect one — twice. An earlier version of
 `ldpc_pipeline_bench` called `LdpcPipeline::new` — which sizes its worker pool
 from `available_parallelism()`, clamped to 8 — while printing a hardcoded
 `"1 worker thread"` banner, so on any multi-core machine every number it ever
 produced was really a multi-worker aggregate mislabeled as single-threaded.
-That is why the figure did not reconcile with the single-threaded number
-above; it was never actually measuring one worker. Explicitly sweeping via
-`LdpcPipeline::with_workers` (see `bench/README.md`) fixed it.
+Fixed by explicitly sweeping via `LdpcPipeline::with_workers`. The fix
+surfaced a second, smaller problem: the resulting 1-worker figure still didn't
+reconcile with §5.2's, which a same-process interleaved comparison (above)
+traced to workload difference rather than pipeline overhead. That
+investigation also found a genuine small bug — the pipeline worker was
+zeroing its ~474 KiB extrinsic buffer before every decode call
+(`ldpc_pipeline.rs`), redundant with the decoder already doing so internally
+— now removed.
 
 ### 5.3 BER Waterfall (5G NR BG1)
 

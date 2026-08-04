@@ -1,58 +1,104 @@
-[
-  {
-    "lang": "rust",
-    "impl": "loms_pipeline_spsc",
-    "backend": "avx2_if_available",
-    "n_variable_nodes": 26112,
-    "n_iters_budget": 10,
-    "n_frames": 1000,
-    "n_workers": 1,
-    "mean_iters_per_frame": 5.0,
-    "ns_per_frame": 805095.221,
-    "frames_per_s": 1242.089101905127,
-    "melem_per_s": 162.1671531447334,
-    "speedup_vs_1_worker": 1.0
+{
+  "overhead_isolation": {
+    "description": "Same-process, interleaved comparison of a plain decode loop against the 1-worker pipeline on identical input, isolating ring/dispatch overhead from workload differences and from cross-process host drift. Which side runs first alternates each round to cancel any within-run thermal/frequency-scaling bias.",
+    "rounds": [
+      {
+        "round": 0,
+        "measured_first": "tight_loop",
+        "tight_loop_melem_per_s": 153.36734840845483,
+        "pipeline_1worker_melem_per_s": 147.54184471934593,
+        "ratio": 1.0394837390042817
+      },
+      {
+        "round": 1,
+        "measured_first": "pipeline",
+        "tight_loop_melem_per_s": 146.00073475630185,
+        "pipeline_1worker_melem_per_s": 153.2022566617307,
+        "ratio": 0.9529933692730796
+      },
+      {
+        "round": 2,
+        "measured_first": "tight_loop",
+        "tight_loop_melem_per_s": 155.00213969080372,
+        "pipeline_1worker_melem_per_s": 156.6699528877276,
+        "ratio": 0.9893546071458957
+      },
+      {
+        "round": 3,
+        "measured_first": "pipeline",
+        "tight_loop_melem_per_s": 154.92845224061386,
+        "pipeline_1worker_melem_per_s": 152.80814978577874,
+        "ratio": 1.013875584893918
+      },
+      {
+        "round": 4,
+        "measured_first": "tight_loop",
+        "tight_loop_melem_per_s": 117.75194289488213,
+        "pipeline_1worker_melem_per_s": 120.83321990565224,
+        "ratio": 0.9744997525252079
+      }
+    ],
+    "median_tight_loop_melem_per_s": 153.36734840845483,
+    "median_pipeline_1worker_melem_per_s": 152.80814978577874,
+    "pipeline_overhead_ratio": 1.003659481666783,
+    "pipeline_overhead_pct": 0.3659481666782982
   },
-  {
-    "lang": "rust",
-    "impl": "loms_pipeline_spsc",
-    "backend": "avx2_if_available",
-    "n_variable_nodes": 26112,
-    "n_iters_budget": 10,
-    "n_frames": 1000,
-    "n_workers": 2,
-    "mean_iters_per_frame": 5.0,
-    "ns_per_frame": 447325.156,
-    "frames_per_s": 2235.510314112538,
-    "melem_per_s": 291.86822661053293,
-    "speedup_vs_1_worker": 1.7997986703882134
-  },
-  {
-    "lang": "rust",
-    "impl": "loms_pipeline_spsc",
-    "backend": "avx2_if_available",
-    "n_variable_nodes": 26112,
-    "n_iters_budget": 10,
-    "n_frames": 1000,
-    "n_workers": 4,
-    "mean_iters_per_frame": 5.0,
-    "ns_per_frame": 277068.593,
-    "frames_per_s": 3609.2145600927056,
-    "melem_per_s": 471.21905296570367,
-    "speedup_vs_1_worker": 2.9057613938942555
-  },
-  {
-    "lang": "rust",
-    "impl": "loms_pipeline_spsc",
-    "backend": "avx2_if_available",
-    "n_variable_nodes": 26112,
-    "n_iters_budget": 10,
-    "n_frames": 1000,
-    "n_workers": 8,
-    "mean_iters_per_frame": 5.0,
-    "ns_per_frame": 172563.578,
-    "frames_per_s": 5794.965609718639,
-    "melem_per_s": 756.5907100048655,
-    "speedup_vs_1_worker": 4.665499118243829
-  }
-]
+  "worker_sweep": [
+    {
+      "lang": "rust",
+      "impl": "loms_pipeline_spsc",
+      "backend": "avx2_if_available",
+      "n_variable_nodes": 26112,
+      "n_iters_budget": 10,
+      "n_frames": 1000,
+      "n_workers": 1,
+      "mean_iters_per_frame": 5.0,
+      "ns_per_frame": 1179551.712,
+      "frames_per_s": 847.7797029385346,
+      "melem_per_s": 110.68611801565508,
+      "speedup_vs_1_worker": 1.0
+    },
+    {
+      "lang": "rust",
+      "impl": "loms_pipeline_spsc",
+      "backend": "avx2_if_available",
+      "n_variable_nodes": 26112,
+      "n_iters_budget": 10,
+      "n_frames": 1000,
+      "n_workers": 2,
+      "mean_iters_per_frame": 5.0,
+      "ns_per_frame": 610626.719,
+      "frames_per_s": 1637.6617152254028,
+      "melem_per_s": 213.81311353982858,
+      "speedup_vs_1_worker": 1.9317066798709803
+    },
+    {
+      "lang": "rust",
+      "impl": "loms_pipeline_spsc",
+      "backend": "avx2_if_available",
+      "n_variable_nodes": 26112,
+      "n_iters_budget": 10,
+      "n_frames": 1000,
+      "n_workers": 4,
+      "mean_iters_per_frame": 5.0,
+      "ns_per_frame": 304808.213,
+      "frames_per_s": 3280.7514933989,
+      "melem_per_s": 428.3349149781604,
+      "speedup_vs_1_worker": 3.869816040685229
+    },
+    {
+      "lang": "rust",
+      "impl": "loms_pipeline_spsc",
+      "backend": "avx2_if_available",
+      "n_variable_nodes": 26112,
+      "n_iters_budget": 10,
+      "n_frames": 1000,
+      "n_workers": 8,
+      "mean_iters_per_frame": 5.0,
+      "ns_per_frame": 198579.549,
+      "frames_per_s": 5035.765289204075,
+      "melem_per_s": 657.4695161584841,
+      "speedup_vs_1_worker": 5.939945568110843
+    }
+  ]
+}

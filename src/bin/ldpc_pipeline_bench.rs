@@ -28,6 +28,30 @@
 //! benchmark ever produced was really an N-worker aggregate mislabeled as a
 //! single-worker one.
 //!
+//! Before the worker-count sweep, this also isolates true pipeline overhead
+//! by alternating a plain decode loop against the 1-worker pipeline on
+//! identical input, several rounds, all within this one process
+//! (`measure_tight_loop`/`OVERHEAD_ROUNDS`). That interleaving matters: a
+//! from-scratch investigation into why this benchmark's throughput didn't
+//! reconcile with a plain decode loop found that (1) most of the apparent
+//! gap was actually a *workload* difference — a synthetic non-converging LLR
+//! pattern used elsewhere in this benchmark suite never triggers the
+//! decoder's early-exit syndrome check, while a real codeword's final,
+//! successful check scans the whole parity matrix and costs roughly as much
+//! as one AVX2 decode iteration, work `melem_per_s` does not count as
+//! "iterations" — and (2) a real several-percent ring/dispatch overhead does
+//! exist at one worker (see the printed `pipeline_overhead_pct` for the
+//! current measurement), but comparing two separate process invocations to
+//! measure it is invalid on this host, which drifted as much as 15-25%
+//! between runs during this investigation, from clock/thermal effects alone.
+//! Measuring both sides back-to-back in one
+//! process is what makes the isolated overhead figure trustworthy. A
+//! redundant per-frame zero-fill of the ~474 KiB extrinsic buffer in the
+//! pipeline worker (`ldpc_pipeline.rs`) — the decoder already zeroes it
+//! internally at the top of every call — was found and removed during this
+//! investigation, which is part of why the overhead measured here is lower
+//! than an earlier estimate.
+//!
 //! Run:
 //!   cargo run --release --bin ldpc_pipeline_bench
 //!
@@ -65,6 +89,61 @@ struct Measurement {
     frames_per_s: f64,
     mean_iters_per_frame: f64,
     melem_per_s: f64,
+}
+
+/// Rounds to alternate between the tight-loop baseline and the 1-worker
+/// pipeline when isolating pipeline overhead. Interleaving within one process
+/// — rather than comparing two separate binary invocations — is what makes
+/// the comparison trustworthy: a from-scratch investigation of why this
+/// benchmark's numbers didn't reconcile with a plain decode loop found that
+/// consecutive invocations of the *same* binary on this host can differ by
+/// 15-25% from clock/thermal drift alone, which swamps a real ~10% pipeline
+/// overhead if the two sides of the comparison are measured minutes apart in
+/// separate processes.
+const OVERHEAD_ROUNDS: usize = 5;
+
+/// Decode `BENCH_FRAMES` copies of `noisy_llr` in a plain loop — no pipeline,
+/// no threads, no rings — and return the median per-frame Melem/s. This is
+/// the fair baseline for isolating pipeline overhead: same decoder, same
+/// workload, same iteration-counting method as [`measure`], with the ring
+/// machinery being the only thing removed.
+fn measure_tight_loop(decoder: &QcLdpcDecoder, n: usize, noisy_llr: &[f32]) -> f64 {
+    let mut llr = vec![0.0f32; n];
+    let mut edge_r = vec![0.0f32; decoder.required_edge_buffer()];
+    let mut scratch = vec![0.0f32; decoder.required_layer_buffer()];
+    let mut hard = vec![0u8; n];
+
+    // Warm-up, matching the pipeline path's warm-up frame count.
+    for _ in 0..WARMUP_FRAMES {
+        llr.copy_from_slice(noisy_llr);
+        decoder
+            .decode_layered_offset_min_sum(
+                &mut llr,
+                &mut edge_r,
+                &mut scratch,
+                &mut hard,
+                DECODE_ITERS,
+            )
+            .expect("decode failed");
+    }
+
+    let mut total_iters = 0u64;
+    let start = Instant::now();
+    for _ in 0..BENCH_FRAMES {
+        llr.copy_from_slice(noisy_llr);
+        let used = decoder
+            .decode_layered_offset_min_sum(
+                &mut llr,
+                &mut edge_r,
+                &mut scratch,
+                &mut hard,
+                DECODE_ITERS,
+            )
+            .expect("decode failed");
+        total_iters += used as u64;
+    }
+    let elapsed_ns = start.elapsed().as_nanos() as f64;
+    (n as f64 * total_iters as f64) / (elapsed_ns * 1e-9) / 1e6
 }
 
 /// Run one full warm-up + timed measurement at a fixed worker count.
@@ -181,6 +260,59 @@ fn main() {
     let mut channel = AwgnChannel::new(EB_N0_DB, code_rate, CHANNEL_SEED);
     let noisy_llr = channel.transmit(&codeword);
 
+    // ── Isolate pipeline overhead, same-process, interleaved ─────────────
+    //
+    // Earlier drafts of this investigation compared this benchmark's 1-worker
+    // pipeline figure against a *separately invoked* tight-loop benchmark and
+    // concluded the two nearly matched (implying near-zero pipeline overhead).
+    // That comparison was invalid: this host's wall-clock throughput drifts
+    // 15-25% between process invocations, which is larger than the effect
+    // being measured. Alternating both measurements within this one process
+    // removes that confound.
+    println!("Isolating pipeline overhead ({OVERHEAD_ROUNDS} interleaved rounds)...");
+    let mut tight_samples = Vec::with_capacity(OVERHEAD_ROUNDS);
+    let mut pipe_samples = Vec::with_capacity(OVERHEAD_ROUNDS);
+    for round in 0..OVERHEAD_ROUNDS {
+        // Alternate which side runs first each round. Always measuring the
+        // same side first under this host's within-run thermal/frequency
+        // decay would bias the overhead estimate in a fixed direction
+        // (conservatively, but still a bias); alternating cancels it.
+        let (tight, pipe) = if round % 2 == 0 {
+            let tight = measure_tight_loop(&decoder_template, n, &noisy_llr);
+            let pipe = measure(decoder_template.clone(), 1, n, &noisy_llr).melem_per_s;
+            (tight, pipe)
+        } else {
+            let pipe = measure(decoder_template.clone(), 1, n, &noisy_llr).melem_per_s;
+            let tight = measure_tight_loop(&decoder_template, n, &noisy_llr);
+            (tight, pipe)
+        };
+        println!(
+            "  round {round}: tight_loop={tight:.2} Melem/s   1-worker pipeline={pipe:.2} Melem/s   ratio={:.3}",
+            tight / pipe
+        );
+        tight_samples.push(tight);
+        pipe_samples.push(pipe);
+    }
+    // Paired per-round (tight, pipe) values for the JSON export, taken before
+    // the medians below sort each series independently — sorting separately
+    // is fine for computing a median but would destroy which two numbers
+    // came from the same round if used for the export.
+    let paired_rounds: Vec<(f64, f64)> = tight_samples
+        .iter()
+        .copied()
+        .zip(pipe_samples.iter().copied())
+        .collect();
+    tight_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    pipe_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_tight = tight_samples[OVERHEAD_ROUNDS / 2];
+    let median_pipe = pipe_samples[OVERHEAD_ROUNDS / 2];
+    let overhead_ratio = median_tight / median_pipe;
+    println!(
+        "\nMedian: tight_loop={median_tight:.2} Melem/s, 1-worker pipeline={median_pipe:.2} Melem/s\n\
+         Pipeline overhead at 1 worker: {:.1}% (tight_loop / pipeline = {overhead_ratio:.3}x)\n",
+        (overhead_ratio - 1.0) * 100.0
+    );
+
     let mut measurements = Vec::with_capacity(WORKER_COUNTS.len());
     for &n_workers in WORKER_COUNTS {
         if n_workers > available {
@@ -241,11 +373,37 @@ fn main() {
         })
         .collect();
 
+    let paired_round_records: Vec<serde_json::Value> = paired_rounds
+        .iter()
+        .enumerate()
+        .map(|(round, &(tight, pipe))| {
+            serde_json::json!({
+                "round": round,
+                "measured_first": if round % 2 == 0 { "tight_loop" } else { "pipeline" },
+                "tight_loop_melem_per_s": tight,
+                "pipeline_1worker_melem_per_s": pipe,
+                "ratio": tight / pipe,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "overhead_isolation": {
+            "description": "Same-process, interleaved comparison of a plain decode loop \
+                against the 1-worker pipeline on identical input, isolating ring/dispatch \
+                overhead from workload differences and from cross-process host drift. \
+                Which side runs first alternates each round to cancel any within-run \
+                thermal/frequency-scaling bias.",
+            "rounds": paired_round_records,
+            "median_tight_loop_melem_per_s": median_tight,
+            "median_pipeline_1worker_melem_per_s": median_pipe,
+            "pipeline_overhead_ratio": overhead_ratio,
+            "pipeline_overhead_pct": (overhead_ratio - 1.0) * 100.0,
+        },
+        "worker_sweep": records,
+    });
+
     let out_path = "bench/results/ldpc_pipeline_rust.json";
-    std::fs::write(
-        out_path,
-        serde_json::to_string_pretty(&serde_json::Value::Array(records)).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(out_path, serde_json::to_string_pretty(&output).unwrap()).unwrap();
     println!("\nWrote {out_path}");
 }

@@ -292,9 +292,12 @@ impl LdpcPipeline {
                             // ensures we are the only thread touching this slot.
                             let slot = unsafe { &mut *(ptrs[idx] as *mut FrameSlot) };
 
-                            // edge_r must start at zero each decode call.
-                            slot.edge_r.iter_mut().for_each(|r| *r = 0.0);
-
+                            // decode_layered_offset_min_sum zeroes edge_r itself at
+                            // the top of every call (see qc_ldpc.rs), so doing it
+                            // here too was a redundant ~474 KiB memset per frame at
+                            // BG1 Z=384 — caught while investigating why the
+                            // pipeline measured slower than a plain decode loop on
+                            // the same workload.
                             slot.iterations_used = dec
                                 .decode_layered_offset_min_sum(
                                     &mut slot.llr,

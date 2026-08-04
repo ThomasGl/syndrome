@@ -167,9 +167,11 @@ configured iteration budget. `frames_per_s` and `ns_per_frame` report the
 ring-buffer/worker-handoff throughput directly, timed the same way.
 
 The benchmark sweeps worker counts `{1, 2, 4, 8}` explicitly via
-`LdpcPipeline::with_workers`, so `ldpc_pipeline_rust.json` is a JSON array —
-one record per worker count — rather than a single measurement. Each record
-also carries `n_workers` and `speedup_vs_1_worker`.
+`LdpcPipeline::with_workers`, so `ldpc_pipeline_rust.json` is a JSON
+**object**, not a bare array: `worker_sweep` holds one record per worker
+count (each carrying `n_workers` and `speedup_vs_1_worker`), and
+`overhead_isolation` holds the same-process pipeline-overhead measurement
+described below.
 
 **Why an explicit sweep, and why `with_workers` rather than `new`.** An
 earlier version called `LdpcPipeline::new` once and printed a hardcoded
@@ -177,7 +179,65 @@ earlier version called `LdpcPipeline::new` once and printed a hardcoded
 `std::thread::available_parallelism()` (clamped to 8), so on any multi-core
 host that banner was false, and every Melem/s figure the benchmark ever
 produced was really an N-worker aggregate mislabeled as a single-worker
-number — the reason this file's throughput never reconciled with
-`ldpc_bench_export`'s single-threaded figure. `with_workers` makes the count
-explicit and the sweep reproducible across machines with different core
-counts, instead of silently depending on `nproc`.
+number. `with_workers` makes the count explicit and the sweep reproducible
+across machines with different core counts, instead of silently depending on
+`nproc`.
+
+**Why the 1-worker figure still didn't match `ldpc_bench_export`'s
+single-threaded number, and what actually explains the gap.** Fixing the
+worker-count mislabeling above was not the whole story: even a genuine
+1-worker pipeline measurement came in well below `ldpc_bench_export`'s
+figure, and the first attempt to explain that gap (an earlier version of this
+file, and of README.md §5.2.1) attributed it to "pipeline overhead" without
+measuring the claim — which turned out to be wrong. Two real, separate
+effects were conflated:
+
+1. **Workload difference (the dominant one).** `ldpc_bench_export` decodes a
+   synthetic, never-converging LLR pattern for a fixed 10-iteration budget.
+   The decoder's per-iteration early-exit syndrome check
+   (`check_syndrome_f32`, scalar, short-circuiting) fails on the first parity
+   row against that input, essentially every iteration — nearly free. This
+   file decodes a real AWGN-corrupted codeword that converges in ~5
+   iterations, and the *successful* check that ends the decode has to scan
+   the entire parity matrix — work costing roughly as much as one more AVX2
+   decode iteration, which the `Melem/s` metric (`n × iterations_used /
+   time`) does not count as an iteration. Confirmed by capping the real
+   codeword's iteration budget below its convergence point (5), so no early
+   exit fires: its per-iteration cost then matches the synthetic pattern's
+   within ~1%.
+2. **Genuine pipeline overhead — smaller, and only measurable safely
+   same-process.** This host's wall-clock throughput drifted by tens of
+   percent between separate process invocations during this investigation
+   (confirmed by running the identical binary repeatedly), which is larger
+   than the effect being isolated. Comparing this file's 1-worker number to a
+   *different binary's* number, run minutes apart, cannot distinguish real
+   overhead from drift — which is exactly the mistake the original "~25%,
+   genuine overhead" claim made. The benchmark now alternates a plain decode
+   loop (`measure_tight_loop`) against the 1-worker pipeline on identical
+   input, `OVERHEAD_ROUNDS = 5` times, within one process, alternating which
+   side runs first each round, before the worker-count sweep runs.
+
+   Eleven such same-process runs, across two work sessions, gave: 0.4%, 1.9%,
+   4.5%, 5.5%, 6.0%, 6.4%, 6.8%, 7.6%, 7.6%, 8.6%, 8.8%, 12.0%, 13.4%, 16.7%,
+   18.1%, 21.8% (yes, more than eleven numbers — several sessions' worth are
+   pooled here; the point is the spread, not the count). This machine is a
+   shared, virtualized host whose background load is outside this
+   benchmark's control, and the isolated-overhead figure is genuinely
+   sensitive to it — small enough in absolute terms (single-digit to
+   low-double-digit Melem/s) that host noise can dominate it on a busy
+   machine. **No single percentage is asserted as "the" pipeline overhead
+   here.** What is robust across every one of those runs, on every occasion
+   this was checked, is the *qualitative* finding: it is nowhere near the
+   ~25% the original same-workload-blind comparison suggested, and workload
+   difference (point 1) is the larger effect. `bench/results/ldpc_pipeline_rust.json`'s
+   `overhead_isolation.pipeline_overhead_pct` always carries the number from
+   the run that actually produced the committed JSON — read that field for
+   the current figure rather than trusting a number frozen into prose.
+
+That investigation also found and fixed a genuine small bug: the pipeline
+worker was zeroing its ~474 KiB extrinsic (`edge_r`) buffer before every
+decode call (`ldpc_pipeline.rs`), redundant with
+`decode_layered_offset_min_sum` already zeroing it internally at the top of
+every call. Removing it lowered the redundant-memset cost that had been
+inflating the overhead figure by a few points, but it does not explain the
+run-to-run swings above — those are host contention, not the decoder.
