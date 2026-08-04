@@ -134,6 +134,28 @@ python3 bench/dashboard/gen_rs_erasure_gif.py
 | `bench/results/rs_erasure.json` | Original/corrupted/recovered image bytes from one real encode→erase→decode cycle |
 | `bench/dashboard/exports/rs_erasure.gif` | Rendered animation embedded in `README.md` |
 
+## Tanner graph diagram
+
+The base-graph connectivity diagram in `system_architecture.md` is generated
+directly from real 3GPP spec data, not drawn by hand.
+
+```bash
+# From repo root:
+python3 bench/dashboard/gen_tanner_graph.py
+```
+
+`data/bg_tables.json` is the same real, spec-extracted base-graph table the
+crate compiles into `BG1_ENTRIES`/`BG2_ENTRIES` at build time (see
+`build.rs`); the script reads it directly and filters to a small window (the
+first 8 check-node rows × 14 variable-node columns of BG2) small enough to
+render legibly — the full BG2 is 42×52 blocks, and drawing all of it produces
+an unreadable smear of edges. Every edge drawn corresponds to a real non-zero
+`(row, col)` entry in that window; none of the connectivity is synthesized.
+
+| File | Contents |
+|------|----------|
+| `bench/dashboard/exports/tanner_graph.png` | Rendered diagram embedded in `system_architecture.md` |
+
 ## Output files
 
 | File | Contents |
