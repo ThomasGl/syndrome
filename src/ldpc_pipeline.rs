@@ -471,12 +471,12 @@ mod tests {
 
         // Submit all frames, draining periodically to avoid exhausting the pool.
         while submitted < FRAMES || received < FRAMES {
-            if submitted < FRAMES {
-                if let Some(mut frame) = pipe.acquire() {
-                    frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-                    assert!(pipe.submit(frame));
-                    submitted += 1;
-                }
+            if submitted < FRAMES
+                && let Some(mut frame) = pipe.acquire()
+            {
+                frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
+                assert!(pipe.submit(frame));
+                submitted += 1;
             }
             if let Some(result) = pipe.try_recv() {
                 assert_eq!(result.hard().len(), n);

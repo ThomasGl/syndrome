@@ -5,7 +5,7 @@ changes to the library.
 
 ## Toolchain
 
-- **MSRV:** Rust **1.85** (Rust 2024 edition). The repo ships a
+- **MSRV:** Rust **1.97** (Rust 2024 edition). The repo ships a
   `rust-toolchain.toml` that selects the `stable` channel with `rustfmt` and
   `clippy`, so `rustup` will provision everything on first build.
 

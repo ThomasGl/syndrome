@@ -1,8 +1,8 @@
 [package]
 name = "syndrome"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97"
 license = "MIT"
 description = "Multi-standard Forward Error Correction in safe Rust: 5G NR TS 38.212 (QC-LDPC LOMS), Wi-Fi 6/7, Reed-Solomon, Viterbi and Polar codes, with AVX2/NEON SIMD and lock-free pipelining."
 authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
@@ -82,11 +82,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "fec_bench"
 harness = false
 
-# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`. Only three
-# clippy lints are allowed, each for a concrete reason; everything else is fixed
-# in the source rather than suppressed. (One rustc lint is also allowed, scoped
-# to three functions in src/turbo.rs — see the comment there; it resolves a
-# conflict between our MSRV and current stable that no single spelling satisfies.)
+# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`. Only two
+# lints are allowed, each for a concrete reason; everything else is fixed in
+# the source rather than suppressed.
 [lints.clippy]
 # Performance-intentional. CLAUDE.md mandates index-based, branch-free hot loops
 # (SoA + SIMD friendliness) in the LDPC/RS/Viterbi kernels. Rewriting these into
@@ -96,8 +94,3 @@ needless_range_loop = "allow"
 # The SIMD kernels in simd_avx2.rs take many flat pointer/length parameters by
 # design; bundling them into a struct would add indirection on the hot path.
 too_many_arguments = "allow"
-
-# `<integer>::is_multiple_of` was stabilized in Rust 1.87, but our MSRV is 1.85
-# (see rust-version in [package]). The manual `% n == 0` form is required to
-# build on the declared minimum toolchain.
-manual_is_multiple_of = "allow"

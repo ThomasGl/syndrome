@@ -142,7 +142,7 @@ impl DlSchEncoder {
         if qm == 0 {
             return Err(FecError::InvalidParam("qm must be >= 1"));
         }
-        if g == 0 || g % qm != 0 {
+        if g == 0 || !g.is_multiple_of(qm) {
             return Err(FecError::InvalidParam("G must be > 0 and divisible by Qm"));
         }
 
@@ -363,7 +363,7 @@ impl DlSchDecoder {
         if tb_size == 0 {
             return Err(FecError::InvalidParam("tb_size must be > 0"));
         }
-        if qm == 0 || g == 0 || g % qm != 0 {
+        if qm == 0 || g == 0 || !g.is_multiple_of(qm) {
             return Err(FecError::InvalidParam(
                 "Qm and G must be positive; G % Qm must be 0",
             ));

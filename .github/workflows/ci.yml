@@ -131,13 +131,13 @@ jobs:
         run: cargo fmt --all -- --check
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.97)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.85 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.97 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@v4
@@ -154,7 +154,7 @@ jobs:
       # proptest, ...) may track a newer toolchain and are not part of the
       # public MSRV contract.
       #
-      # `+1.85.0` is load-bearing. rust-toolchain.toml pins `channel = "stable"`,
+      # `+1.97.0` is load-bearing. rust-toolchain.toml pins `channel = "stable"`,
       # and a toolchain file outranks the `rustup default` that the setup action
       # sets — so a bare `cargo build` here silently compiled with stable and
       # this job proved nothing about the declared MSRV. An explicit `+toolchain`
@@ -164,7 +164,7 @@ jobs:
       - name: Build on MSRV
         run: |
           set -o pipefail
-          cargo +1.85.0 build --release 2>&1 | tee msrv-build.log
+          cargo +1.97.0 build --release 2>&1 | tee msrv-build.log
           if grep -q '^warning' msrv-build.log; then
             echo "::error::MSRV build emitted warnings (see log above)"
             exit 1

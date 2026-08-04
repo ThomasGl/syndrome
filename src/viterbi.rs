@@ -1542,7 +1542,7 @@ mod tests {
             let mut coded = dec.encode(&info);
             // Flip roughly 5% of coded bits at pseudo-random positions.
             for bit in coded.iter_mut() {
-                if splitmix64(&mut seed) % 20 == 0 {
+                if splitmix64(&mut seed).is_multiple_of(20) {
                     *bit ^= 1;
                 }
             }
@@ -1607,7 +1607,7 @@ mod tests {
             let mut coded = dec.encode(&info);
             // Flip roughly 5% of coded bits at pseudo-random positions.
             for bit in coded.iter_mut() {
-                if splitmix64(&mut seed) % 20 == 0 {
+                if splitmix64(&mut seed).is_multiple_of(20) {
                     *bit ^= 1;
                 }
             }

@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-08-04
+
+### Changed
+
+- **MSRV raised from 1.85 to 1.97** (latest stable at time of release). A
+  minor-version bump rather than a patch, because raising the MSRV is a real
+  breaking change for anyone still on an older toolchain — Cargo's default
+  caret matching (`^0.1.x`) would otherwise have handed this to existing
+  dependents automatically. `rust-toolchain.toml` already tracked `channel =
+  "stable"` generically, so no pin needed updating there; only the declared
+  floor moved.
+- Two workarounds that existed solely to reconcile the old MSRV against
+  current stable are gone, not just relaxed: three AVX2 helpers in
+  `src/turbo.rs` no longer need an inner `unsafe` block plus
+  `#[allow(unused_unsafe)]` (Rust 1.87 made `core::arch` intrinsic calls safe
+  from within an equally `#[target_feature]`-gated function; MSRV 1.97 is
+  past that), and the `manual_is_multiple_of` clippy allow is gone —
+  clippy's MSRV-aware lints now correctly suggest `.is_multiple_of()` in
+  `rate_matching.rs`, `transport_block.rs`, and a test in `viterbi.rs`
+  (`is_multiple_of` stabilized in 1.87, also now behind the floor), and two
+  `if`-let-chains simplify nested `if let Some(...) { if ... { ... } }`
+  patterns in `reed_solomon.rs`, `ldpc_pipeline.rs`, and
+  `src/bin/ldpc_pipeline_bench.rs`. None of this changes behavior; every
+  site was verified equivalent by the existing test suite passing unchanged.
+
 ## [0.1.3] — 2026-07-31
 
 ### Fixed

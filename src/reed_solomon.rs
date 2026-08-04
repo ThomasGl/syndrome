@@ -978,20 +978,20 @@ impl ReedSolomon {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if let Some(tables) = self.mul_tables.as_ref() {
-                if is_x86_feature_detected!("avx2") {
-                    let full_table = &tables[coef as usize];
-                    // Precomputed 16-byte lo/hi nibble tables (see
-                    // `nibble_tables`'s field doc) -- indexed, not rebuilt.
-                    // Always `Some` when `mul_tables` is (built together in
-                    // `precompute_mul_tables`).
-                    let [lo_tbl, hi_tbl] = &self.nibble_tables.as_ref().unwrap()[coef as usize];
-                    // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
-                    unsafe {
-                        crate::simd_avx2::gf256_muladd_avx2(src, dst, lo_tbl, hi_tbl, full_table);
-                    }
-                    return;
+            if let Some(tables) = self.mul_tables.as_ref()
+                && is_x86_feature_detected!("avx2")
+            {
+                let full_table = &tables[coef as usize];
+                // Precomputed 16-byte lo/hi nibble tables (see
+                // `nibble_tables`'s field doc) -- indexed, not rebuilt.
+                // Always `Some` when `mul_tables` is (built together in
+                // `precompute_mul_tables`).
+                let [lo_tbl, hi_tbl] = &self.nibble_tables.as_ref().unwrap()[coef as usize];
+                // SAFETY: AVX2 presence was verified above by is_x86_feature_detected.
+                unsafe {
+                    crate::simd_avx2::gf256_muladd_avx2(src, dst, lo_tbl, hi_tbl, full_table);
                 }
+                return;
             }
         }
 

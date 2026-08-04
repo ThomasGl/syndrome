@@ -163,12 +163,12 @@ fn measure(decoder: QcLdpcDecoder, n_workers: usize, n: usize, noisy_llr: &[f32]
     let mut submitted = 0usize;
     let mut received = 0usize;
     while received < WARMUP_FRAMES {
-        if submitted < WARMUP_FRAMES {
-            if let Some(mut frame) = pipe.acquire() {
-                frame.llr_mut().copy_from_slice(noisy_llr);
-                pipe.submit(frame);
-                submitted += 1;
-            }
+        if submitted < WARMUP_FRAMES
+            && let Some(mut frame) = pipe.acquire()
+        {
+            frame.llr_mut().copy_from_slice(noisy_llr);
+            pipe.submit(frame);
+            submitted += 1;
         }
         if let Some(result) = pipe.try_recv() {
             pipe.release(result);
@@ -184,12 +184,12 @@ fn measure(decoder: QcLdpcDecoder, n_workers: usize, n: usize, noisy_llr: &[f32]
     let start = Instant::now();
 
     while received < BENCH_FRAMES {
-        if submitted < BENCH_FRAMES {
-            if let Some(mut frame) = pipe.acquire() {
-                frame.llr_mut().copy_from_slice(noisy_llr);
-                pipe.submit(frame);
-                submitted += 1;
-            }
+        if submitted < BENCH_FRAMES
+            && let Some(mut frame) = pipe.acquire()
+        {
+            frame.llr_mut().copy_from_slice(noisy_llr);
+            pipe.submit(frame);
+            submitted += 1;
         }
         if let Some(result) = pipe.try_recv() {
             total_iterations_used += result.iterations_used() as u64;

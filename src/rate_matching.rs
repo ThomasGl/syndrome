@@ -196,7 +196,7 @@ pub fn rate_match(
         return Err(FecError::InvalidParam("lifting size Z must be > 0"));
     }
     let e_bits = e_out.len();
-    if e_bits % qm != 0 {
+    if !e_bits.is_multiple_of(qm) {
         return Err(FecError::InvalidParam("E must be divisible by Qm"));
     }
 
@@ -322,7 +322,7 @@ pub fn rate_dematch_llr(
         return Err(FecError::InvalidParam("lifting size Z must be > 0"));
     }
     let e_bits = e_llr.len();
-    if e_bits % qm != 0 {
+    if !e_bits.is_multiple_of(qm) {
         return Err(FecError::InvalidParam("E must be divisible by Qm"));
     }
 
@@ -609,7 +609,7 @@ impl RateMatchCache {
             return Err(FecError::InvalidParam("lifting size Z must be > 0"));
         }
         let e_bits = e_out.len();
-        if e_bits % qm != 0 {
+        if !e_bits.is_multiple_of(qm) {
             return Err(FecError::InvalidParam("E must be divisible by Qm"));
         }
 
@@ -691,7 +691,7 @@ impl RateMatchCache {
             return Err(FecError::InvalidParam("lifting size Z must be > 0"));
         }
         let e_bits = e_llr.len();
-        if e_bits % qm != 0 {
+        if !e_bits.is_multiple_of(qm) {
             return Err(FecError::InvalidParam("E must be divisible by Qm"));
         }
 
