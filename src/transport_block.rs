@@ -411,6 +411,28 @@ impl DlSchDecoder {
         })
     }
 
+    /// Total received coded bits $G$ expected by [`DlSchDecoder::decode`]'s
+    /// `rx_llr` argument (concatenation of all CB rate-matched inputs).
+    ///
+    /// This is the value to size `rx_llr` from — not the raw `g` passed to
+    /// [`DlSchDecoder::new`]. `g` is rounded down internally to a multiple of
+    /// `Qm` per code block (matching [`DlSchEncoder::output_bits`], which
+    /// this must stay equal to for a given `(tb_size, target_rate, qm, g)`),
+    /// so the two only coincide when `g` was already a multiple of
+    /// `Qm * num_code_blocks`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::transport_block::{DlSchEncoder, DlSchDecoder};
+    /// let enc = DlSchEncoder::new(200, 0.5, 1, 512).unwrap();
+    /// let dec = DlSchDecoder::new(200, 0.5, 1, 512, 10, 0.25).unwrap();
+    /// assert_eq!(enc.output_bits(), dec.output_bits());
+    /// ```
+    pub fn output_bits(&self) -> usize {
+        self.e_per_cb * self.params.c
+    }
+
     /// Decode a received LLR vector into a transport block.
     ///
     /// The HARQ accumulators are updated with this transmission before
@@ -504,9 +526,23 @@ impl DlSchDecoder {
             //
             // Correct mapping: harq_buf[0..N-2Z] → llr_cb[2Z..N]
             //                  llr_cb[0..2Z] stays 0.0 (decode_5g enforces this anyway).
+            //
+            // `ncb` (n_b * Z: 66Z for BG1, 50Z for BG2 — see HarqBuffer::new) is
+            // ALREADY defined as N - 2Z, since n_b is 2 less than the base
+            // graph's total column count (68 for BG1, 52 for BG2). So `ncb` is
+            // exactly the valid length above, with no further subtraction — a
+            // previous version computed `ncb - 2Z` here, double-subtracting the
+            // puncture width and silently dropping the last 2Z accumulated LLRs
+            // of every HARQ-combined codeword (the positions rv=2/rv=3
+            // retransmissions are specifically walking into) on the floor before
+            // they ever reached the decoder.
             let two_z = 2 * z;
-            let ncb = harq_bufs[ci].ncb();
-            let valid_len = ncb.saturating_sub(two_z);
+            let valid_len = harq_bufs[ci].ncb();
+            debug_assert_eq!(
+                two_z + valid_len,
+                n,
+                "ncb (N - 2Z) plus the punctured prefix must exactly fill the N-length decode buffer"
+            );
             llr_cb[..n].iter_mut().for_each(|v| *v = 0.0); // zero the full buffer first
             {
                 let harq_data = harq_bufs[ci].llr_buffer();
@@ -635,6 +671,56 @@ mod tests {
         assert!(report.max_iters_used <= 10);
     }
 
+    /// Regression test for a `g` that is not already a multiple of
+    /// `Qm * num_code_blocks`. Every other round-trip test in this module
+    /// happens to pass a "nice" `g` (either `qm = 1`, which makes the
+    /// rounding a no-op, or `g = c * n`, the full unpunctured codeword), so
+    /// none of them ever exercised the rounding-down that both
+    /// `DlSchEncoder::new` and `DlSchDecoder::new` do internally
+    /// (`e_per_cb = (g / c / qm) * qm`). This case is chosen so the real
+    /// output length (8000) differs from the raw `g` passed in (8002),
+    /// which is exactly the condition `DlSchDecoder::output_bits` exists to
+    /// report correctly instead of a caller assuming `rx_llr.len() == g`.
+    #[test]
+    fn round_trip_with_g_not_a_multiple_of_qm_times_c() {
+        let (tb_size, rate, qm, g) = (3824usize, 0.5f32, 2usize, 8002usize);
+        let params = compute_segmentation(tb_size, rate).unwrap();
+        assert_eq!(
+            params.c, 2,
+            "test assumes C=2 so the rounding actually bites"
+        );
+
+        let enc = DlSchEncoder::new(tb_size, rate, qm, g).unwrap();
+        let mut dec = DlSchDecoder::new(tb_size, rate, qm, g, 20, 0.25).unwrap();
+
+        assert_eq!(
+            enc.output_bits(),
+            dec.output_bits(),
+            "encoder and decoder must agree on the real (rounded) coded length"
+        );
+        assert!(
+            enc.output_bits() < g,
+            "g={g} was chosen to not already be a multiple of qm*c; if this fails the \
+             test fixture needs a different g, not the assertion relaxed"
+        );
+
+        let tb: Vec<u8> = (0..tb_size).map(|i| ((i * 7 + 3) % 5 < 2) as u8).collect();
+        let mut coded = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded).unwrap();
+
+        let llr: Vec<f32> = coded
+            .iter()
+            .map(|&b| if b == 0 { 10.0 } else { -10.0 })
+            .collect();
+        let mut tb_out = vec![0u8; tb_size];
+        // Sized from dec.output_bits(), not the raw g — this is the buffer a
+        // correct caller builds, and decode() must accept it.
+        let report = dec.decode(&llr, 0, &mut tb_out).unwrap();
+
+        assert!(report.crc_ok, "CRC failed to pass over a noiseless channel");
+        assert_eq!(tb_out, tb, "recovered payload mismatch");
+    }
+
     #[test]
     fn invalid_params_rejected() {
         assert!(DlSchEncoder::new(0, 0.5, 1, 512).is_err());
@@ -704,6 +790,69 @@ mod tests {
                 "tb_size={tb_size} rate={rate}: recovered payload mismatch"
             );
         }
+    }
+
+    /// Regression test for the HARQ off-by-2Z bug: `decode`'s mapping from
+    /// `HarqBuffer::llr_buffer()` into the LDPC decoder's LLR array dropped
+    /// the last 2Z accumulated positions (see the comment on `valid_len` in
+    /// `decode`). A single noisy transmission that fails CRC alone, combined
+    /// with a second, independently-noisy transmission of the same
+    /// codeword, must recover the transport block — this is HARQ combining's
+    /// entire reason to exist, and losing 2Z worth of accumulated LLR per
+    /// code block is exactly the kind of degradation that turns a
+    /// borderline combined decode back into a failure without ever raising
+    /// an error.
+    ///
+    /// The second shot MUST be an incremental-redundancy retransmission
+    /// (`rv=3`, not `rv=0` again) for this test to actually exercise the
+    /// bug: at `rv=0`, the rate-matching bit-selection walk starts at
+    /// circular-buffer offset `k0=0` and — for a `g` this small — never
+    /// reaches the tail 2Z positions the fix restores, so a first version of
+    /// this test using `rv=0` for both shots passed identically whether or
+    /// not the bug was present. `rv=3`'s `k0` walk is specifically what
+    /// reaches into that tail (see the comment on `valid_len` in `decode`).
+    /// Parameters found by grid search over (`Eb/N0`, seed pairs) for a case
+    /// that both (a) has shot 1 fail alone and shot 1+2 combined succeed,
+    /// and (b) was confirmed, by temporarily reverting just the `valid_len`
+    /// fix, to fail under the old buggy code — so this is a verified
+    /// regression guard, not merely a plausible-looking one.
+    #[test]
+    fn harq_combining_recovers_a_block_that_fails_alone() {
+        use crate::channel_sim::AwgnChannel;
+
+        let (tb_size, rate, qm, g) = (400usize, 0.5f32, 1usize, 700usize);
+        let (ebno_db, seed_a, seed_b) = (-1.5f32, 1u64, 1001u64);
+
+        let enc = DlSchEncoder::new(tb_size, rate, qm, g).unwrap();
+        let mut dec = DlSchDecoder::new(tb_size, rate, qm, g, 20, 0.25).unwrap();
+        let tb: Vec<u8> = (0..tb_size).map(|i| ((i * 7 + 3) % 5 < 2) as u8).collect();
+
+        let mut coded_rv0 = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded_rv0).unwrap();
+        let mut coded_rv3 = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 3, &mut coded_rv3).unwrap();
+
+        let mut tb_out = vec![0u8; tb_size];
+
+        let mut ch_a = AwgnChannel::new(ebno_db, rate, seed_a);
+        let llr_a = ch_a.transmit(&coded_rv0);
+        let report_a = dec.decode(&llr_a, 0, &mut tb_out).unwrap();
+        assert!(
+            !report_a.crc_ok,
+            "fixture regressed: shot 1 alone now succeeds, so this case no longer tests combining"
+        );
+
+        let mut ch_b = AwgnChannel::new(ebno_db, rate, seed_b);
+        let llr_b = ch_b.transmit(&coded_rv3);
+        let report_b = dec.decode(&llr_b, 3, &mut tb_out).unwrap();
+        assert!(
+            report_b.crc_ok,
+            "HARQ-combined decode failed to recover a block that a single shot alone could not"
+        );
+        assert_eq!(
+            tb_out, tb,
+            "recovered payload mismatch after HARQ combining"
+        );
     }
 
     #[test]

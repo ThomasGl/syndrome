@@ -217,10 +217,10 @@ effects were conflated:
    input, `OVERHEAD_ROUNDS = 5` times, within one process, alternating which
    side runs first each round, before the worker-count sweep runs.
 
-   Eleven such same-process runs, across two work sessions, gave: 0.4%, 1.9%,
-   4.5%, 5.5%, 6.0%, 6.4%, 6.8%, 7.6%, 7.6%, 8.6%, 8.8%, 12.0%, 13.4%, 16.7%,
-   18.1%, 21.8% (yes, more than eleven numbers — several sessions' worth are
-   pooled here; the point is the spread, not the count). This machine is a
+   A dozen such same-process runs, across several work sessions, gave: 0.4%,
+   1.9%, 4.5%, 5.5%, 6.0%, 6.4%, 6.8%, 7.6%, 7.6%, 8.6%, 8.8%, 9.9%, 12.0%,
+   13.4%, 16.7%, 18.1%, 21.8% (yes, more numbers than the round count — the
+   point is the spread, not the count). This machine is a
    shared, virtualized host whose background load is outside this
    benchmark's control, and the isolated-overhead figure is genuinely
    sensitive to it — small enough in absolute terms (single-digit to

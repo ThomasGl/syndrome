@@ -36,6 +36,37 @@
 /// let llrs = ch.transmit(&bits);
 /// assert_eq!(llrs.len(), bits.len());
 /// ```
+/// Mix a `u64` seed into a well-distributed, (for all practical purposes)
+/// non-zero xorshift64 initial state.
+///
+/// This is the standard SplitMix64 output mixer, the usual way to turn a
+/// small, low-entropy seed (`0`, `1`, `2`, ...) into a state suitable for a
+/// generator like xorshift64 that has no mixing step of its own on
+/// construction. Two reasons a raw seed isn't good enough on its own:
+///
+/// 1. Xorshift64's all-zero state is a fixed point (it never leaves it), so
+///    `seed = 0` must be avoided.
+/// 2. Xorshift64's *state transition* is a lightweight bit permutation with
+///    weak diffusion between seeds that differ only in low bits — feeding
+///    consecutive small integers straight in as state risks correlated
+///    early output, not just an exact collision.
+///
+/// A previous version instead special-cased `seed | 1`, which produced only
+/// problem #1's fix while *introducing* a new instance of problem #2: it
+/// forced every seed's low bit to 1, making every `(even, even + 1)` pair
+/// collide onto an identical state and therefore identical noise. A second
+/// attempt special-cased `seed == 0 => 1`, which is well-intentioned but
+/// itself collides with the literal seed `1`. Hashing avoids the whole
+/// category of "which small integers accidentally collide" bugs rather than
+/// patching them one report at a time.
+fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    if z == 0 { 1 } else { z } // astronomically unlikely, but keep the invariant absolute
+}
+
 pub struct AwgnChannel {
     /// Internal PRNG state (xorshift64; guaranteed non-zero).
     state: u64,
@@ -50,8 +81,10 @@ impl AwgnChannel {
     ///
     /// * `ebno_db`    — $E_b/N_0$ in decibels.
     /// * `code_rate`  — Code rate $R \in (0, 1]$ (e.g. `0.5` for rate-1/2).
-    /// * `seed`       — PRNG seed; the value `0` is mapped to `1` to prevent
-    ///   the degenerate all-zero xorshift state.
+    /// * `seed`       — PRNG seed. Every `u64` value, including `0`, is
+    ///   accepted and produces a distinct, well-mixed noise sequence: the
+    ///   seed is hashed (SplitMix64) into the xorshift state rather than
+    ///   used directly, so small integer seeds don't collide or correlate.
     ///
     /// # Returns
     ///
@@ -70,7 +103,7 @@ impl AwgnChannel {
         let ebno_linear = 10.0_f32.powf(ebno_db / 10.0);
         let sigma = (1.0 / (2.0 * code_rate * ebno_linear)).sqrt();
         Self {
-            state: seed | 1, // prevent zero state
+            state: splitmix64(seed),
             sigma,
         }
     }
@@ -336,5 +369,25 @@ mod tests {
         let llrs1 = ch1.transmit(&bits);
         let llrs2 = ch2.transmit(&bits);
         assert_eq!(llrs1, llrs2);
+    }
+
+    /// Regression test for the `seed | 1` bug: every (even, even+1) seed
+    /// pair used to collapse onto the same xorshift state and therefore
+    /// produce byte-identical noise, silently defeating anything that relied
+    /// on two "different" seeds giving independent realizations (e.g. HARQ
+    /// retransmission testing). Checked over consecutive pairs, including
+    /// the seed-0 special case, and over non-adjacent seeds for good
+    /// measure.
+    #[test]
+    fn adjacent_seeds_are_not_identical() {
+        let bits: Vec<u8> = (0..256).map(|i| (i % 3 == 0) as u8).collect();
+        for (a, b) in [(0u64, 1u64), (2, 3), (4, 5), (100, 101), (1_000, 1_001)] {
+            let llrs_a = AwgnChannel::new(3.0, 0.5, a).transmit(&bits);
+            let llrs_b = AwgnChannel::new(3.0, 0.5, b).transmit(&bits);
+            assert_ne!(
+                llrs_a, llrs_b,
+                "seeds {a} and {b} produced identical noise; the seed-remapping regression is back"
+            );
+        }
     }
 }

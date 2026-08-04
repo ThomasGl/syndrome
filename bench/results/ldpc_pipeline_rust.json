@@ -5,43 +5,43 @@
       {
         "round": 0,
         "measured_first": "tight_loop",
-        "tight_loop_melem_per_s": 153.36734840845483,
-        "pipeline_1worker_melem_per_s": 147.54184471934593,
-        "ratio": 1.0394837390042817
+        "tight_loop_melem_per_s": 173.24162717384087,
+        "pipeline_1worker_melem_per_s": 159.18543835791283,
+        "ratio": 1.0883007199711576
       },
       {
         "round": 1,
         "measured_first": "pipeline",
-        "tight_loop_melem_per_s": 146.00073475630185,
-        "pipeline_1worker_melem_per_s": 153.2022566617307,
-        "ratio": 0.9529933692730796
+        "tight_loop_melem_per_s": 176.61875376129902,
+        "pipeline_1worker_melem_per_s": 157.81497050506374,
+        "ratio": 1.119150820711473
       },
       {
         "round": 2,
         "measured_first": "tight_loop",
-        "tight_loop_melem_per_s": 155.00213969080372,
-        "pipeline_1worker_melem_per_s": 156.6699528877276,
-        "ratio": 0.9893546071458957
+        "tight_loop_melem_per_s": 171.9838566278077,
+        "pipeline_1worker_melem_per_s": 161.40681168270066,
+        "ratio": 1.0655303505151925
       },
       {
         "round": 3,
         "measured_first": "pipeline",
-        "tight_loop_melem_per_s": 154.92845224061386,
-        "pipeline_1worker_melem_per_s": 152.80814978577874,
-        "ratio": 1.013875584893918
+        "tight_loop_melem_per_s": 173.5113657758974,
+        "pipeline_1worker_melem_per_s": 157.62435849279552,
+        "ratio": 1.1007903057307478
       },
       {
         "round": 4,
         "measured_first": "tight_loop",
-        "tight_loop_melem_per_s": 117.75194289488213,
-        "pipeline_1worker_melem_per_s": 120.83321990565224,
-        "ratio": 0.9744997525252079
+        "tight_loop_melem_per_s": 174.65666016887081,
+        "pipeline_1worker_melem_per_s": 143.77489096605504,
+        "ratio": 1.214792506503148
       }
     ],
-    "median_tight_loop_melem_per_s": 153.36734840845483,
-    "median_pipeline_1worker_melem_per_s": 152.80814978577874,
-    "pipeline_overhead_ratio": 1.003659481666783,
-    "pipeline_overhead_pct": 0.3659481666782982
+    "median_tight_loop_melem_per_s": 173.5113657758974,
+    "median_pipeline_1worker_melem_per_s": 157.81497050506374,
+    "pipeline_overhead_ratio": 1.0994607496399083,
+    "pipeline_overhead_pct": 9.946074963990824
   },
   "worker_sweep": [
     {
@@ -53,9 +53,9 @@
       "n_frames": 1000,
       "n_workers": 1,
       "mean_iters_per_frame": 5.0,
-      "ns_per_frame": 1179551.712,
-      "frames_per_s": 847.7797029385346,
-      "melem_per_s": 110.68611801565508,
+      "ns_per_frame": 984132.902,
+      "frames_per_s": 1016.122921983153,
+      "melem_per_s": 132.66500869412044,
       "speedup_vs_1_worker": 1.0
     },
     {
@@ -67,10 +67,10 @@
       "n_frames": 1000,
       "n_workers": 2,
       "mean_iters_per_frame": 5.0,
-      "ns_per_frame": 610626.719,
-      "frames_per_s": 1637.6617152254028,
-      "melem_per_s": 213.81311353982858,
-      "speedup_vs_1_worker": 1.9317066798709803
+      "ns_per_frame": 558769.48,
+      "frames_per_s": 1789.6467788469763,
+      "melem_per_s": 233.65628344626123,
+      "speedup_vs_1_worker": 1.7612502780216273
     },
     {
       "lang": "rust",
@@ -81,10 +81,10 @@
       "n_frames": 1000,
       "n_workers": 4,
       "mean_iters_per_frame": 5.0,
-      "ns_per_frame": 304808.213,
-      "frames_per_s": 3280.7514933989,
-      "melem_per_s": 428.3349149781604,
-      "speedup_vs_1_worker": 3.869816040685229
+      "ns_per_frame": 297566.637,
+      "frames_per_s": 3360.591799140439,
+      "melem_per_s": 438.7588652957757,
+      "speedup_vs_1_worker": 3.307268959725482
     },
     {
       "lang": "rust",
@@ -95,10 +95,10 @@
       "n_frames": 1000,
       "n_workers": 8,
       "mean_iters_per_frame": 5.0,
-      "ns_per_frame": 198579.549,
-      "frames_per_s": 5035.765289204075,
-      "melem_per_s": 657.4695161584841,
-      "speedup_vs_1_worker": 5.939945568110843
+      "ns_per_frame": 237538.028,
+      "frames_per_s": 4209.852243111153,
+      "melem_per_s": 549.6383088605921,
+      "speedup_vs_1_worker": 4.143054105004189
     }
   ]
 }

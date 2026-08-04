@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-07-31
+
+### Fixed
+
+- **`AwgnChannel::new` seeded xorshift64 with `seed | 1`, silently colliding
+  every `(even, even + 1)` seed pair onto identical noise.** `0` and `1`
+  produced the same sequence, as did `2`/`3`, `100`/`101`, and so on for
+  every consecutive pair — two channels built with "different" seeds could
+  transmit byte-identical noise. The seed is now mixed through SplitMix64
+  before becoming the xorshift state, which is both collision-free (the
+  mixer is a bijection) and free of the weak diffusion between low-bit-similar
+  seeds that a raw `seed | 1` (or a naive `if seed == 0 { 1 }`, which merely
+  trades the bug for a new collision against the literal seed `1`) would
+  still carry. Found while investigating why a HARQ combining test was
+  silently combining a transmission with itself.
+- **`DlSchDecoder::decode` dropped the last `2Z` accumulated HARQ LLRs of
+  every code block before they reached the LDPC decoder.** The mapping from
+  the HARQ circular buffer into the decoder's LLR array computed
+  `valid_len = ncb - 2Z`, double-subtracting the puncture width: `ncb`
+  (`HarqBuffer`'s circular buffer size) is already `N - 2Z` by construction,
+  so the correct value is `ncb` with no further subtraction. The bug never
+  panicked or returned an error — it silently zeroed real information the
+  receiver had (worth roughly one AVX2 decode iteration's amount of data per
+  code block), and specifically weakened incremental-redundancy
+  retransmissions at RV 2 and RV 3, whose rate-matching walk reaches into
+  exactly the dropped region. A test decoding a real, `AwgnChannel`-corrupted
+  codeword confirms an RV0 transmission that fails CRC alone is recovered by
+  combining it with an RV3 retransmission, and was verified — by temporarily
+  reverting only this fix — to fail under the old code.
+- `DlSchDecoder` had no way to report the real (rounded) coded length it
+  expects, so a caller could only guess it from the raw `g` constructor
+  argument — wrong whenever `g` wasn't already a multiple of
+  `Qm * num_code_blocks`. Added `DlSchDecoder::output_bits`, mirroring the
+  accessor `DlSchEncoder` already had.
+
 ## [0.1.2] — 2026-07-29
 
 ### Added

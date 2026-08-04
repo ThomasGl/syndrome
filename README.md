@@ -3,7 +3,7 @@
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-297%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-301%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -14,7 +14,7 @@
 ![QC-LDPC layered offset min-sum decode converging on a real, noise-corrupted 802.11 Wi-Fi codeword](bench/dashboard/exports/ldpc_convergence.gif)
 
 *A real 802.11ax/be Wi-Fi LDPC codeword (Z=27, rate 1/2, 648 bits), encoded by
-this crate, sent through a simulated BPSK/AWGN channel at 0.0 dB Eb/N0 (81
+this crate, sent through a simulated BPSK/AWGN channel at 0.0 dB Eb/N0 (96
 bits corrupted), and decoded by the layered offset min-sum kernel in
 [`src/qc_ldpc.rs`](src/qc_ldpc.rs). Every frame is a hard-decision snapshot
 taken after one real decode iteration — the bit-error count is the actual
@@ -40,7 +40,7 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 297 total on x86-64 (298 on AArch64, +1 NEON-only) — 162 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 76 doctests |
+| **Tests** | 301 total on x86-64 (302 on AArch64, +1 NEON-only) — 165 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 77 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~215 Melem/s · all numbers from running code |
@@ -390,7 +390,7 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (297 tests total on x86-64; 298 on AArch64)
+### 4.1 Component coverage (301 tests total on x86-64; 302 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
@@ -446,12 +446,21 @@ Each test encodes a real payload, simulates BPSK AWGN at multiple SNR levels, de
 | `wifi6_frame_reconstruction` | 63 bytes (Wi-Fi data frame) | Wi-Fi 6 MCS7 proxy, R=5/6 | 7 dB Eb/No | ✓ perfect |
 | `sixg_embb_ultra_reliable` | 250 bytes (6G eMBB block) | 6G BG1, Z=96, R=0.89 | 12 dB Eb/No | ✓ perfect |
 
-Sample output (`--nocapture`):
+Sample output (`cargo test --release --test media_reconstruction audio_frame_5g_nr_reconstruction -- --nocapture`):
 ```
-[audio_frame] Eb/No waterfall:
-  Eb/No = 1.0 dB → BER = 0.1823 (no convergence)
-  Eb/No = 3.0 dB → BER = 0.0412
-  Eb/No = 5.0 dB → BER = 0.0000  ✓  CRC PASS — bit-exact reconstruction
+════════════════════════════════════════════════════════════
+  Audio Frame — Opus-style 100-byte frame over 5G NR
+  TB size: 800bits (100bytes) | Rate: 0.5 | Standard: 5G NR
+════════════════════════════════════════════════════════════
+ Eb/No (dB) │ Raw BER     │ FEC BER     │ CRC  │ Iter
+────────────┼─────────────┼─────────────┼──────┼─────
+       -1.0  │ 0.1888      │ 0.5000       │ FAIL ✗ │ 20
+        0.0  │ 0.1588      │ 0.5000       │ FAIL ✗ │ 20
+        1.0  │ 0.1325      │ 0.5000       │ FAIL ✗ │ 20
+        2.0  │ 0.0994      │ 0.0000       │ PASS ✓ │ 6
+        3.0  │ 0.0719      │ 0.0000       │ PASS ✓ │ 4
+        4.0  │ 0.0569      │ 0.0000       │ PASS ✓ │ 3
+        5.0  │ 0.0362      │ 0.0000       │ PASS ✓ │ 2
 ```
 
 ---
@@ -558,10 +567,10 @@ lock-free SPSC ring architecture described in §6.
 
 | Workers | Aggregate throughput | Speed-up vs. 1 worker | Efficiency vs. ideal linear |
 |---|---|---|---|
-| 1 | 111 Melem/s | 1.00× | 100% |
-| 2 | 214 Melem/s | 1.93× | 97% |
-| 4 | 428 Melem/s | 3.87× | 97% |
-| 8 | 657 Melem/s | 5.94× | 74% |
+| 1 | 133 Melem/s | 1.00× | 100% |
+| 2 | 234 Melem/s | 1.76× | 88% |
+| 4 | 439 Melem/s | 3.31× | 83% |
+| 8 | 550 Melem/s | 4.14× | 52% |
 
 Scaling is close to linear through 4 workers here, then falls off at 8. The
 lock-free rings themselves add no serialization at any worker count; what
@@ -622,11 +631,11 @@ $E_b/N_0 \ge (2^{2R}-1)/(2R) \approx -0.6\ \text{dB}$.
 
 | Eb/No (dB) | BER | BLER | Frames simulated |
 |---|---|---|---|
-| −1.0 | ~0.25 | 1.00 | 50 |
-| 0.0 | ~0.21 | 1.00 | 50 |
-| 0.5 | ~0.13 | 1.00 | 50 |
-| 1.0 | ~7.6×10⁻⁴ | 0.18 | 283 |
-| 1.5 | < 10⁻⁷ | < 2×10⁻³ | 500 (0 errors) |
+| −1.0 | 0.2504 | 1.00 | 50 |
+| 0.0 | 0.2062 | 1.00 | 50 |
+| 0.5 | 0.1282 | 1.00 | 50 |
+| 1.0 | 7.60×10⁻⁴ | 0.177 | 283 |
+| 1.5 | 0 (0 errors) | 0 (0 errors) | 500 |
 
 The waterfall region (0.5 → 1.5 dB) represents **~6 dB coding gain** over uncoded BPSK — the property that makes LDPC essential to every modern wireless standard.
 
