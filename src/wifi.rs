@@ -25,18 +25,27 @@
 //! combinations, cross-validated against the IEEE 802.11n-2009 standard text
 //! itself) now live in [`crate::wifi_ldpc_tables`].
 //!
-//! # What is real vs. still planned
+//! # What is real vs. still out of scope
 //!
 //! **Real today:** full, unshortened, unpunctured codeword encode/decode
 //! ($K$ info bits exactly filling $N = 24Z$ coded bits) for all 12 $(Z, R)$
 //! combinations, using the actual IEEE 802.11 Annex R/F shift matrices —
 //! see `tests/wifi_ldpc_integration.rs` for encode -> AWGN -> decode
-//! round-trips.
+//! round-trips. **Shortening and puncturing** (a payload smaller than $K$,
+//! a transmitted length smaller than the post-shortening budget) are also
+//! implemented, in [`crate::wifi_rate_matching`] — see that module's docs
+//! and `tests/wifi_shortening_puncturing_integration.rs` for the same
+//! encode -> AWGN -> decode round-trip with genuine shortening and
+//! puncturing applied, across all 12 combinations.
 //!
-//! **Still planned (not in this pass):**
-//! * **Shortening** — padding a payload smaller than $K$ before encoding.
-//! * **Puncturing / rate-matching** — the per-MCS coded-bit selection that
-//!   maps a full codeword onto the actual transmitted bit count.
+//! **Still out of scope:**
+//! * Multi-codeword segmentation — a payload larger than one codeword's
+//!   $K$ is rejected, not split across several LDPC codewords (see
+//!   [`crate::wifi_rate_matching`]'s module docs).
+//! * The 802.11 PPDU-level formula that derives *how many* coded bits are
+//!   available for a given MCS/bandwidth/PSDU length (IEEE 802.11-2020
+//!   §19.5.3.2) — [`crate::wifi_rate_matching::encode_shortened`] takes the
+//!   transmitted length directly rather than deriving it.
 //! * The rest of the 802.11 PHY chain (scrambling, interleaving, OFDM
 //!   subcarrier mapping) — out of scope for this FEC-only crate.
 //!
@@ -125,8 +134,10 @@ impl WifiLdpcParams {
     /// matrix (see [`crate::wifi_ldpc_tables`] for sourcing).
     ///
     /// Handles exactly one full, unshortened, unpunctured codeword: `K`
-    /// info bits in, `N = 24*z` coded bits out. Shortening/puncturing are
-    /// not implemented — see the module doc.
+    /// info bits in, `N = 24*z` coded bits out. For a payload smaller than
+    /// `K` and/or a transmitted length smaller than `N`, encode through
+    /// this encoder via [`crate::wifi_rate_matching::encode_shortened`]
+    /// instead — see that module's doc.
     ///
     /// # Errors
     ///

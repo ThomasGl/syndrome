@@ -6,9 +6,10 @@
 //! verify the encode -> AWGN -> decode round-trip for a **full, unshortened,
 //! unpunctured codeword** ($K$ info bits exactly fill $N = 24Z$ coded bits).
 //!
-//! Shortening and puncturing (802.11 rate-matching for a specific MCS) are
-//! out of scope for this pass — see the module docs on
-//! `syndrome::wifi_ldpc_tables` and the CHANGELOG.
+//! For shortening and puncturing (a payload smaller than $K$, a
+//! transmitted length smaller than $N$), see
+//! `syndrome::wifi_rate_matching` and
+//! `tests/wifi_shortening_puncturing_integration.rs`.
 
 use syndrome::channel_sim::AwgnChannel;
 use syndrome::wifi_ldpc_tables::{wifi_ldpc_decoder, wifi_ldpc_encoder};

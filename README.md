@@ -3,7 +3,7 @@
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-301%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-313%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -40,7 +40,7 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 301 total on x86-64 (302 on AArch64, +1 NEON-only) — 165 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 10 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 77 doctests |
+| **Tests** | 313 total on x86-64 (314 on AArch64, +1 NEON-only) — 172 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 12 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 80 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~215 Melem/s · all numbers from running code |
@@ -68,11 +68,16 @@ its MCS 0–13 tables (up to 4096-QAM) and LDPC parameter selection, and
 [`wifi_ldpc_tables.rs`](src/wifi_ldpc_tables.rs) carries the real
 802.11 Annex R/F shift matrices for all 12 $(Z, R)$ combinations
 ($Z \in \{27, 54, 81\}$, $R \in \{1/2, 2/3, 3/4, 5/6\}$), cross-validated
-against the IEEE 802.11n-2009 standard text itself — so a full,
-unshortened, unpunctured 802.11 codeword genuinely encodes and decodes
-through the same LOMS kernel as 5G NR (`tests/wifi_ldpc_integration.rs`).
-Shortening and puncturing/rate-matching (the per-MCS coded-bit selection)
-are not implemented yet — see the `wifi`/`wifi_ldpc_tables` module docs. 6G
+against the IEEE 802.11n-2009 standard text itself — so an 802.11 codeword
+genuinely encodes and decodes through the same LOMS kernel as 5G NR, with
+real shortening (a payload smaller than $K$) and puncturing (a transmitted
+length smaller than the post-shortening budget) via
+[`wifi_rate_matching.rs`](src/wifi_rate_matching.rs)
+(`tests/wifi_ldpc_integration.rs`,
+`tests/wifi_shortening_puncturing_integration.rs`). Multi-codeword
+segmentation and the 802.11 PPDU-level formula that derives the available
+coded-bit count for a given MCS are not implemented — see the
+`wifi_rate_matching` module docs. 6G
 (IMT-2030) is still in the requirements phase: every serious candidate is an
 evolution of the LDPC/polar families already in this table, and
 [`sixg.rs`](src/sixg.rs) models the research-profile transport-block
@@ -390,17 +395,18 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (301 tests total on x86-64; 302 on AArch64)
+### 4.1 Component coverage (313 tests total on x86-64; 314 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 161 (x86-64) / 162 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 172 (x86-64) / 173 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | Wi-Fi LDPC integration (encode→AWGN→decode, all 12 (Z,R)) | 3 | `tests/wifi_ldpc_integration.rs` |
+| Wi-Fi shortening/puncturing integration (encode→AWGN→decode, all 12 (Z,R)) | 2 | `tests/wifi_shortening_puncturing_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 31 | `tests/robustness.rs` |
-| Doctests | 75 | `///` examples in all public API |
+| Doctests | 80 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
@@ -738,9 +744,14 @@ sourcing note. `wifi_ldpc_encoder(z, rate_num, rate_den)` /
 `WifiLdpcParams::build_encoder`/`build_decoder`) build a real
 `QcLdpcEncoder`/`QcLdpcDecoder` — a genuine 802.11 codeword now encodes,
 survives an AWGN channel, and decodes bit-exact through the identical LOMS
-kernel used for 5G NR. This covers the full, unshortened, unpunctured
-codeword case only; 802.11 shortening (payloads smaller than $K$) and
-puncturing/rate-matching (per-MCS coded-bit selection) are not implemented.
+kernel used for 5G NR, including a payload smaller than $K$ (shortening) and
+a transmitted length smaller than the post-shortening budget (puncturing)
+via `wifi_rate_matching::{encode_shortened, decode_shortened}` — see
+`tests/wifi_shortening_puncturing_integration.rs` for the encode → AWGN →
+decode round-trip across all 12 combinations. Multi-codeword segmentation
+(a payload larger than one codeword's $K$) and the 802.11 PPDU-level formula
+that derives the available coded-bit count for a given MCS are not
+implemented — see the `wifi_rate_matching` module doc.
 
 ### 6.6 6G NR Research Module (IMT-2030)
 

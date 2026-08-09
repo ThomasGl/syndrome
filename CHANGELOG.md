@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-05
+
+### Added
+
+- **Wi-Fi 802.11 LDPC shortening and puncturing** (`src/wifi_rate_matching.rs`):
+  `encode_shortened`/`decode_shortened` accept a payload smaller than a
+  codeword's $K$ (padded with known-zero bits that are never transmitted)
+  and a transmitted length smaller than the post-shortening budget (parity
+  bits dropped from the tail), for any of the 12 real 802.11 $(Z, R)$
+  matrices. The decoder reconstructs the full-length LLR buffer before
+  decoding: shortened positions get a high-confidence known-zero LLR,
+  punctured positions get an erasure ($LLR = 0$). Previously only a full,
+  unshortened, unpunctured codeword ($K$ info bits exactly filling $N$
+  coded bits) could be encoded or decoded.
+  `tests/wifi_shortening_puncturing_integration.rs` verifies the encode →
+  AWGN → decode round-trip, with genuine shortening and puncturing applied,
+  across all 12 combinations.
+- Still not implemented, and now the documented scope boundary for
+  `wifi_rate_matching`: multi-codeword segmentation (a payload larger than
+  one codeword's $K$), and the 802.11 PPDU-level formula (§19.5.3.2) that
+  derives the available coded-bit count from an MCS, bandwidth, and PSDU
+  length — callers supply that length directly instead.
+
 ## [0.2.0] — 2026-08-04
 
 ### Changed

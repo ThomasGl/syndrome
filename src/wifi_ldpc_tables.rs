@@ -60,22 +60,26 @@
 //!
 //! # Explicitly out of scope (not modeled by this table)
 //!
-//! These raw matrices only describe the parity-check structure for a
-//! **full, unshortened, unpunctured codeword** ($K$ info bits exactly fill
-//! $N = 24Z$ coded bits). The following real 802.11 PHY mechanics are
-//! deliberately not implemented anywhere in this crate yet:
+//! These raw matrices only describe the parity-check structure itself
+//! (which bit connects to which check, at which shift). Shortening and
+//! puncturing — a payload smaller than $K$, a transmitted length smaller
+//! than $N$ — are implemented one layer up, in
+//! [`crate::wifi_rate_matching`], against the encoder/decoder these tables
+//! build; they're not properties of the matrix data. Still deliberately
+//! not implemented anywhere in this crate:
 //!
-//! * **Shortening** — zero-padding a payload smaller than $K$ before
-//!   encoding and discarding the pad after decoding (802.11-2020 §19.3.11.7.1 /
-//!   §36.3.11.4.3 for EHT).
-//! * **Puncturing / rate-matching** — the per-MCS coded-bit selection that
-//!   maps a full codeword onto the actual number of bits transmitted in an
-//!   OFDM symbol allocation.
+//! * Multi-codeword segmentation — a payload larger than one codeword's
+//!   $K$ (see [`crate::wifi_rate_matching`] module docs).
+//! * The 802.11 PPDU-level formula that derives *how many* coded bits are
+//!   available for a given MCS/bandwidth/PSDU length (802.11-2020
+//!   §19.5.3.2 / §36.3.11.4.3 for EHT) — callers of
+//!   [`crate::wifi_rate_matching::encode_shortened`] supply that length
+//!   directly.
 //! * The rest of the 802.11 PHY chain (scrambling, bit interleaving, OFDM
 //!   subcarrier mapping) — entirely out of scope for this FEC-only crate.
 //!
-//! See [`crate::wifi`] module docs and the crate `CHANGELOG.md` for the
-//! same scope note.
+//! See [`crate::wifi`] and [`crate::wifi_rate_matching`] module docs for
+//! the full picture.
 
 use crate::error::FecError;
 use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
@@ -465,8 +469,10 @@ pub fn wifi_ldpc_matrix(
 /// `(z, rate_num, rate_den)`, using the real Annex R/F shift matrix.
 ///
 /// The resulting encoder handles exactly one full, unshortened, unpunctured
-/// codeword: `K` info bits in, `N = 24*z` coded bits out. See the module
-/// doc for what is explicitly out of scope (shortening, puncturing).
+/// codeword: `K` info bits in, `N = 24*z` coded bits out. For a payload
+/// smaller than `K` and/or a transmitted length smaller than `N`, pass this
+/// encoder to [`crate::wifi_rate_matching::encode_shortened`] instead — see
+/// the module doc for what is still explicitly out of scope.
 ///
 /// # Errors
 ///

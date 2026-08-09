@@ -34,6 +34,7 @@ pub mod turbo;
 pub mod viterbi;
 pub mod wifi;
 pub mod wifi_ldpc_tables;
+pub mod wifi_rate_matching;
 
 // Architecture-specific SIMD kernels (pub(crate) — called from qc_ldpc only).
 #[cfg(target_arch = "x86_64")]

@@ -117,8 +117,8 @@ hand-written.
 
 ## Current Implementation Status
 
-*(301 tests on x86-64 / 302 on AArch64: 165 unit, 10 integration + media, 31
-robustness, 77 doctests — see the [README test-suite section](README.md#4-test-suite)
+*(313 tests on x86-64 / 314 on AArch64: 172 unit, 12 integration + media, 31
+robustness, 80 doctests — see the [README test-suite section](README.md#4-test-suite)
 for the up-to-date breakdown; the count above is a snapshot, that section is
 the source of truth.)*
 
@@ -139,7 +139,7 @@ FEC cores:
 - Rate-1/2 K=7 Viterbi decoder (`src/viterbi.rs`) — hard (Hamming ACS) + soft (max-log-MAP)
 - LTE rate-1/3 Turbo (`src/turbo.rs`) — TS 36.212 QPP interleaver, iterative max-log-MAP
 - Polar codes SC + CA-SCL (`src/polar.rs`) — 3GPP reliability sequence + polarization-weight fallback
-- Wi-Fi 6/7 (802.11ax/be) LDPC — real Annex R/F matrices (`src/wifi.rs`, `src/wifi_ldpc_tables.rs`)
+- Wi-Fi 6/7 (802.11ax/be) LDPC — real Annex R/F matrices (`src/wifi.rs`, `src/wifi_ldpc_tables.rs`), with shortening and puncturing (`src/wifi_rate_matching.rs`)
 - 7 runnable teaching examples (`examples/`) + an all-algorithm benchmark exporter
 
 QC-LDPC kernel:
@@ -163,6 +163,13 @@ Concurrency:
   from the AFF3CT comparison in the README's "Similar Projects" table, which
   describes AFF3CT, not this library
 - AFF3CT end-to-end comparison on the LDPC path (Phase 2)
+- Wi-Fi multi-codeword segmentation — a payload larger than one LDPC
+  codeword's $K$ is rejected by `wifi_rate_matching`, not split across
+  several codewords
+- The 802.11 PPDU-level formula (§19.5.3.2) that derives the available
+  coded-bit count from an MCS, bandwidth, and PSDU length — callers of
+  `wifi_rate_matching::encode_shortened` supply that length directly
+  instead
 
 ## Benchmark Result Schema
 
