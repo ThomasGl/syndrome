@@ -9,9 +9,17 @@
 //! Designed for zero-allocation hot paths, AVX2 (x86-64) and NEON (AArch64)
 //! SIMD acceleration, and lock-free SPSC pipeline concurrency.
 
+/// This crate's version, captured at compile time from `Cargo.toml`.
+///
+/// Exists so downstream wrappers (for example the Python binding) can report
+/// which version of the core library they were compiled against, rather than
+/// their own version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod affinity;
 pub mod bch;
 pub mod bg_tables;
+pub mod bits;
 pub mod channel_sim;
 pub mod crc;
 pub mod error;
@@ -45,6 +53,7 @@ pub(crate) mod simd_neon;
 pub use affinity::pin_to_core;
 pub use bch::BchCode;
 pub use bg_tables::*;
+pub use bits::{bits_to_bytes, bytes_to_bits, hard_decision};
 pub use crc::{Crc24, CrcKind};
 pub use error::FecError;
 pub use golay::GolayCode;
