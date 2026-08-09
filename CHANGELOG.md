@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-09
+
+### Added
+
+- **Public `bits` module** (`src/bits.rs`): MSB-first `bytes_to_bits` /
+  `bits_to_bytes` (caller-buffer and `_vec` forms, validating that every
+  element is 0/1) and `hard_decision`, the crate-wide LLR sign rule
+  ($L < 0 \Rightarrow 1$). Nearly every API in the crate speaks
+  one-bit-per-byte, and until now every user had to write these conversions
+  themselves.
+- **`LdpcWorkspace`** (`src/qc_ldpc.rs`): an owning bundle of all four LDPC
+  decode buffers, built by `QcLdpcDecoder::workspace()`. New
+  `decode_with_workspace` / `decode_5g_with_workspace` /
+  `wifi_rate_matching::decode_shortened_with_workspace` entry points replace
+  the three sizing calls and four `vec![...]` lines previously required
+  before a first decode (the Wi-Fi shortened decode drops from 8 parameters
+  to 5). The raw slice entry points are unchanged for callers who want exact
+  allocation control; each decode remains allocation-free either way, and
+  the workspace path is tested bit- and iteration-identical to the raw path.
+- **`DlSchConfig`** (`src/transport_block.rs`): named-field configuration for
+  the DL-SCH pair, with `DlSchEncoder::from_config` /
+  `DlSchDecoder::from_config`, so the six positional numerics of
+  `DlSchDecoder::new` can no longer be transposed silently and the encoder
+  and decoder can be built from literally the same value.
+- **`syndrome::VERSION`**: the crate version captured at compile time, so
+  downstream wrappers (e.g. the Python binding) can report which core they
+  were compiled against instead of their own version.
+
+### Fixed
+
+- **A build without `data/bg_tables.json` silently produced fake 5G base
+  graphs.** `build.rs` emitted a 2-entry placeholder BG1/BG2 when the table
+  file was missing — compiling cleanly into a crate whose "base graphs" were
+  two-edge toys, with no warning anywhere. The file ships in both git and
+  the crates.io tarball, so its absence always means a broken checkout; it
+  is now a hard build error naming the regeneration tool. The `bg1`/`bg2`
+  keys and their `rows`/`cols` fields are also required now instead of
+  being silently skipped or defaulted.
+
 ## [0.3.0] — 2026-08-05
 
 ### Added

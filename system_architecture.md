@@ -117,8 +117,8 @@ hand-written.
 
 ## Current Implementation Status
 
-*(313 tests on x86-64 / 314 on AArch64: 172 unit, 12 integration + media, 31
-robustness, 80 doctests — see the [README test-suite section](README.md#4-test-suite)
+*(332 tests on x86-64 / 333 on AArch64: 183 unit, 12 integration + media, 31
+robustness, 88 doctests — see the [README test-suite section](README.md#4-test-suite)
 for the up-to-date breakdown; the count above is a snapshot, that section is
 the source of truth.)*
 
@@ -152,6 +152,15 @@ Concurrency:
 - SPSC lock-free ring buffer (`src/spsc_queue.rs`) — cache-line-padded head/tail, no false sharing
 - `LdpcPipeline` multi-worker (`src/ldpc_pipeline.rs`) — worker count from `available_parallelism()`
 - i8 LLR quantization (`src/quantize.rs`) — scale + clamp to $[-127, 127]$
+
+API utilities:
+- `bits` module (`src/bits.rs`) — public MSB-first bytes↔one-bit-per-byte
+  converters and the crate-wide LLR `hard_decision` rule
+- `LdpcWorkspace` (`src/qc_ldpc.rs`) — owning bundle of all four LDPC decode
+  buffers, so callers no longer size `edge_r`/`layer_scratch`/`hard` by hand;
+  raw slice entry points remain for exact allocation control
+- `DlSchConfig` (`src/transport_block.rs`) — named-field configuration shared
+  by the DL-SCH encoder/decoder pair
 
 **Aspirational / deferred — not implemented:**
 - i8 (rather than f32) LOMS decode path, and an AVX2 8-bit kernel over it
