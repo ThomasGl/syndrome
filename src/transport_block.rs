@@ -49,6 +49,79 @@ use crate::rate_matching::RateMatchCache;
 use crate::segmentation::{SegmentationParams, compute_segmentation, segment};
 
 // ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// Named-field configuration for a DL-SCH encoder/decoder pair.
+///
+/// [`DlSchEncoder::new`] and [`DlSchDecoder::new`] take four to six
+/// positional numeric arguments, three of them `usize` — a call site like
+/// `DlSchDecoder::new(8448, 0.5, 2, 16896, 20, 0.25)` compiles just as
+/// happily with `qm` and `g` transposed. This struct gives every parameter
+/// a name at the call site and keeps the encoder and decoder built from
+/// literally the same value, which is what the chain requires anyway (a
+/// decoder configured with a different `g` than its encoder is a bug, not
+/// a choice).
+///
+/// # Examples
+///
+/// ```
+/// use syndrome::transport_block::{DlSchConfig, DlSchDecoder, DlSchEncoder};
+///
+/// let cfg = DlSchConfig {
+///     tb_size: 200,
+///     target_rate: 0.5,
+///     qm: 1,
+///     g: 512,
+///     ..DlSchConfig::default_decode_params()
+/// };
+/// let enc = DlSchEncoder::from_config(&cfg).unwrap();
+/// let dec = DlSchDecoder::from_config(&cfg).unwrap();
+/// assert_eq!(enc.output_bits(), dec.output_bits());
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct DlSchConfig {
+    /// Transport block size in bits (before CRC attachment).
+    pub tb_size: usize,
+    /// Target code rate, used for base-graph selection.
+    pub target_rate: f32,
+    /// Modulation order $Q_m$ (bits per modulation symbol).
+    pub qm: usize,
+    /// Total coded bits $G$ available for this TB across all code blocks.
+    pub g: usize,
+    /// LDPC iterations per code block per decode call (decoder only;
+    /// ignored by [`DlSchEncoder::from_config`]).
+    pub iterations: usize,
+    /// LOMS offset correction $\beta$ (decoder only; ignored by
+    /// [`DlSchEncoder::from_config`]).
+    pub offset_beta: f32,
+}
+
+impl DlSchConfig {
+    /// The decoder-side defaults (`iterations: 20`, `offset_beta: 0.25`)
+    /// with zeroed link parameters, intended for struct-update syntax as in
+    /// the [`DlSchConfig`] example. There is no `Default` impl because a
+    /// zero `tb_size`/`g` is not a usable configuration, only a base to
+    /// spread real values over.
+    ///
+    /// # Returns
+    ///
+    /// A config whose four link parameters are zero and whose decoder
+    /// tunables carry the crate-wide defaults.
+    #[must_use]
+    pub fn default_decode_params() -> Self {
+        Self {
+            tb_size: 0,
+            target_rate: 0.0,
+            qm: 0,
+            g: 0,
+            iterations: 20,
+            offset_beta: 0.25,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
 
@@ -169,6 +242,23 @@ impl DlSchEncoder {
             tb_size,
             rm_cache: std::cell::RefCell::new(RateMatchCache::new()),
         })
+    }
+
+    /// Create a DL-SCH encoder from a named-field [`DlSchConfig`].
+    ///
+    /// Equivalent to [`DlSchEncoder::new`] with the config's four link
+    /// parameters; the decoder-only fields (`iterations`, `offset_beta`)
+    /// are ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The shared encoder/decoder configuration.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`DlSchEncoder::new`].
+    pub fn from_config(config: &DlSchConfig) -> Result<Self, FecError> {
+        Self::new(config.tb_size, config.target_rate, config.qm, config.g)
     }
 
     /// Total output coded bits $G$ (concatenation of all CB rate-matched outputs).
@@ -409,6 +499,30 @@ impl DlSchDecoder {
             hard: vec![0u8; n],
             all_info: Vec::with_capacity(all_info_capacity),
         })
+    }
+
+    /// Create a DL-SCH decoder from a named-field [`DlSchConfig`].
+    ///
+    /// Equivalent to [`DlSchDecoder::new`] with all six of the config's
+    /// parameters. Build the matching encoder from the same value with
+    /// [`DlSchEncoder::from_config`] so the pair can never disagree.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The shared encoder/decoder configuration.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`DlSchDecoder::new`].
+    pub fn from_config(config: &DlSchConfig) -> Result<Self, FecError> {
+        Self::new(
+            config.tb_size,
+            config.target_rate,
+            config.qm,
+            config.g,
+            config.iterations,
+            config.offset_beta,
+        )
     }
 
     /// Total received coded bits $G$ expected by [`DlSchDecoder::decode`]'s

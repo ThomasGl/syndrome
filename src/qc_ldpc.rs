@@ -1142,6 +1142,181 @@ impl QcLdpcDecoder {
         }
         true
     }
+
+    /// Allocate an [`LdpcWorkspace`] sized for this decoder.
+    ///
+    /// The workspace owns every buffer a decode call needs, so the pairing
+    /// `decoder.workspace()` + [`QcLdpcDecoder::decode_with_workspace`]
+    /// replaces the four separately sized `vec![...]` allocations of the raw
+    /// entry points. Allocate it once and reuse it across calls; each decode
+    /// itself stays allocation-free.
+    ///
+    /// # Returns
+    ///
+    /// A workspace whose buffers exactly match this decoder's
+    /// [`QcLdpcDecoder::variable_node_count`],
+    /// [`QcLdpcDecoder::required_edge_buffer`], and
+    /// [`QcLdpcDecoder::required_layer_buffer`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
+    /// let mut ws = dec.workspace();
+    /// let mut llr = vec![5.0f32; dec.variable_node_count()];
+    /// let iters = dec.decode_with_workspace(&mut llr, &mut ws, 5).unwrap();
+    /// assert!(iters >= 1);
+    /// assert!(ws.hard_output().iter().all(|&b| b == 0));
+    /// ```
+    #[must_use]
+    pub fn workspace(&self) -> LdpcWorkspace {
+        let n = self.variable_node_count();
+        LdpcWorkspace {
+            codeword_llr: vec![0.0f32; n],
+            edge_r: vec![0.0f32; self.required_edge_buffer()],
+            layer_scratch: vec![0.0f32; self.required_layer_buffer()],
+            hard: vec![0u8; n],
+        }
+    }
+
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`] with the message and
+    /// scratch buffers taken from an [`LdpcWorkspace`] instead of four
+    /// separate slices.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` - Channel LLR input of length
+    ///   [`QcLdpcDecoder::variable_node_count`]; overwritten with
+    ///   a-posteriori values.
+    /// * `workspace` - Buffers from [`QcLdpcDecoder::workspace`]. The hard
+    ///   decisions land in [`LdpcWorkspace::hard_output`].
+    /// * `iterations` - Number of full layered passes.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed (early syndrome
+    /// termination can make it less than `iterations`).
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`QcLdpcDecoder::decode_layered_offset_min_sum`];
+    /// in particular, a workspace built for a different decoder is rejected
+    /// with [`FecError::InvalidParam`] or [`FecError::BufferTooSmall`]
+    /// rather than silently misused.
+    pub fn decode_with_workspace(
+        &self,
+        llr: &mut [f32],
+        workspace: &mut LdpcWorkspace,
+        iterations: usize,
+    ) -> Result<usize, FecError> {
+        self.decode_layered_offset_min_sum(
+            llr,
+            &mut workspace.edge_r,
+            &mut workspace.layer_scratch,
+            &mut workspace.hard,
+            iterations,
+        )
+    }
+
+    /// [`QcLdpcDecoder::decode_5g`] with the message and scratch buffers
+    /// taken from an [`LdpcWorkspace`].
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` - Channel LLR buffer of length
+    ///   [`QcLdpcDecoder::variable_node_count`], prepared as
+    ///   [`QcLdpcDecoder::decode_5g`] documents (leading $2Z$ positions
+    ///   zeroed, filler positions filled by this call).
+    /// * `n_filler` - Number of filler bits.
+    /// * `workspace` - Buffers from [`QcLdpcDecoder::workspace`]. The hard
+    ///   decisions land in [`LdpcWorkspace::hard_output`].
+    /// * `iterations` - Number of full layered passes.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`QcLdpcDecoder::decode_5g`].
+    pub fn decode_5g_with_workspace(
+        &self,
+        llr: &mut [f32],
+        n_filler: usize,
+        workspace: &mut LdpcWorkspace,
+        iterations: usize,
+    ) -> Result<usize, FecError> {
+        self.decode_5g(
+            llr,
+            n_filler,
+            &mut workspace.edge_r,
+            &mut workspace.layer_scratch,
+            &mut workspace.hard,
+            iterations,
+        )
+    }
+}
+
+/// Owning bundle of every buffer an LDPC decode call needs.
+///
+/// The raw decode entry points take four caller-sized slices so that
+/// hot-path users control allocation exactly. Everyone else pays that
+/// flexibility as boilerplate: three sizing calls and four `vec![...]`
+/// lines before the first decode. A workspace is that boilerplate done
+/// once, correctly, by the decoder itself ([`QcLdpcDecoder::workspace`]) —
+/// allocate one per decoder (or per thread), reuse it for every frame, and
+/// the decode calls themselves remain allocation-free.
+///
+/// Used by [`QcLdpcDecoder::decode_with_workspace`],
+/// [`QcLdpcDecoder::decode_5g_with_workspace`], and
+/// [`crate::wifi_rate_matching::decode_shortened_with_workspace`].
+#[derive(Clone, Debug)]
+pub struct LdpcWorkspace {
+    /// Full-length ($N$) LLR staging buffer. The plain decode paths take the
+    /// caller's LLR slice directly and leave this untouched; reconstruction
+    /// paths that must assemble a full codeword from a shorter received
+    /// vector (Wi-Fi shortening/puncturing) build it here.
+    pub(crate) codeword_llr: Vec<f32>,
+    /// Flat check-to-variable extrinsic message buffer
+    /// (length [`QcLdpcDecoder::required_edge_buffer`]).
+    pub(crate) edge_r: Vec<f32>,
+    /// Per-layer variable-to-check scratch
+    /// (length [`QcLdpcDecoder::required_layer_buffer`]).
+    pub(crate) layer_scratch: Vec<f32>,
+    /// Hard-decision output, one bit per byte (length $N$).
+    pub(crate) hard: Vec<u8>,
+}
+
+impl LdpcWorkspace {
+    /// The hard-decision bits produced by the most recent decode call that
+    /// used this workspace, one bit per byte, full codeword length $N$.
+    ///
+    /// # Returns
+    ///
+    /// The full $N$-bit hard-decision buffer. Callers that only want the
+    /// systematic part slice it themselves (for example
+    /// `&ws.hard_output()[..payload_bits]` after a shortened Wi-Fi decode).
+    #[must_use]
+    pub fn hard_output(&self) -> &[u8] {
+        &self.hard
+    }
+
+    /// The full-length LLR staging buffer, as left by the most recent
+    /// reconstruction-style decode (currently
+    /// [`crate::wifi_rate_matching::decode_shortened_with_workspace`]),
+    /// holding a-posteriori LLRs for every codeword position.
+    ///
+    /// # Returns
+    ///
+    /// The $N$-element LLR buffer. After a plain
+    /// [`QcLdpcDecoder::decode_with_workspace`] call this buffer is unused
+    /// (the a-posteriori values are in the caller's own `llr` slice).
+    #[must_use]
+    pub fn posterior_llr(&self) -> &[f32] {
+        &self.codeword_llr
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1947,6 +2122,55 @@ impl QcLdpcEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace carries no marker of which decoder built it, so the size
+    /// validation in the core decode path is the only thing standing between
+    /// a mixed-up workspace and silent corruption. Prove it rejects.
+    #[test]
+    fn workspace_from_wrong_decoder_is_rejected() {
+        let small = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg2, 2, 0.25).unwrap();
+        let large = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.25).unwrap();
+        let mut ws_small = small.workspace();
+        let mut llr = vec![5.0f32; large.variable_node_count()];
+        assert!(
+            large
+                .decode_with_workspace(&mut llr, &mut ws_small, 5)
+                .is_err()
+        );
+    }
+
+    /// The workspace path and the raw-buffer path must be the same decode.
+    #[test]
+    fn workspace_decode_matches_raw_buffer_decode() {
+        let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg2, 3, 0.25).unwrap();
+        let n = dec.variable_node_count();
+        // Weak, structured LLRs so the decoder does real work.
+        let llr_in: Vec<f32> = (0..n)
+            .map(|i| if i % 7 == 0 { -0.5 } else { 1.5 })
+            .collect();
+
+        let mut llr_raw = llr_in.clone();
+        let mut edge_r = vec![0.0f32; dec.required_edge_buffer()];
+        let mut scratch = vec![0.0f32; dec.required_layer_buffer()];
+        let mut hard_raw = vec![0u8; n];
+        let iters_raw = dec
+            .decode_layered_offset_min_sum(
+                &mut llr_raw,
+                &mut edge_r,
+                &mut scratch,
+                &mut hard_raw,
+                8,
+            )
+            .unwrap();
+
+        let mut llr_ws = llr_in;
+        let mut ws = dec.workspace();
+        let iters_ws = dec.decode_with_workspace(&mut llr_ws, &mut ws, 8).unwrap();
+
+        assert_eq!(iters_raw, iters_ws);
+        assert_eq!(hard_raw, ws.hard_output());
+        assert_eq!(llr_raw, llr_ws);
+    }
 
     #[test]
     fn ils_lookup() {

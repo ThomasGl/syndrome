@@ -293,6 +293,83 @@ pub fn decode_shortened(
     )
 }
 
+/// [`decode_shortened`] with every buffer taken from an
+/// [`LdpcWorkspace`](crate::qc_ldpc::LdpcWorkspace) instead of four
+/// separate caller-sized slices.
+///
+/// This is the recommended entry point unless you need exact control over
+/// each allocation: build the workspace once with
+/// [`QcLdpcDecoder::workspace`], reuse it for every received frame, and
+/// each decode stays allocation-free.
+///
+/// # Arguments
+///
+/// * `decoder` - Decoder for the target $(Z, R)$ 802.11 codeword.
+/// * `payload_bits` - Number of real information bits that were sent.
+/// * `rx_llr` - Received channel LLRs, one entry per transmitted bit.
+/// * `workspace` - Buffers from [`QcLdpcDecoder::workspace`]. After the
+///   call, the recovered payload is
+///   `&workspace.hard_output()[..payload_bits]` and the reconstructed
+///   full-length a-posteriori LLRs are in `workspace.posterior_llr()`.
+/// * `iterations` - Number of LOMS passes.
+///
+/// # Returns
+///
+/// The number of LOMS iterations actually used.
+///
+/// # Errors
+///
+/// Same conditions as [`decode_shortened`]; a workspace built for a
+/// different decoder is rejected, never silently misused.
+///
+/// # Examples
+///
+/// ```
+/// use syndrome::wifi::{select_wifi_ldpc, WifiStandard};
+/// use syndrome::wifi_rate_matching::{decode_shortened_with_workspace, encode_shortened};
+///
+/// let params = select_wifi_ldpc(41, WifiStandard::WiFi6, 0.5);
+/// let encoder = params.build_encoder().unwrap();
+/// let decoder = params.build_decoder(0.25).unwrap();
+///
+/// let payload = vec![1u8, 0, 1, 1, 0, 0, 1, 0];
+/// let mut coded = vec![0u8; 200];
+/// encode_shortened(&encoder, &payload, coded.len(), &mut coded).unwrap();
+///
+/// // Strong noiseless channel: bit 0 -> +LLR, bit 1 -> -LLR.
+/// let rx_llr: Vec<f32> = coded.iter().map(|&b| if b == 0 { 8.0 } else { -8.0 }).collect();
+///
+/// let mut ws = decoder.workspace();
+/// decode_shortened_with_workspace(&decoder, payload.len(), &rx_llr, &mut ws, 20).unwrap();
+/// assert_eq!(&ws.hard_output()[..payload.len()], &payload[..]);
+/// ```
+pub fn decode_shortened_with_workspace(
+    decoder: &QcLdpcDecoder,
+    payload_bits: usize,
+    rx_llr: &[f32],
+    workspace: &mut crate::qc_ldpc::LdpcWorkspace,
+    iterations: usize,
+) -> Result<usize, FecError> {
+    // Split borrows: the codeword staging buffer is rebuilt by
+    // decode_shortened while the other three buffers feed the core decoder.
+    let crate::qc_ldpc::LdpcWorkspace {
+        codeword_llr,
+        edge_r,
+        layer_scratch,
+        hard,
+    } = workspace;
+    decode_shortened(
+        decoder,
+        payload_bits,
+        rx_llr,
+        codeword_llr,
+        edge_r,
+        layer_scratch,
+        hard,
+        iterations,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
