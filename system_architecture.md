@@ -117,8 +117,8 @@ hand-written.
 
 ## Current Implementation Status
 
-*(332 tests on x86-64 / 333 on AArch64: 183 unit, 12 integration + media, 31
-robustness, 88 doctests — see the [README test-suite section](README.md#4-test-suite)
+*(351 tests on x86-64 / 352 on AArch64: 194 unit, 12 integration + media, 31
+robustness, 96 doctests — see the [README test-suite section](README.md#4-test-suite)
 for the up-to-date breakdown; the count above is a snapshot, that section is
 the source of truth.)*
 
@@ -140,6 +140,7 @@ FEC cores:
 - LTE rate-1/3 Turbo (`src/turbo.rs`) — TS 36.212 QPP interleaver, iterative max-log-MAP
 - Polar codes SC + CA-SCL (`src/polar.rs`) — 3GPP reliability sequence + polarization-weight fallback
 - Wi-Fi 6/7 (802.11ax/be) LDPC — real Annex R/F matrices (`src/wifi.rs`, `src/wifi_ldpc_tables.rs`), with shortening and puncturing (`src/wifi_rate_matching.rs`)
+- Bluetooth FEC profiles (`src/bluetooth.rs`) — LE Coded PHY ($K=4$ convolutional + $S=8$ pattern mapper, verified against the Core Spec's own sample data) and BR/EDR FEC 1/3 + (15,10) FEC 2/3
 - 7 runnable teaching examples (`examples/`) + an all-algorithm benchmark exporter
 
 QC-LDPC kernel:

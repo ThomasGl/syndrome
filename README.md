@@ -3,7 +3,7 @@
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-332%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-351%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -40,7 +40,7 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 332 total on x86-64 (333 on AArch64, +1 NEON-only) — 183 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 12 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 88 doctests |
+| **Tests** | 351 total on x86-64 (352 on AArch64, +1 NEON-only) — 194 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 12 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 96 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~215 Melem/s · all numbers from running code |
@@ -398,18 +398,18 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (332 tests total on x86-64; 333 on AArch64)
+### 4.1 Component coverage (351 tests total on x86-64; 352 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 183 (x86-64) / 184 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 194 (x86-64) / 195 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | Wi-Fi LDPC integration (encode→AWGN→decode, all 12 (Z,R)) | 3 | `tests/wifi_ldpc_integration.rs` |
 | Wi-Fi shortening/puncturing integration (encode→AWGN→decode, all 12 (Z,R)) | 2 | `tests/wifi_shortening_puncturing_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 31 | `tests/robustness.rs` |
-| Doctests | 88 | `///` examples in all public API |
+| Doctests | 96 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,

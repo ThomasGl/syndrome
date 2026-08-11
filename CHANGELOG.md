@@ -26,6 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codeword's $K$), and the 802.11 PPDU-level formula (§19.5.3.2) that
   derives the available coded-bit count from an MCS, bandwidth, and PSDU
   length — callers supply that length directly instead.
+- **Bluetooth FEC profiles** (`src/bluetooth.rs`): the complete set of FEC
+  schemes in the Bluetooth Core Specification (unchanged since 5.0; verified
+  against 5.0 through 6.2) — the LE Coded PHY convolutional code ($K=4$,
+  rate 1/2, $G_0 = 1+x+x^2+x^3$, $G_1 = 1+x^2+x^3$) built on the existing
+  Viterbi engine with hard and soft decoding, the $S=8$ pattern
+  mapper/soft-demapper, BR/EDR FEC 1/3 (3× repetition, majority decode),
+  and BR/EDR FEC 2/3 (the (15,10) shortened Hamming code,
+  $g(D)=D^5+D^4+D^2+1$, single-error correction with double-error
+  detection). Unit tests reproduce the specification's own sample data
+  bit-exactly: the Vol 6 Part C reference packet (every FEC output bit for
+  both CI values and the $S=8$ symbol stream) and all ten (15,10)
+  generator rows from the Vol 2 FEC sample data, cross-checked against
+  libbtbb's independent table. Out of scope, documented: packet assembly,
+  whitening, and the Bluetooth CRC/HEC family.
 - **Public `bits` module** (`src/bits.rs`): MSB-first `bytes_to_bits` /
   `bits_to_bytes` (caller-buffer and `_vec` forms, validating that every
   element is 0/1) and `hard_decision`, the crate-wide LLR sign rule
