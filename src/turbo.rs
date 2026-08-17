@@ -121,6 +121,50 @@
 
 use crate::error::FecError;
 
+/// Which BCJR combining rule a [`TurboDecoder`] uses.
+///
+/// The BCJR recursions repeatedly need
+/// $\ln\!\left(e^{a} + e^{b}\right)$, the "max-star" operator. Its exact
+/// form is the Jacobian logarithm
+///
+/// $$\max{}^*(a, b) = \max(a, b) + \ln\left(1 + e^{-|a-b|}\right),$$
+///
+/// and the choice here is whether to evaluate that correction term or drop
+/// it. Dropping it — plain $\max(a,b)$ — is the max-log-MAP approximation:
+/// much cheaper (no transcendentals, and it vectorizes to a single `max`
+/// instruction per step) at a cost of a few tenths of a dB.
+///
+/// # Which to choose
+///
+/// [`MaxLog`](Self::MaxLog) is the right default and is what the SIMD
+/// kernels implement. [`LogMap`](Self::LogMap) trades throughput for error
+/// -rate performance and runs on the scalar kernel only.
+///
+/// # The scaling caveat that makes `LogMap` easy to misuse
+///
+/// Max-log-MAP is **invariant to a positive scaling of its input LLRs**:
+/// scaling every input by $c > 0$ scales every path metric by $c$, and
+/// $\max$ commutes with that, so the hard decisions are unchanged. Exact
+/// log-MAP is **not** invariant, because $\ln(1 + e^{-|a-b|})$ is not
+/// homogeneous. `LogMap` therefore requires *genuine* LLRs —
+/// $2r/\sigma^2$ for BPSK over AWGN, which is what
+/// [`crate::channel_sim::AwgnChannel`] produces — and gives *worse* results
+/// than max-log if handed arbitrarily scaled soft values such as raw
+/// correlations or a fixed $\pm 1$ mapping. Feeding it inputs that are too
+/// large makes the correction term vanish (it degenerates to max-log);
+/// feeding it inputs that are too small makes the correction dominate and
+/// washes out the channel information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MapAlgorithm {
+    /// Max-log-MAP: approximate $\max{}^*(a,b)$ by $\max(a,b)$. The default,
+    /// and the only rule the AVX2/NEON kernels implement.
+    #[default]
+    MaxLog,
+    /// Exact log-MAP: evaluate the full Jacobian correction. Scalar only,
+    /// and requires correctly scaled input LLRs — see the type-level docs.
+    LogMap,
+}
+
 /// Extrinsic-information damping factor for max-log-MAP turbo decoding.
 ///
 /// The max-log approximation of BCJR systematically overestimates the
@@ -129,6 +173,42 @@ use crate::error::FecError;
 /// J. Vogt and A. Finger, "Improving the max-log-MAP turbo decoder," IEE
 /// Electronics Letters, 2000.
 const EXTRINSIC_SCALE: f32 = 0.75;
+
+/// Extrinsic-information scaling for exact log-MAP.
+///
+/// [`EXTRINSIC_SCALE`] exists to correct an error that exact log-MAP does
+/// not make: with the Jacobian term evaluated, the extrinsic information is
+/// already correctly scaled, and damping it would discard real information
+/// rather than compensate for phantom confidence. Hence 1.0 — the constant
+/// is named and documented rather than left implicit so that the asymmetry
+/// with `EXTRINSIC_SCALE` is visibly deliberate.
+const EXTRINSIC_SCALE_LOG_MAP: f32 = 1.0;
+
+/// The max-star operator $\ln(e^a + e^b)$, exact or approximated.
+///
+/// With `EXACT == false` this is plain $\max(a, b)$ (max-log-MAP). With
+/// `EXACT == true` it adds the Jacobian correction
+/// $\ln(1 + e^{-|a-b|})$, computed with [`f32::ln_1p`] so that the
+/// small-argument case keeps its precision instead of losing it to
+/// `(1.0 + x).ln()` cancellation.
+///
+/// `EXACT` is a const parameter rather than a runtime flag so each kernel
+/// monomorphizes into a branch-free loop, keeping the max-log path exactly
+/// as cheap as it was before this option existed.
+///
+/// The [`NEG_INF`] sentinel needs no special case: when one argument is the
+/// sentinel and the other is a real metric, $|a-b|$ is enormous,
+/// $e^{-|a-b|}$ underflows to zero, and the result is the real metric
+/// unchanged.
+#[inline(always)]
+fn max_star<const EXACT: bool>(a: f32, b: f32) -> f32 {
+    let m = if a > b { a } else { b };
+    if EXACT {
+        m + (-(a - b).abs()).exp().ln_1p()
+    } else {
+        m
+    }
+}
 
 /// A very large finite "negative infinity" stand-in used for pruned trellis
 /// paths. Using a large finite value instead of `f32::NEG_INFINITY` avoids
@@ -410,6 +490,9 @@ pub struct TurboDecoder {
     // arithmetic from `ch_sys`/`ch_par`/`apriori` on every trellis edge.
     gamma_a: Vec<f32>,
     gamma_p: Vec<f32>,
+
+    /// Which BCJR combining rule to use; see [`MapAlgorithm`].
+    algorithm: MapAlgorithm,
 }
 
 impl TurboDecoder {
@@ -439,6 +522,7 @@ impl TurboDecoder {
         Ok(Self {
             k,
             pi,
+            algorithm: MapAlgorithm::default(),
             ch_sys: vec![0.0; k],
             ch_par1: vec![0.0; k],
             ch_par2: vec![0.0; k],
@@ -522,6 +606,62 @@ impl TurboDecoder {
         self.decode_with_backend(llr, out, max_iters, SisoBackend::Auto)
     }
 
+    /// The BCJR combining rule this decoder currently uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::TurboDecoder;
+    /// use syndrome::turbo::MapAlgorithm;
+    ///
+    /// let dec = TurboDecoder::new(40).unwrap();
+    /// assert_eq!(dec.algorithm(), MapAlgorithm::MaxLog);
+    /// ```
+    pub fn algorithm(&self) -> MapAlgorithm {
+        self.algorithm
+    }
+
+    /// Select the BCJR combining rule for subsequent [`Self::decode`] calls.
+    ///
+    /// Defaults to [`MapAlgorithm::MaxLog`]. Selecting
+    /// [`MapAlgorithm::LogMap`] improves error-rate performance at the cost
+    /// of throughput and forces the scalar kernel, since the SIMD kernels
+    /// implement only the max-log rule.
+    ///
+    /// **Read [`MapAlgorithm`]'s docs before switching**: exact log-MAP is
+    /// not invariant to input LLR scaling the way max-log-MAP is, so it
+    /// requires genuine LLRs and will underperform on arbitrarily scaled
+    /// soft values.
+    ///
+    /// # Arguments
+    ///
+    /// * `algorithm` — the combining rule to use from now on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::{TurboDecoder, TurboEncoder};
+    /// use syndrome::turbo::MapAlgorithm;
+    ///
+    /// let k = 40;
+    /// let enc = TurboEncoder::new(k).unwrap();
+    /// let mut dec = TurboDecoder::new(k).unwrap();
+    /// dec.set_algorithm(MapAlgorithm::LogMap);
+    /// assert_eq!(dec.algorithm(), MapAlgorithm::LogMap);
+    ///
+    /// let info: Vec<u8> = (0..k).map(|i| (i % 3 == 0) as u8).collect();
+    /// let mut coded = vec![0u8; enc.output_len()];
+    /// enc.encode(&info, &mut coded).unwrap();
+    /// // Genuine-scale LLRs, as an AWGN channel would produce.
+    /// let llr: Vec<f32> = coded.iter().map(|&b| if b == 0 { 4.0 } else { -4.0 }).collect();
+    /// let mut out = vec![0u8; k];
+    /// dec.decode(&llr, &mut out, 8).unwrap();
+    /// assert_eq!(out, info);
+    /// ```
+    pub fn set_algorithm(&mut self, algorithm: MapAlgorithm) {
+        self.algorithm = algorithm;
+    }
+
     /// Identical to [`Self::decode`] but lets the caller force a specific
     /// SISO backend instead of the runtime auto-detection `decode` uses.
     ///
@@ -574,6 +714,15 @@ impl TurboDecoder {
         }
         self.apriori1.fill(0.0);
 
+        // The extrinsic damping factor is a correction for max-log's
+        // over-confidence, so it belongs to the algorithm, not to the
+        // decoder: applying it under exact log-MAP would throw away
+        // correctly-scaled information. See `EXTRINSIC_SCALE_LOG_MAP`.
+        let extrinsic_scale = match self.algorithm {
+            MapAlgorithm::MaxLog => EXTRINSIC_SCALE,
+            MapAlgorithm::LogMap => EXTRINSIC_SCALE_LOG_MAP,
+        };
+
         let mut iters_used = 0usize;
         for _iter in 0..max_iters {
             // --- constituent decoder 1: natural order ---
@@ -590,10 +739,11 @@ impl TurboDecoder {
                 &mut self.gamma_p,
                 &mut self.llr_total1,
                 backend,
+                self.algorithm,
             );
             for t in 0..k {
                 self.extrinsic1[t] =
-                    EXTRINSIC_SCALE * (self.llr_total1[t] - self.ch_sys[t] - self.apriori1[t]);
+                    extrinsic_scale * (self.llr_total1[t] - self.ch_sys[t] - self.apriori1[t]);
                 self.hard1[t] = (self.llr_total1[t] < 0.0) as u8;
             }
 
@@ -614,10 +764,11 @@ impl TurboDecoder {
                 &mut self.gamma_p,
                 &mut self.llr_total2,
                 backend,
+                self.algorithm,
             );
             for i in 0..k {
                 let e2 =
-                    EXTRINSIC_SCALE * (self.llr_total2[i] - self.ch_sys_il[i] - self.apriori2[i]);
+                    extrinsic_scale * (self.llr_total2[i] - self.ch_sys_il[i] - self.apriori2[i]);
                 let nat = self.pi[i];
                 self.extrinsic2_nat[nat] = e2;
                 self.hard2_nat[nat] = (self.llr_total2[i] < 0.0) as u8;
@@ -754,6 +905,7 @@ fn siso_max_log_map(
     gamma_p: &mut [f32],
     llr_out: &mut [f32],
     backend: SisoBackend,
+    algorithm: MapAlgorithm,
 ) {
     // Precompute the two branch-metric halves once per trellis position;
     // shared by the forward, backward, and LLR-extraction passes below (and
@@ -767,6 +919,16 @@ fn siso_max_log_map(
     for i in 0..3 {
         gamma_a[k + i] = 0.5 * tail_sys[i];
         gamma_p[k + i] = 0.5 * tail_par[i];
+    }
+
+    // Exact log-MAP exists only in the scalar kernel: the Jacobian
+    // correction needs a transcendental per combine, which the AVX2/NEON
+    // kernels' single-`max` step cannot express. Rather than silently
+    // downgrading the caller's requested algorithm to fit a faster backend,
+    // the algorithm wins and the backend choice is overridden.
+    if algorithm == MapAlgorithm::LogMap {
+        siso_log_map_scalar(k, gamma_a, gamma_p, alpha, beta, llr_out);
+        return;
     }
 
     match backend {
@@ -842,6 +1004,45 @@ fn siso_max_log_map_scalar(
     beta: &mut [f32],
     llr_out: &mut [f32],
 ) {
+    siso_scalar::<false>(k, gamma_a, gamma_p, alpha, beta, llr_out);
+}
+
+/// Exact log-MAP twin of [`siso_max_log_map_scalar`]: identical recursion,
+/// with the Jacobian correction applied at every combining step.
+fn siso_log_map_scalar(
+    k: usize,
+    gamma_a: &[f32],
+    gamma_p: &[f32],
+    alpha: &mut [f32],
+    beta: &mut [f32],
+    llr_out: &mut [f32],
+) {
+    siso_scalar::<true>(k, gamma_a, gamma_p, alpha, beta, llr_out);
+}
+
+/// The shared scalar SISO recursion, generic over the combining rule.
+///
+/// `EXACT == false` gives max-log-MAP (every combine is a plain `max`);
+/// `EXACT == true` gives exact log-MAP (every combine adds the Jacobian
+/// term). Both instantiations share one body so the two algorithms cannot
+/// drift apart: a fix to the trellis handling, the termination rows, or the
+/// normalization applies to both by construction.
+///
+/// One structural difference from a plain `max` version is forced by
+/// exactness. The max-log code could seed a destination metric with
+/// [`NEG_INF`] and fold candidates in with `>`, because `max` is
+/// idempotent on the sentinel. `max_star` is not: combining the sentinel
+/// with itself adds $\ln 2$. The loops below therefore track whether a
+/// destination has received its first candidate and *assign* rather than
+/// combine it, so an unreachable state stays exactly at the sentinel.
+fn siso_scalar<const EXACT: bool>(
+    k: usize,
+    gamma_a: &[f32],
+    gamma_p: &[f32],
+    alpha: &mut [f32],
+    beta: &mut [f32],
+    llr_out: &mut [f32],
+) {
     let (next_state, out_z) = RSC_TRELLIS;
     let n_ext = k + 3;
 
@@ -860,6 +1061,10 @@ fn siso_max_log_map_scalar(
         for ns in 0..8 {
             alpha[base_out + ns] = NEG_INF;
         }
+        // See the note on `siso_scalar`: a destination's first candidate is
+        // assigned, not combined, so unreachable states stay at the
+        // sentinel instead of drifting up by ln 2 per fold.
+        let mut seen = [false; 8];
         let base_in = t * 8;
         for s in 0..8usize {
             let av = alpha[base_in + s];
@@ -871,8 +1076,11 @@ fn siso_max_log_map_scalar(
                 let ns = next_state[idx] as usize;
                 let z = out_z[idx];
                 let cand = av + gamma_ab(a, p, b, z);
-                if cand > alpha[base_out + ns] {
+                if seen[ns] {
+                    alpha[base_out + ns] = max_star::<EXACT>(alpha[base_out + ns], cand);
+                } else {
                     alpha[base_out + ns] = cand;
+                    seen[ns] = true;
                 }
             }
         }
@@ -908,13 +1116,17 @@ fn siso_max_log_map_scalar(
             } else {
                 (0usize, 1usize)
             };
+            let mut seen = false;
             for b in lo..=hi {
                 let idx = s * 2 + b;
                 let ns = next_state[idx] as usize;
                 let z = out_z[idx];
                 let cand = gamma_ab(a, p, b, z) + beta[base_next + ns];
-                if cand > beta[base_cur + s] {
+                if seen {
+                    beta[base_cur + s] = max_star::<EXACT>(beta[base_cur + s], cand);
+                } else {
                     beta[base_cur + s] = cand;
+                    seen = true;
                 }
             }
         }
@@ -931,6 +1143,7 @@ fn siso_max_log_map_scalar(
         let base_next = (t + 1) * 8;
         let mut best0 = NEG_INF;
         let mut best1 = NEG_INF;
+        let (mut seen0, mut seen1) = (false, false);
         for s in 0..8usize {
             for b in 0..2usize {
                 let idx = s * 2 + b;
@@ -938,11 +1151,19 @@ fn siso_max_log_map_scalar(
                 let z = out_z[idx];
                 let val = alpha[base_in + s] + gamma_ab(a, p, b, z) + beta[base_next + ns];
                 if b == 0 {
-                    if val > best0 {
-                        best0 = val;
-                    }
-                } else if val > best1 {
-                    best1 = val;
+                    best0 = if seen0 {
+                        max_star::<EXACT>(best0, val)
+                    } else {
+                        seen0 = true;
+                        val
+                    };
+                } else {
+                    best1 = if seen1 {
+                        max_star::<EXACT>(best1, val)
+                    } else {
+                        seen1 = true;
+                        val
+                    };
                 }
             }
         }
@@ -1685,6 +1906,191 @@ mod tests {
         let iters = dec.decode(&llr, &mut out, 12).unwrap();
         assert_eq!(out, info, "AWGN round-trip at 3 dB Eb/N0 must be bit-exact");
         assert!((1..=12).contains(&iters));
+    }
+
+    // =====================================================================
+    // Exact log-MAP
+    // =====================================================================
+
+    /// `max_star` must actually compute $\ln(e^a + e^b)$ when exact, and
+    /// plain $\max$ when not. Checked against a directly evaluated
+    /// reference in `f64` so the assertion does not inherit the very
+    /// approximation it is testing.
+    #[test]
+    fn max_star_matches_its_definition() {
+        for &(a, b) in &[
+            (0.0_f32, 0.0_f32),
+            (1.0, 1.0),
+            (3.0, -2.0),
+            (-5.0, 7.5),
+            (0.25, 0.30),
+            (12.0, 11.9),
+            (-1.5, -1.5),
+            (20.0, -20.0),
+        ] {
+            let exact = max_star::<true>(a, b);
+            let reference = ((a as f64).exp() + (b as f64).exp()).ln() as f32;
+            assert!(
+                (exact - reference).abs() < 1e-4,
+                "max_star::<true>({a}, {b}) = {exact}, expected {reference}"
+            );
+            let approx = max_star::<false>(a, b);
+            assert_eq!(approx, a.max(b), "max_star::<false> must be plain max");
+            // The correction is non-negative and at most ln 2, attained when
+            // the arguments are equal.
+            let correction = exact - approx;
+            assert!(
+                (-1e-5..=core::f32::consts::LN_2 + 1e-5).contains(&correction),
+                "correction {correction} outside [0, ln 2] for ({a}, {b})"
+            );
+        }
+        // The sentinel must survive combination with a real metric unchanged.
+        assert!((max_star::<true>(NEG_INF, 4.0) - 4.0).abs() < 1e-6);
+    }
+
+    /// Exact log-MAP must decode a noiseless block, at every supported
+    /// length, exactly as max-log does.
+    #[test]
+    fn log_map_noiseless_roundtrip_all_sizes() {
+        for &(k, _, _) in QPP_TABLE {
+            let enc = TurboEncoder::new(k).unwrap();
+            let mut dec = TurboDecoder::new(k).unwrap();
+            dec.set_algorithm(MapAlgorithm::LogMap);
+            let info: Vec<u8> = (0..k).map(|i| ((i * 7 + 3) % 5 < 2) as u8).collect();
+            let mut coded = vec![0u8; enc.output_len()];
+            enc.encode(&info, &mut coded).unwrap();
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| if b == 0 { 4.0 } else { -4.0 })
+                .collect();
+            let mut out = vec![0u8; k];
+            dec.decode(&llr, &mut out, 8).unwrap();
+            assert_eq!(out, info, "log-MAP noiseless round-trip failed at K={k}");
+        }
+    }
+
+    /// Selecting exact log-MAP must override the backend choice rather than
+    /// silently falling back to a SIMD kernel that implements a different
+    /// algorithm. Verified behaviourally: with `LogMap` selected, forcing
+    /// the AVX2/NEON backend must produce bit-identical output to forcing
+    /// the scalar one, because both are in fact running the scalar log-MAP
+    /// kernel.
+    #[test]
+    fn log_map_ignores_the_simd_backend() {
+        let k = 512;
+        let enc = TurboEncoder::new(k).unwrap();
+        let info: Vec<u8> = (0..k).map(|i| ((i * 13 + 5) % 7 < 3) as u8).collect();
+        let mut coded = vec![0u8; enc.output_len()];
+        enc.encode(&info, &mut coded).unwrap();
+        let mut ch = AwgnChannel::new(0.5, 1.0 / 3.0, 0xBEEF);
+        let llr = ch.transmit(&coded);
+
+        let mut scalar_out = vec![0u8; k];
+        let mut dec = TurboDecoder::new(k).unwrap();
+        dec.set_algorithm(MapAlgorithm::LogMap);
+        dec.decode_with_backend(&llr, &mut scalar_out, 8, SisoBackend::Scalar)
+            .unwrap();
+
+        let simd_backend = if cfg!(target_arch = "x86_64") {
+            SisoBackend::Avx2
+        } else if cfg!(target_arch = "aarch64") {
+            SisoBackend::Neon
+        } else {
+            SisoBackend::Scalar
+        };
+        // Skip on an x86_64 host without AVX2: forcing that backend asserts.
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let mut simd_out = vec![0u8; k];
+        let mut dec2 = TurboDecoder::new(k).unwrap();
+        dec2.set_algorithm(MapAlgorithm::LogMap);
+        dec2.decode_with_backend(&llr, &mut simd_out, 8, simd_backend)
+            .unwrap();
+
+        assert_eq!(
+            scalar_out, simd_out,
+            "log-MAP output changed with the backend — the algorithm was downgraded"
+        );
+    }
+
+    /// Exact log-MAP must actually decode *better* than max-log-MAP.
+    ///
+    /// This is the test that justifies the option existing at all. It is a
+    /// statistical claim, so it is made statistically: block error rate is
+    /// measured for both algorithms with the [`crate::montecarlo`] harness
+    /// over the same channel realizations, and the assertion requires the
+    /// two 95% confidence intervals to be disjoint before declaring a
+    /// difference. Comparing bare point estimates here would prove nothing —
+    /// the gap between the algorithms is a few tenths of a dB, which is
+    /// smaller than the sampling noise of a careless measurement.
+    #[test]
+    fn log_map_outperforms_max_log_on_an_awgn_channel() {
+        use crate::montecarlo::{MonteCarloConfig, Trial, run};
+
+        const K: usize = 512;
+        const ITERS: usize = 6;
+        // Chosen to sit on the waterfall, where the algorithms differ most.
+        const EBNO_DB: f32 = 0.2;
+
+        // Sized from the effect being measured, not picked by feel. The two
+        // BLERs sit near 0.5, where each estimate's standard error is
+        // ~sqrt(0.25/n); disjoint 95% intervals therefore need roughly
+        // |p1 - p2| > 1.96/sqrt(n). The observed gap is ~0.15, so n must
+        // exceed ~170 — 500 trials leaves comfortable margin without making
+        // this the slowest test in the suite.
+        let cfg = MonteCarloConfig::default()
+            .with_target_error_events(250)
+            .with_min_trials(500)
+            .with_max_trials(700);
+
+        let measure = |algorithm: MapAlgorithm| {
+            let enc = TurboEncoder::new(K).unwrap();
+            let mut dec = TurboDecoder::new(K).unwrap();
+            dec.set_algorithm(algorithm);
+            let mut coded = vec![0u8; enc.output_len()];
+            let mut out = vec![0u8; K];
+            let mut info = vec![0u8; K];
+
+            run(&cfg, |trial| {
+                let mut s = 0x5EED_u64.wrapping_add(trial as u64 + 1);
+                for b in info.iter_mut() {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    *b = (s & 1) as u8;
+                }
+                enc.encode(&info, &mut coded).unwrap();
+                // Same seed per trial index for both algorithms, so the two
+                // measurements see identical channel realizations and the
+                // comparison is paired rather than confounded by noise.
+                let mut ch = AwgnChannel::new(EBNO_DB, 1.0 / 3.0, 0xC0DE ^ ((trial as u64) << 16));
+                let llr = ch.transmit(&coded);
+                dec.decode(&llr, &mut out, ITERS).unwrap();
+                Trial::block(out != info)
+            })
+        };
+
+        let max_log = measure(MapAlgorithm::MaxLog);
+        let log_map = measure(MapAlgorithm::LogMap);
+
+        assert!(
+            log_map.estimate < max_log.estimate,
+            "log-MAP BLER {:.4} should be below max-log BLER {:.4}",
+            log_map.estimate,
+            max_log.estimate
+        );
+        assert!(
+            log_map.ci_high < max_log.ci_low,
+            "log-MAP [{:.4}, {:.4}] and max-log [{:.4}, {:.4}] overlap — the measurement \
+             does not resolve a difference between the algorithms",
+            log_map.ci_low,
+            log_map.ci_high,
+            max_log.ci_low,
+            max_log.ci_high,
+        );
     }
 
     /// At high SNR, the decoder should converge (and early-exit) in fewer
