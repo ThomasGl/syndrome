@@ -6,7 +6,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 2560,
-    "ns_per_iter": 911538.1,
+    "ns_per_iter": 896468.6,
     "mib_per_s": 2.7
   },
   {
@@ -16,7 +16,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 10240,
-    "ns_per_iter": 4115271.5,
+    "ns_per_iter": 4043808.8,
     "mib_per_s": 2.4
   },
   {
@@ -26,7 +26,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 40960,
-    "ns_per_iter": 17291787.4,
+    "ns_per_iter": 16728509.3,
     "mib_per_s": 2.3
   },
   {
@@ -36,7 +36,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 163840,
-    "ns_per_iter": 67457928.3,
+    "ns_per_iter": 67890934.0,
     "mib_per_s": 2.3
   },
   {
@@ -46,8 +46,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 2560,
-    "ns_per_iter": 1158840.5,
-    "mib_per_s": 2.1,
+    "ns_per_iter": 1196950.9,
+    "mib_per_s": 2.0,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
   {
@@ -57,8 +57,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 10240,
-    "ns_per_iter": 4296390.1,
-    "mib_per_s": 2.3,
+    "ns_per_iter": 4479230.0,
+    "mib_per_s": 2.2,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
   {
@@ -68,8 +68,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 40960,
-    "ns_per_iter": 17956198.4,
-    "mib_per_s": 2.2,
+    "ns_per_iter": 18180096.1,
+    "mib_per_s": 2.1,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
   {
@@ -79,7 +79,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 163840,
-    "ns_per_iter": 70642864.8,
+    "ns_per_iter": 71450402.3,
     "mib_per_s": 2.2,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   }

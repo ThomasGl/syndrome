@@ -135,10 +135,10 @@ FEC cores:
 - Hamming(7,4) encode/decode (`src/hamming.rs`)
 - Extended Golay(24,12,8) (`src/golay.rs`) — syndrome-table 3-error correction, weight enumerator verified
 - BCH(255,k,t≤10) over GF(2⁸) (`src/bch.rs`) — Berlekamp–Massey + Chien search
-- Reed-Solomon erasure encoder/decoder (`src/reed_solomon.rs`) — GF(256), 0x11D, AVX2 VPSHUFB path
-- Rate-1/2 K=7 Viterbi decoder (`src/viterbi.rs`) — hard (Hamming ACS) + soft (max-log-MAP)
+- Reed-Solomon encoder/decoder (`src/reed_solomon.rs`) — GF(256), 0x11D; erasure decode (Vandermonde) plus errors-and-erasures decode by syndrome-verified combinatorial search; GFNI bit-matrix multiply where available, AVX2 VPSHUFB nibble-table path otherwise
+- Rate-1/2 K=7 Viterbi decoder (`src/viterbi.rs`) — hard (Hamming ACS) + soft (max-log-MAP); zero-terminated and tail-biting (WAVA) termination
 - LTE rate-1/3 Turbo (`src/turbo.rs`) — TS 36.212 QPP interleaver, iterative max-log-MAP
-- Polar codes SC + CA-SCL (`src/polar.rs`) — 3GPP reliability sequence + polarization-weight fallback
+- Polar codes SC + CA-SCL (`src/polar.rs`) — complete 3GPP `Q_Nmax` reliability sequence (all `N ≤ 1024`), polarization-weight fallback only outside that range
 - Wi-Fi 6/7 (802.11ax/be) LDPC — real Annex R/F matrices (`src/wifi.rs`, `src/wifi_ldpc_tables.rs`), with shortening and puncturing (`src/wifi_rate_matching.rs`)
 - Bluetooth FEC profiles (`src/bluetooth.rs`) — LE Coded PHY ($K=4$ convolutional + $S=8$ pattern mapper, verified against the Core Spec's own sample data) and BR/EDR FEC 1/3 + (15,10) FEC 2/3
 - 7 runnable teaching examples (`examples/`) + an all-algorithm benchmark exporter

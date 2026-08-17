@@ -3,7 +3,7 @@
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-351%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-425%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -38,12 +38,12 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 |---|---|
 | **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G research) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
-| **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); NEON (AArch64) |
+| **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); GFNI-accelerated GF(256) multiply for RS where available, AVX2 VPSHUFB nibble-table fallback elsewhere; NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 351 total on x86-64 (352 on AArch64, +1 NEON-only) — 194 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof) · 12 integration (5G NR + Wi-Fi) · 4 media reconstruction · 14 reference vectors · 31 robustness · 96 doctests |
+| **Tests** | 425 total on x86-64 (423 on AArch64: 7 AVX2/GFNI tests drop out, 5 NEON-only ones appear) — 235 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test) · 12 integration (5G NR + Wi-Fi) · 4 LDPC offset-β validation · 4 media reconstruction · 14 reference vectors · 38 robustness · 118 doctests |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
-| **Benchmarks** | RS: ~89/66 Gbit/s encode/decode (AVX2 VPSHUFB), LDPC: ~215 Melem/s · all numbers from running code |
+| **Benchmarks** | RS: ~162/90 Gbit/s encode/decode (GFNI, AVX2 VPSHUFB fallback), LDPC: ~219 Melem/s · all numbers from running code |
 
 ### The algorithm portfolio — one library, every generation
 
@@ -52,8 +52,8 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Hamming(7,4)** | 1950 | Syndrome lookup | $O(1)$ / nibble | ECC teaching, SECDED DRAM ancestor | Hamming 1950 |
 | **Golay(24,12,8)** | 1949 | Syndrome table (2 325 cosets) | $O(1)$ / block | Voyager imaging, CCSDS telecommand, MIL-STD-188-141 ALE | Golay 1949 |
 | **BCH(255,k,t≤10)** | 1959–60 | Berlekamp–Massey + Chien | $O(nt)$ | DVB-S2 outer code, NAND-flash controllers | Bose–Chaudhuri 1960; Hocquenghem 1959 |
-| **Reed-Solomon GF(256)** | 1960 | Erasure (Vandermonde) | $O(n \cdot p)$ | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
-| **Convolutional (Viterbi)** | 1967 | Hard ACS + soft max-log-MAP | $O(2^{K-1} L)$ | GSM/2G, DAB radio, legacy 802.11, deep space | Viterbi 1967 |
+| **Reed-Solomon GF(256)** | 1960 | Erasure (Vandermonde); errors-and-erasures (syndrome-verified search) | $O(n \cdot p)$ erasure; $O\!\big(\binom{n}{t} \cdot \text{len}\big)$ for $t$ unknown-position errors | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
+| **Convolutional (Viterbi)** | 1967 | Hard ACS + soft max-log-MAP; zero-terminated and tail-biting (WAVA) | $O(2^{K-1} L)$, $\times$ laps for tail-biting | GSM/2G, DAB radio, legacy 802.11, deep space | Viterbi 1967; Shao–Lin–Fossorier 2003 (WAVA) |
 | **Turbo (LTE PCCC)** | 1993 | Iterative max-log-MAP (BCJR) | $O(8 K \cdot \text{iters})$ | 3G UMTS, 4G LTE data channels | Berrou et al. 1993 |
 | **QC-LDPC (BG1/BG2)** | 1963 / 2004 | Layered Offset Min-Sum, SIMD | $O(E Z \cdot \text{iters})$ | 5G NR data, Wi-Fi 6/7, DVB-S2X, 10GBASE-T | Gallager 1963; Fossorier 2004 |
 | **Polar (SC / CA-SCL)** | 2009 | Successive cancellation + list | $O(N \log N)$, list $\times L$ | 5G NR control channels (PDCCH/PBCH) | Arıkan 2009; Tal & Vardy 2015 |
@@ -144,10 +144,10 @@ syndrome/
 │   ├── quantize.rs         — f32 → i8 LLR quantization (scale + clamp, −127..127)
 │   │
 │   │   ── Multi-standard FEC cores ──────────────────────────────────
-│   ├── viterbi.rs          — Rate-1/2 K=7 Viterbi (hard Hamming ACS + soft max-log-MAP)
+│   ├── viterbi.rs          — Rate-1/2 K=7 Viterbi (hard Hamming ACS + soft max-log-MAP, zero-tail + tail-biting)
 │   ├── turbo.rs            — LTE rate-1/3 Turbo (TS 36.212): QPP interleaver, max-log-MAP
 │   ├── polar.rs            — Polar codes: SC + CA-SCL decode, 3GPP reliability seq
-│   ├── reed_solomon.rs     — GF(256) Vandermonde erasure RS encoder/decoder
+│   ├── reed_solomon.rs     — GF(256) Vandermonde RS: erasure + errors-and-erasures decode
 │   ├── bch.rs              — Binary BCH(255,k,t≤10): Berlekamp–Massey + Chien search
 │   ├── golay.rs            — Extended Golay(24,12,8): syndrome-table 3-error correction
 │   ├── hamming.rs          — Hamming(7,4) encode/decode
@@ -398,24 +398,32 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (351 tests total on x86-64; 352 on AArch64)
+### 4.1 Component coverage (425 tests total on x86-64; 423 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 194 (x86-64) / 195 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 235 (x86-64) / 233 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
+| LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
 | Wi-Fi LDPC integration (encode→AWGN→decode, all 12 (Z,R)) | 3 | `tests/wifi_ldpc_integration.rs` |
 | Wi-Fi shortening/puncturing integration (encode→AWGN→decode, all 12 (Z,R)) | 2 | `tests/wifi_shortening_puncturing_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
-| Robustness (hostile/degenerate inputs, no panics) | 31 | `tests/robustness.rs` |
-| Doctests | 96 | `///` examples in all public API |
+| Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
+| Doctests | 118 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
-Reed-Solomon against CCSDS conventions, Hamming/Golay/BCH against published
-generator and parity-check matrices — so a refactor that silently changes the
-algorithm fails loudly even when every round-trip test still passes. The
+Hamming against a published generator/parity-check matrix, BCH against an
+independently-derived generator polynomial, Golay against a published
+self-dual-code literature fact (the all-ones vector is always a codeword,
+verified exhaustively over all 4096 messages) — so a refactor that silently
+changes the algorithm fails loudly even when every round-trip test still
+passes. Reed-Solomon is deliberately absent from this
+suite: this crate's coefficients are a Vandermonde-style erasure scheme, not
+CCSDS 131.0-B's dual-basis systematic code, so no independently published KAT
+applies to it — it is skipped rather than tested against a mismatched
+standard (see `tests/reference_vectors.rs`'s own module doc). The
 **robustness suite** drives every public API with adversarial byte streams and
 degenerate parameters, asserting that each one returns a typed `FecError`
 rather than panicking, whatever it is fed. Six libFuzzer targets
@@ -452,7 +460,7 @@ Each test encodes a real payload, simulates BPSK AWGN at multiple SNR levels, de
 |---|---|---|---|---|
 | `audio_frame_5g_nr_reconstruction` | 100 bytes (Opus audio frame) | 5G NR BG2, Z=88, R=1/2 | 5 dB Eb/No | ✓ perfect |
 | `video_nalu_5g_nr_reconstruction` | 1 000 bytes (H.265 NAL unit) | 5G NR BG1, Z=384, R=1/3 | 4 dB Eb/No | ✓ perfect |
-| `wifi6_frame_reconstruction` | 63 bytes (Wi-Fi data frame) | Wi-Fi 6 MCS7 proxy, R=5/6 | 7 dB Eb/No | ✓ perfect |
+| `wifi6_frame_reconstruction` | 62 bytes (Wi-Fi data frame) | Wi-Fi 6 MCS7 proxy, R=5/6 | 7 dB Eb/No | ✓ perfect |
 | `sixg_embb_ultra_reliable` | 250 bytes (6G eMBB block) | 6G BG1, Z=96, R=0.89 | 12 dB Eb/No | ✓ perfect |
 
 Sample output (`cargo test --release --test media_reconstruction audio_frame_5g_nr_reconstruction -- --nocapture`):
@@ -484,21 +492,53 @@ Uniform metric: **information-bit throughput** (payload bits per second — pari
 
 | Algorithm | Configuration | Encode | Decode | Decoder implementation |
 |---|---|---|---|---|
-| Reed-Solomon | RS(10,4), 4 KiB shards | **89.0 Gbit/s** | **66.0 Gbit/s** | Reconstruction runs through the same AVX2 VPSHUFB kernel as encode; allocation-free per call |
-| CRC-24A | 6144-bit block | **3.71 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
-| Golay | (24,12), syndrome table | 1.82 Gbit/s | 625 Mbit/s | $O(1)$ syndrome-table lookup |
-| Hamming | (7,4), table | 2.46 Gbit/s | 1.09 Gbit/s | Table lookup |
-| BCH | (255,223,t=4) | **976 Mbit/s** | **243 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
-| Viterbi | K=7, R=1/2, soft | 545 Mbit/s | **29.2 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
-| Polar | (1024,512), SC | 123 Mbit/s | **37.2 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
-| Turbo | LTE K=1024, 8 iter | 313 Mbit/s | **11.6 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
-| QC-LDPC | BG1 Z=384, 10 iter | **1.55 Gbit/s** | 10.9 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
+| Reed-Solomon | RS(10,4), 4 KiB shards | **161.7 Gbit/s** | **89.5 Gbit/s** | Reconstruction runs through the same GFNI/AVX2 kernel as encode; allocation-free per call |
+| CRC-24A | 6144-bit block | **3.89 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
+| Golay | (24,12), syndrome table | 1.80 Gbit/s | 653 Mbit/s | $O(1)$ syndrome-table lookup |
+| Hamming | (7,4), table | 2.36 Gbit/s | 1.05 Gbit/s | Table lookup |
+| BCH | (255,223,t=4) | **1.22 Gbit/s** | **262 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
+| Viterbi | K=7, R=1/2, soft | 572 Mbit/s | **30.8 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
+| Polar | (1024,512), SC | 130 Mbit/s | **36.8 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
+| Turbo | LTE K=1024, 8 iter | 327 Mbit/s | **20.1 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
+| QC-LDPC | BG1 Z=384, 10 iter | **1.93 Gbit/s** | 11.6 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
 
 The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3).
 
 Every SIMD path keeps its scalar implementation as a tested reference, and the two are proven output-equivalent by seeded randomized round-trips rather than assumed equivalent. §5.2 puts the vectorized decoder next to the same algorithm compiled from C++, both measured in one run of `bench/run_all.sh`, so the comparison is reproducible on your own machine.
 
 Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algos.json` → `python bench/dashboard/gen_charts.py`.
+
+Every figure above is one run of that command, and the table is regenerated
+from the `algos.json` it writes. Two things are worth knowing about how it
+measures, because the obvious approach gets both wrong on a shared,
+virtualized host (this crate develops on WSL2):
+
+- **Warm-up is timed, not counted.** A fixed warm-up *call count* warms a
+  slow kernel for milliseconds and a fast one for microseconds. That matters
+  most for the AVX2/GFNI Reed-Solomon kernel: the same timed block reports
+  roughly 78 Gbit/s after 20 warm-up calls against roughly 165 Gbit/s once
+  fully warmed. Running the identical measurement against the *scalar*
+  encode kernel on the same buffers shows no such ramp, which is what
+  distinguishes a vector-unit frequency ramp from mere cache residency. The
+  harness therefore warms up for a fixed wall-clock duration.
+
+- **The estimator is a median, not a mean.** Per-call times here are heavily
+  right-tailed — the 99.9th percentile is around 7× the median and the worst
+  case around 50× — because the process is preempted. A mean folds every
+  preemption into the result: 100 independent timed blocks of the *identical*
+  Reed-Solomon encode spanned 90 to 163 Gbit/s. The harness takes the median
+  across 51 timed rounds, which discards interrupted rounds instead of
+  averaging them in.
+
+With both in place, repeated runs of the same binary on the same tree agree
+to roughly 5–7% on most rows. Two caveats remain. Erasure-decode figures
+subtract one timed measurement from another to exclude setup cost, and a
+difference of two noisy quantities is noisier than either, so those rows move
+more. And rows differing by less than ~10% still should not be read as
+meaningfully ordered. Where a comparison has to be trustworthy — the GFNI
+versus VPSHUFB kernel choice in §5.1 — it is measured by an interleaved,
+same-process microbenchmark that alternates the two kernels within one
+process, which removes even the between-run component.
 
 ### 5.1 Reed-Solomon encode throughput
 
@@ -508,14 +548,33 @@ Reproduce: `cargo run --release --bin algo_bench_export` → `bench/results/algo
 
 | Implementation | 256 B | 1 KiB | 4 KiB | 16 KiB |
 |---|---|---|---|---|
-| **Rust `encode_with_avx2` (VPSHUFB)** | **~7.4 GiB/s** | **~9.8 GiB/s** | **~10.7 GiB/s** | **~8.7 GiB/s** |
-| Rust `encode_with_tables_chunked` | ~729 MiB/s | ~762 | ~844 | ~776 |
-| Rust `encode_into` | ~613 MiB/s | ~618 | ~638 | ~585 |
-| C++ same-algorithm `-O3 -march=native` | ~588 MiB/s | ~594 | ~592 | ~594 |
+| **Rust `encode_with_avx2` (GFNI)** | **~12.4 GiB/s** | **~14.3 GiB/s** | **~13.7 GiB/s** | **~10.2 GiB/s** |
+| Rust `encode_with_tables_chunked` | ~843 MiB/s | ~869 | ~839 | ~853 |
+| Rust `encode_into` | ~533 MiB/s | ~661 | ~657 | ~655 |
+| C++ same-algorithm `-O3 -march=native` | ~552 MiB/s | ~494 | ~616 | ~614 |
 | Python same-algorithm | ~2.7 MiB/s | ~2.4 | ~2.3 | ~2.3 |
-| Python `reedsolo` library | ~2.1 MiB/s | ~2.3 | ~2.2 | ~2.2 |
+| Python `reedsolo` library | ~2.0 MiB/s | ~2.2 | ~2.1 | ~2.2 |
 
-The AVX2 path uses VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, processing 32 bytes/cycle.  Rust and C++ produce **byte-identical parity output** (checksum-gated).
+`encode_with_avx2` runtime-detects GFNI first: multiplying by a fixed `GF(256)` coefficient is $\mathbb{F}_2$-linear in the byte's bit representation, so it reduces to one `_mm256_gf2p8affine_epi64_epi8` per 32 bytes against a per-coefficient $8\times8$ bit matrix derived once in `precompute_mul_tables`. Where GFNI isn't available it falls back to VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, also 32 bytes/iteration but four shuffle/blend instructions instead of one affine instruction. Both kernels are proven byte-identical to the scalar reference — the GFNI matrix additionally exhaustively, over all 256 coefficients. Rust and C++ produce **byte-identical parity output** (checksum-gated).
+
+Which of the two is faster cannot be settled by the table above: separate
+benchmark runs on this host drift by more than the gap between the kernels
+(see §5.0). It is instead measured by
+`reed_solomon::tests::bench_gfni_vs_avx2_nibble`, which calls both kernels
+alternately inside a single process — 21 rounds × 200 iterations each, after
+a warm-up, reporting medians — so both see the same turbo and thermal state:
+
+| Shard length | VPSHUFB nibble | GFNI | Speed-up |
+|---|---|---|---|
+| 256 B | 9.1 GiB/s | 13.7 GiB/s | **1.51×** |
+| 1 KiB | 10.9 GiB/s | 18.8 GiB/s | **1.73×** |
+| 4 KiB | 10.9 GiB/s | 18.0 GiB/s | **1.65×** |
+| 16 KiB | 10.1 GiB/s | 13.7 GiB/s | **1.35×** |
+
+Reproduce with `cargo test --release
+reed_solomon::tests::bench_gfni_vs_avx2_nibble -- --ignored --nocapture`. The
+test is `#[ignore]`d (it is a measurement, not an assertion) and skips
+cleanly on hosts without GFNI.
 
 The throughput above is what RS(10,4) costs; this is what it buys — a real
 80×80 test image, RS(10,4)-encoded, with 4 of its 10 data shards (the maximum
@@ -542,9 +601,9 @@ Metric: $N \times \text{iters} / t_{\text{call}}$ (variable-node-iterations/s).
 
 | Implementation | Throughput | Wall-clock / call |
 |---|---|---|
-| **Rust, AVX2 selected at runtime** | **~215 Melem/s** | **~1.22 ms** |
-| Rust, scalar kernel forced | ~66 Melem/s | ~3.95 ms |
-| C++ scalar `-O3 -march=native` | ~67 Melem/s | ~3.88 ms |
+| **Rust, AVX2 selected at runtime** | **~219 Melem/s** | **~1.19 ms** |
+| Rust, scalar kernel forced | ~67 Melem/s | ~3.89 ms |
+| C++ scalar `-O3 -march=native` | ~71 Melem/s | ~3.67 ms |
 
 All three rows come from one run of `bench/run_all.sh`, decoding the same
 codeword for the same number of iterations, on the machine recorded in
@@ -556,8 +615,20 @@ separate decoders. A unit test asserts the two produce identical hard-decision
 output and identical iteration counts on the same input, which is what makes
 the comparison meaningful rather than merely apples-to-apples-looking.
 
-Rust's scalar kernel lands within ~2% of the C++ scalar build of the same
+Rust's scalar kernel lands within ~6% of the C++ scalar build of the same
 algorithm, and AVX2 buys ~3.3× over it.
+
+The Rust/C++ comparison is checksum-gated like the Reed-Solomon one, and
+`bench/run_all.sh` refuses to plot these numbers if the gate fails. What is
+compared is the decoders' **hard decisions** — which codeword each settled on
+— hashed on both sides and required to match on all 26,112 variable nodes.
+Not the raw LLRs: LOMS is floating point, and two compilers are each free to
+contract multiply-adds into FMAs, reassociate, and vectorize differently, so
+bit-identical `f32` output is not a property either toolchain guarantees and
+demanding it would produce a gate that fails for reasons unrelated to
+correctness. The decoded codeword is integer, is what any downstream stage
+consumes, and is invariant to those last-ulp differences — so it is the
+thing worth gating on.
 
 AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar path):
 1. **Loop inversion** — Z-inner loop (384 independent iterations) gives LLVM a vectorisable axis.
@@ -591,7 +662,7 @@ virtualized host (WSL2) whose available throughput swings with whatever else
 the underlying machine is doing; a repeat run below shows the 1-worker figure
 alone ranging from 97 to 154 Melem/s.
 
-**This is not directly comparable to §5.2's 215 Melem/s single-threaded
+**This is not directly comparable to §5.2's 219 Melem/s single-threaded
 figure — the two decode different workloads, not just through different
 harnesses.** §5.2 decodes a synthetic, never-converging LLR pattern for a
 fixed 10-iteration budget; the per-iteration syndrome check fails on the
@@ -910,6 +981,8 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 [19] 3GPP, "E-UTRA; Multiplexing and channel coding," TS 36.212 (LTE Turbo coding, QPP interleaver Table 5.1.3-3).
 
 [20] S. Lin and D. J. Costello, *Error Control Coding*, 2nd ed., Prentice Hall, 2004 — the standard textbook covering Hamming, Golay, BCH, RS, convolutional/Viterbi, and Turbo codes, and the text whose chapter order this library roughly follows.
+
+[21] R. Y. Shao, S. Lin, and M. P. C. Fossorier, "Two Decoding Algorithms for Tailbiting Codes," *IEEE Trans. Commun.*, vol. 51, no. 10, pp. 1658–1665, Oct. 2003 — the Wrap-Around Viterbi Algorithm used by `decode_hard_tail_biting` / `decode_soft_tail_biting` in `src/viterbi.rs`.
 
 ### Video introductions
 

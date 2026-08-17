@@ -1,6 +1,6 @@
 [
-  {"lang":"cpp","impl":"encode_into","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":4151.0,"mib_per_s":588.2},
-  {"lang":"cpp","impl":"encode_into","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":16441.5,"mib_per_s":594.0},
-  {"lang":"cpp","impl":"encode_into","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":65966.4,"mib_per_s":592.2},
-  {"lang":"cpp","impl":"encode_into","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":263014.5,"mib_per_s":594.1}
+  {"lang":"cpp","impl":"encode_into","shard_len":256,"data_shards":10,"parity_shards":4,"payload_bytes":2560,"ns_per_iter":4419.9,"mib_per_s":552.4},
+  {"lang":"cpp","impl":"encode_into","shard_len":1024,"data_shards":10,"parity_shards":4,"payload_bytes":10240,"ns_per_iter":19763.1,"mib_per_s":494.1},
+  {"lang":"cpp","impl":"encode_into","shard_len":4096,"data_shards":10,"parity_shards":4,"payload_bytes":40960,"ns_per_iter":63460.0,"mib_per_s":615.5},
+  {"lang":"cpp","impl":"encode_into","shard_len":16384,"data_shards":10,"parity_shards":4,"payload_bytes":163840,"ns_per_iter":254566.1,"mib_per_s":613.8}
 ]

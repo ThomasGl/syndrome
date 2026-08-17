@@ -5,6 +5,272 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-16
+
+### Added
+
+- **Cross-language LDPC correctness gate** (`bench/run_all.sh`,
+  `bench/cpp/loms_decode.cpp`, `src/bin/ldpc_bench_export.rs`): the C++ and
+  Rust LOMS decoders now each hash their hard decisions after a decode from
+  a fixed input and write `ldpc_{cpp,rust}.checksum`, which `run_all.sh`
+  compares and fails the run on divergence — the same gate the Reed-Solomon
+  path already had, extended to the LDPC benchmark whose numbers were
+  previously published without any correctness check tying the two
+  implementations together. Hard decisions rather than raw LLRs: RS parity
+  can be compared byte-for-byte because GF(256) encoding is integer
+  arithmetic, but LOMS is floating point and the two binaries are built by
+  different compilers free to contract multiply-adds into FMAs and
+  reassociate, so identical `f32` values are not something either toolchain
+  guarantees. Which codeword the decoder settles on is integer, is what a
+  downstream stage consumes, and is invariant to those differences. The two
+  implementations currently agree on all 26,112 decisions.
+
+- **Adversarial coverage for the Bluetooth, Wi-Fi rate-matching, and `bits`
+  APIs** (`tests/robustness.rs`): these were the largest gaps in a suite
+  whose stated goal is that no public API panics on arbitrary input — every
+  Bluetooth entry point takes caller-sized buffers whose required lengths
+  are derived from a code rate, which is exactly where a length-check slip
+  becomes an out-of-bounds index. Six new fuzz functions drive the LE Coded
+  PHY pattern mapper, both BR/EDR codes, the Wi-Fi shortening/puncturing
+  path, and the bit/byte conversions with mismatched buffers, non-binary
+  "bit" values, `usize::MAX` parameters, and NaN/infinite/subnormal LLRs.
+  They found the `shortening_and_puncture_counts` overflow recorded under
+  Fixed below.
+
+- **Monte Carlo estimation harness** (`src/montecarlo.rs`): runs trials until
+  a target number of *error events* has accumulated rather than a fixed
+  trial count, because the relative precision of an error-rate estimate
+  depends on the event count ($\approx 1/\sqrt{k}$) and not on how many
+  trials produced them — a fixed budget over-runs at low SNR and returns no
+  information at high SNR. Every result carries a Wilson score confidence
+  interval, which stays inside $[0, 1]$ and gives a usable one-sided bound
+  when zero errors were seen, where the textbook normal approximation
+  collapses to $[0, 0]$ and asserts certainty from no evidence. The module
+  documents what the interval does not cover: it is a statement about
+  sampling noise only, and it is exact for block-level events but optimistic
+  for bit-level ones, whose errors are correlated within a failed block.
+  Includes an empirical coverage test that verifies a nominal 95% interval
+  covers the true value about 95% of the time over 400 independent
+  experiments.
+
+- **Rayleigh block-fading channel** (`src/channel_sim.rs`):
+  `RayleighBlockChannel` models multipath fading with a per-block amplitude
+  $h$ drawn from a Rayleigh distribution normalized to $E[h^2] = 1$, so a
+  given $E_b/N_0$ means the same average received energy as on the AWGN
+  channel and the two are directly comparable. Perfect receiver CSI is
+  assumed and the LLR is scaled by the realized gain; channel estimation
+  error is not modelled, and the docs say so — results from this channel are
+  an optimistic bound on a real receiver. `transmit_with_gains` also returns
+  the realized amplitudes.
+
+- **Statistical validation of the channel models** (`src/channel_sim.rs`):
+  the existing tests checked determinism and LLR signs, none of which would
+  notice noise with the wrong variance, a non-zero mean, or a non-Gaussian
+  shape — defects that would silently shift every error-rate curve the crate
+  produces while leaving the suite green. Added tests that recover the
+  realized noise from the LLRs and check its mean and variance against the
+  $E_b/N_0$ calibration, invert the calibration to confirm the measured SNR
+  matches the requested one, run a $\chi^2$ goodness-of-fit test against the
+  normal distribution, and bound the lag-1 autocorrelation. Both channels
+  are additionally checked against the closed-form uncoded-BPSK error
+  probabilities ($Q(1/\sigma)$ for AWGN, the standard
+  $\tfrac{1}{2}(1-\sqrt{\bar\gamma_b/(1+\bar\gamma_b)})$ for Rayleigh), and
+  the fading amplitudes against the Rayleigh moments $E[h] = \sqrt\pi/2$,
+  $E[h^2] = 1$, $E[h^4] = 2$.
+
+- **Exact log-MAP for the Turbo decoder** (`src/turbo.rs`): `MapAlgorithm`
+  selects between `MaxLog` (the default, unchanged) and `LogMap`, which
+  evaluates the full Jacobian correction $\ln(1 + e^{-|a-b|})$ at every BCJR
+  combining step instead of dropping it. Both rules share one generic scalar
+  kernel parameterized by a const flag, so they cannot drift apart and the
+  max-log path monomorphizes back to exactly the branch-free `max` loop it
+  was before. Selecting `LogMap` also disables the Vogt-Finger extrinsic
+  damping, which exists to correct max-log's over-confidence and would
+  discard correctly scaled information under exact log-MAP. Exact log-MAP is
+  scalar-only: the AVX2/NEON kernels express one `max` per step and cannot
+  carry a transcendental, so requesting `LogMap` overrides the backend
+  rather than silently downgrading the algorithm. The docs state the trap
+  that makes this option easy to misuse — max-log-MAP is invariant to a
+  positive scaling of its input LLRs and exact log-MAP is **not**, so
+  `LogMap` requires genuine LLRs and underperforms on arbitrarily scaled
+  soft values. The accompanying test measures block error rate for both
+  algorithms over identical channel realizations and requires disjoint 95%
+  confidence intervals before claiming a difference.
+
+- **Reed-Solomon errors-and-erasures decoding** (`src/reed_solomon.rs`):
+  `ReedSolomon::decode_errors_and_erasures` corrects symbols that are
+  *present but corrupted* — wrong bytes carrying no erasure flag — alongside
+  any number of flagged erasures, whenever $2t + s \le$ `parity_shards`.
+  It returns the number of unknown-position errors it actually found.
+  The algorithm is a syndrome-verified combinatorial search over candidate
+  error positions that reuses the existing Vandermonde erasure decoder as
+  its only reconstruction engine, so it introduces no new field arithmetic.
+  Berlekamp–Massey and Chien search (as used in `src/bch.rs`) are
+  deliberately *not* used here and would be mathematically unsound for this
+  code: data positions hold the message polynomial's coefficients while
+  parity positions hold its evaluations $p(\alpha^i)$, so the parity-check
+  matrix has Kronecker-delta columns at parity positions and the syndromes
+  never take the classical $S_i = \sum_k e_k \beta_k^i$ form those algorithms
+  require. Cost is $O\!\big(\binom{n}{\text{max\_errors}} \cdot
+  \text{shard\_len}\big)$ — cheap for the small parity counts this crate
+  targets, and the reason the method takes an explicit `max_errors` bound
+  rather than searching unboundedly. Verified against a from-scratch
+  exhaustive reference decoder that shares no code with the crate (its own
+  Russian-peasant `GF(256)` multiply and Horner evaluator), plus seeded
+  random round-trips across 11 $(d, p, t, s)$ shapes, and a case with more
+  errors than the distance bound allows that must return
+  `FecError::DecoderNotConverged` rather than a silently wrong answer.
+
+- **Tail-biting convolutional codes** (`src/viterbi.rs`):
+  `encode_tail_biting`, `decode_hard_tail_biting`, and
+  `decode_soft_tail_biting` implement tail-biting termination, where the
+  encoder's shift register is preloaded with the message's own final $K-1$
+  bits so the trellis starts and ends in the same (unknown) state — no
+  zero-tail flush bits, and therefore no rate loss on short blocks. Decoding
+  uses the Wrap-Around Viterbi Algorithm: metrics are initialised uniformly
+  across all states, carried around the circular trellis for up to four
+  laps, and the decode stops as soon as a lap's traceback returns to the
+  state it started from (a self-consistent circular path). Hard-decision and
+  soft-decision paths both have AVX2 and NEON kernels sharing the same ACS
+  step functions as the existing zero-terminated decoders, with seeded
+  equivalence tests against the scalar reference. Round-trip correctness is
+  tested from all 64 possible starting states for both hard and soft input.
+
+### Changed
+
+- **LDPC offset correction $\beta$ raised from `0.25` to `0.5`** where the
+  crate picks it on the caller's behalf
+  (`DlSchConfig::default_decode_params`). `0.25` is measurably the wrong
+  value: `tests/ldpc_offset_beta_sweep.rs` sweeps $\beta$ against block
+  error rate over the crate's AWGN channel using the new
+  `montecarlo` harness, and on BG1 at production lifting sizes the gap is
+  large and grows with $Z$ — at $Z = 384$, $E_b/N_0 = 1$ dB, 10 iterations,
+  BLER is $0.133$ at $\beta = 0.25$ against $3.3 \times 10^{-4}$ at
+  $\beta = 0.5$, with disjoint 95% confidence intervals. On BG2 the two
+  best points ($0.35$ and $0.5$) are statistically indistinguishable from
+  each other and both beat $0.25$. $\beta$ remains a caller-supplied
+  parameter everywhere else in the public API; only the value the crate
+  selects by itself changed. The sweep is checked in, so the choice can be
+  re-measured rather than trusted, and `tests/` now carries fast regression
+  tests that fail if $\beta$'s advantage over both $0$ and an over-large
+  offset stops being resolvable.
+
+- **`src/viterbi.rs` module documentation** now states the precise limits of
+  its "maximum likelihood" claim, which previously read as unqualified. The
+  decoder is maximum-likelihood *sequence* detection, not bitwise MAP: it
+  minimizes the probability that the whole sequence is wrong and produces no
+  per-bit reliability, which is the distinction from the BCJR decoder in
+  `src/turbo.rs`. Optimality also holds only under each branch metric's own
+  channel model — Hamming distance is ML for a BSC with $p < 1/2$,
+  correlation is ML for BPSK over AWGN. And it does not extend to the
+  tail-biting decoder at all: WAVA is an approximation to ML decoding of a
+  circular trellis, returning a certified tail-biting codeword when its
+  self-consistency check succeeds and the best candidate found otherwise,
+  with no flag distinguishing the two.
+
+- **`src/quantize.rs` module documentation** now states plainly that this
+  crate has *not* measured its own quantization loss, because the vectorized
+  `i8` LOMS kernel this module exists to feed is not implemented, so there
+  is no decode path here to measure. The previous text asserted a "< 0.1 dB"
+  figure with no source. The replacement cites a published survey for
+  min-sum decoders generally
+  (<https://par.nsf.gov/servlets/purl/10156560>) and says explicitly that
+  the figure describes other implementations until this crate has a kernel
+  and its own BER/BLER sweep to back a number.
+
+- **AVX2 QC-LDPC kernel alignment contract** (`src/simd_avx2.rs`,
+  `src/qc_ldpc.rs`): the `min1`/`min2`/`sxor` scratch buffers are now accessed
+  with the aligned AVX2 load/store forms (`_mm256_load_ps`,
+  `_mm256_load_si256`) instead of the unaligned ones, and the sole caller
+  backs them with `#[repr(align(64))]` locals always sliced from index 0 to
+  guarantee that. The safety contract on `decode_layer_passes_avx2` documents
+  the requirement. `edge_r` and `q_row` keep the unaligned forms: their
+  per-layer offsets are data-dependent running sums, so no unconditional
+  alignment guarantee is available for them without a larger layout change.
+  Measured LDPC throughput is unchanged (~217 Melem/s) — modern x86 handles
+  aligned and unaligned loads at the same rate when the address happens to
+  be aligned; this is a correctness/intent change, not a speed-up.
+
+### Fixed
+
+- **Benchmark harness measured the AVX2 kernels while they were still
+  ramping** (`src/bin/algo_bench_export.rs`, `src/bin/bench_export.rs`). Both
+  exporters warmed up for a fixed *call count* and then reported the mean of
+  a single timed block. Two independent defects followed, and the published
+  Reed-Solomon figures were the main casualty:
+
+  A fixed call count is not a fixed amount of warm-up. Twenty warm-up calls
+  is tens of microseconds — enough for the scalar codecs, far too little for
+  the AVX2/GFNI Reed-Solomon kernel to reach a steady frequency. Measured on
+  this host, the same timed block reports ~78 Gbit/s after 20 warm-up calls
+  against ~165 Gbit/s once fully warmed, and which regime a given run landed
+  in varied with host state. The identical measurement against the *scalar*
+  encode kernel on the same buffers shows no such ramp, which is what rules
+  out cache residency as the cause.
+
+  Separately, a mean cannot reject a timed block that was preempted. Per-call
+  times here are heavily right-tailed (99.9th percentile ~7× the median,
+  worst case ~50×), so 100 independent blocks timing the identical encode
+  spanned 90–163 Gbit/s.
+
+  Both exporters now warm up for a fixed wall-clock duration and report the
+  median of 51 timed rounds. Run-to-run spread on the same tree drops from
+  28% to ~7% for Reed-Solomon encode, 100% to ~4% for CRC-24A, 62% to ~4% for
+  Turbo encode, and 54% to ~5% for Viterbi encode. Every published number in
+  `README.md` moved accordingly — Reed-Solomon encode most of all, from a
+  reported ~97 Gbit/s to ~162 Gbit/s, because the old figure was measuring a
+  partly-cold vector unit rather than the kernel.
+
+- **Unchecked subtraction in
+  `wifi_rate_matching::shortening_and_puncture_counts`**: the function
+  computed `n - (k - payload_bits)` having checked only
+  `payload_bits <= k`, never that `n >= k`. `k` and `n` are free `usize`
+  parameters rather than values read off a validated matrix, so a caller
+  could supply a pair no real block code has and reach the subtraction. In a
+  debug build that panicked; in a release build — the worse case — it wrapped
+  to a value near `usize::MAX`, which let the range check below it pass for
+  essentially any input and returned a meaningless puncture count instead of
+  an error. Now rejected with `FecError::InvalidParam`. Found by the new
+  adversarial coverage below, with a minimized reproducer kept in
+  `tests/robustness.rs`.
+
+- **Polar code reliability sequence** (`src/polar.rs`): `RELIABILITY_SEQ` now
+  embeds the complete 1024-entry 3GPP `Q_Nmax` table (TS 38.212 Table
+  5.3.1.2-1), cross-validated byte-for-byte against two independent
+  open-source implementations (`robmaunder/polar-3gpp-matlab` and
+  OpenAirInterface5G's `nr_polar_sequence_pattern.c`). `frozen_mask` now
+  consults the real table for every `N ≤ 1024` — the entire 3GPP-defined
+  range, including PBCH (`N=512`) and PDCCH up to `N=1024` — instead of
+  falling back to a polarization-weight approximation above `N=256`. The
+  previously embedded `N ≤ 256` prefix was also incomplete (247 of the 256
+  required entries; nine reliability positions were missing from the
+  hand-transcribed table) and is corrected by this replacement. The PW
+  fallback remains for `N > 1024`, outside the range 5G NR polar codes are
+  defined for.
+
+### Performance
+
+- **Reed-Solomon GFNI acceleration** (`src/reed_solomon.rs`, `src/simd_avx2.rs`):
+  `encode_with_avx2` and erasure `decode` now runtime-detect GFNI
+  (`_mm256_gf2p8affine_epi64_epi8`) and prefer it over the existing AVX2
+  VPSHUFB nibble-table kernel when available, falling back to VPSHUFB where
+  GFNI isn't present. Multiplying by a fixed `GF(256)` coefficient is
+  $\mathbb{F}\_2$-linear, so GFNI applies the coefficient's precomputed
+  $8 \times 8$ bit matrix directly in one instruction per 32 bytes, instead
+  of VPSHUFB's four-instruction shuffle/mask/blend sequence for the same 32
+  bytes. Measured by `reed_solomon::tests::bench_gfni_vs_avx2_nibble`, which
+  alternates the two kernels inside a single process (21 rounds × 200
+  iterations, medians) so both see the same turbo and thermal state: GFNI is
+  1.51×/1.73×/1.65×/1.35× the VPSHUFB kernel's throughput at 256 B/1 KiB/4
+  KiB/16 KiB shards. That interleaved form is what the comparison rests on —
+  comparing separate `bench/run_all.sh` runs could not have established this
+  either way — see the benchmark-harness entry under Fixed for why those
+  runs were unstable, and note that this interleaved measurement was
+  unaffected by that defect and reproduces to within 0.03x across runs.
+  Both kernels are proven byte-identical to the scalar reference; the GFNI
+  bit matrix is additionally checked exhaustively against all 256 `GF(256)`
+  coefficients.
+
 ## [0.3.0] — 2026-08-09
 
 ### Added
