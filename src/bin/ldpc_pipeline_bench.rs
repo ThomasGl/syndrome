@@ -167,7 +167,7 @@ fn measure(decoder: QcLdpcDecoder, n_workers: usize, n: usize, noisy_llr: &[f32]
             && let Some(mut frame) = pipe.acquire()
         {
             frame.llr_mut().copy_from_slice(noisy_llr);
-            pipe.submit(frame);
+            let _ = pipe.submit(frame);
             submitted += 1;
         }
         if let Some(result) = pipe.try_recv() {
@@ -188,7 +188,7 @@ fn measure(decoder: QcLdpcDecoder, n_workers: usize, n: usize, noisy_llr: &[f32]
             && let Some(mut frame) = pipe.acquire()
         {
             frame.llr_mut().copy_from_slice(noisy_llr);
-            pipe.submit(frame);
+            let _ = pipe.submit(frame);
             submitted += 1;
         }
         if let Some(result) = pipe.try_recv() {

@@ -398,11 +398,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (455 tests total on x86-64; 453 on AArch64)
+### 4.1 Component coverage (461 tests total on x86-64; 459 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 244 (x86-64) / 242 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 248 (x86-64) / 246 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
 | int8 LDPC kernel equivalence (scalar vs AVX2, bit-for-bit) | 8 | `tests/ldpc_int8_kernel_equivalence.rs` |
@@ -413,7 +413,7 @@ loop {
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
 | SPSC memory-ordering model check (loom, exhaustive) | 5 — not counted above; needs `--cfg loom` | `tests/loom_spsc.rs` |
-| Doctests | 128 | `///` examples in all public API |
+| Doctests | 130 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
@@ -648,6 +648,16 @@ AVX2 speed-up breakdown (3 optimisations that together match C++ on the scalar p
 3. **Sign bit XOR** — `bits & 0x8000_0000` accumulation replaces float multiply.
 
 ### 5.2.1 Lock-free multi-worker pipeline scaling
+
+`DlSchDecoder::with_pipeline(n)` puts this on the real transport-block path:
+a segmented transport block's code blocks are dispatched to the workers
+instead of being decoded one after another on the calling thread. It is
+opt-in — the pipeline spawns threads that spin for the decoder's lifetime —
+and `decode` still takes the sequential path when the transport block fits in
+a single code block. The decoded output is identical either way; a unit test
+asserts that bit-for-bit over a noisy channel, including the per-code-block
+CRC flags and the reported iteration count.
+
 
 BG1 Z=384, real AWGN-corrupted codewords (not the clean, single-iteration
 codeword an easier benchmark would use — see below), 1000 frames/worker-count.

@@ -74,7 +74,7 @@
 //! // Acquire a free slot, fill with channel LLRs, and submit.
 //! let mut frame = pipe.acquire().expect("pool has 16 slots");
 //! frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-//! pipe.submit(frame);
+//! pipe.submit(frame).ok();
 //!
 //! // Spin until the worker completes the frame.
 //! loop {
@@ -108,6 +108,9 @@ struct FrameSlot {
     /// budget; smaller when the syndrome check passed early). `0` until the
     /// first decode completes.
     iterations_used: usize,
+    /// Caller-owned identifier, carried through the pipeline untouched. See
+    /// [`LdpcFrame::set_tag`].
+    tag: usize,
 }
 
 /// A borrowed decode slot.  Obtained via [`LdpcPipeline::acquire`].
@@ -161,6 +164,37 @@ impl LdpcFrame {
     pub fn iterations_used(&self) -> usize {
         // SAFETY: exclusive access is guaranteed by the pool protocol.
         unsafe { (*self.ptr).iterations_used }
+    }
+
+    /// Attach a caller-chosen identifier to this frame, carried through the
+    /// pipeline and readable again with [`LdpcFrame::tag`].
+    ///
+    /// [`LdpcPipeline::try_recv`] returns frames in *completion* order, which
+    /// is not submission order once there is more than one worker — a short
+    /// frame submitted second can finish first. Any caller that has to put
+    /// results back in order therefore needs to know which input a completed
+    /// frame came from, and the pool slot index is deliberately not exposed
+    /// for that purpose: it is an allocation detail that gets reused, so it
+    /// identifies a slot rather than a piece of work.
+    ///
+    /// [`crate::transport_block::DlSchDecoder`] uses this to carry the code
+    /// block index across the pipeline, which is what lets it reassemble the
+    /// transport block in order from out-of-order completions.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Any value meaningful to the caller. The pipeline never reads
+    ///   it.
+    pub fn set_tag(&mut self, tag: usize) {
+        // SAFETY: exclusive access is guaranteed by the pool protocol.
+        unsafe { (*self.ptr).tag = tag };
+    }
+
+    /// The identifier set by [`LdpcFrame::set_tag`] before submission, or `0`
+    /// if none was set.
+    pub fn tag(&self) -> usize {
+        // SAFETY: exclusive access is guaranteed by the pool protocol.
+        unsafe { (*self.ptr).tag }
     }
 }
 
@@ -249,6 +283,7 @@ impl LdpcPipeline {
                     scratch: vec![0.0f32; n_scr],
                     hard: vec![0u8; n],
                     iterations_used: 0,
+                    tag: 0,
                 })
             })
             .collect();
@@ -358,18 +393,42 @@ impl LdpcPipeline {
         Some(LdpcFrame { slot_idx: idx, ptr })
     }
 
-    /// Submit a frame for decoding. Dispatches to the next worker in
-    /// round-robin order. Returns `false` if the chosen ring is full.
+    /// Submit a frame for decoding, dispatching to the next worker in
+    /// round-robin order.
     ///
-    /// The frame is consumed: the caller must not use it after this call.
-    pub fn submit(&mut self, frame: LdpcFrame) -> bool {
-        // The frame is consumed here; ownership of its slot passes to the ring.
-        // `LdpcFrame` has no `Drop` impl, so letting it fall out of scope releases
-        // nothing — we only need its slot index.
+    /// On success the frame is consumed and its slot belongs to the worker
+    /// until it comes back through [`LdpcPipeline::try_recv`]. On failure —
+    /// the chosen worker's ring is full — the frame is handed **back** to the
+    /// caller in the `Err`, who can retry or [`LdpcPipeline::release`] it.
+    ///
+    /// Returning the frame rather than a bare `false` is what makes the
+    /// failure path leak-free. `LdpcFrame` has no `Drop`, so a frame consumed
+    /// by a failed submit would simply vanish and its pool slot would never
+    /// return to the free list — the pipeline would quietly lose one of its
+    /// sixteen slots per occurrence and eventually stall with no error
+    /// anywhere. With the pool and each ring both sized to the same 16 slots, the
+    /// failure is currently unreachable by construction (at most `POOL_SIZE`
+    /// frames can be in flight at once, so no single ring can overflow), but
+    /// a signature that makes the invariant load-bearing is a poor place to
+    /// rely on it.
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - The filled frame to decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns the frame unchanged if the target worker's ring is full.
+    pub fn submit(&mut self, frame: LdpcFrame) -> Result<(), LdpcFrame> {
         let idx = frame.slot_idx;
         let wi = self.next_submit % self.n_workers;
+        if self.work_rings[wi].try_push(idx).is_err() {
+            return Err(frame);
+        }
+        // Only advance the round-robin cursor on a successful dispatch, so a
+        // full ring does not silently skip a worker's turn.
         self.next_submit = self.next_submit.wrapping_add(1);
-        self.work_rings[wi].try_push(idx).is_ok()
+        Ok(())
     }
 
     /// Poll for a completed frame without blocking. Checks all done rings in
@@ -421,7 +480,7 @@ mod tests {
         let mut frame = pipe.acquire().expect("pool should have free slots");
         // All-positive LLRs → hard decisions should all be 0.
         frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-        assert!(pipe.submit(frame));
+        assert!(pipe.submit(frame).is_ok());
 
         let result = loop {
             if let Some(r) = pipe.try_recv() {
@@ -444,7 +503,7 @@ mod tests {
         for _ in 0..POOL_SIZE {
             let mut frame = pipe.acquire().expect("enough slots");
             frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-            assert!(pipe.submit(frame));
+            assert!(pipe.submit(frame).is_ok());
         }
 
         let mut received = 0usize;
@@ -475,7 +534,7 @@ mod tests {
                 && let Some(mut frame) = pipe.acquire()
             {
                 frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-                assert!(pipe.submit(frame));
+                assert!(pipe.submit(frame).is_ok());
                 submitted += 1;
             }
             if let Some(result) = pipe.try_recv() {
@@ -520,7 +579,7 @@ mod tests {
         let mut pipe = LdpcPipeline::with_workers(decoder, 3, 0);
         let mut frame = pipe.acquire().expect("pool has slots");
         frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);
-        assert!(pipe.submit(frame));
+        assert!(pipe.submit(frame).is_ok());
         let result = loop {
             if let Some(r) = pipe.try_recv() {
                 break r;

@@ -628,27 +628,84 @@ impl QcLdpcDecoder {
         hard_output: &mut [u8],
         iterations: usize,
     ) -> Result<usize, FecError> {
+        self.init_5g_llr(llr, n_filler)?;
+        self.decode_layered_offset_min_sum(llr, edge_r, layer_scratch, hard_output, iterations)
+    }
+
+    /// Apply the 3GPP TS 38.212 §5.3.2 initialisation to a channel LLR buffer,
+    /// without decoding.
+    ///
+    /// This is the prologue [`QcLdpcDecoder::decode_5g`] runs before handing
+    /// the buffer to [`QcLdpcDecoder::decode_layered_offset_min_sum`]: filler
+    /// bits are pinned, and the punctured systematic prefix is forced to the
+    /// erasure value.
+    ///
+    /// It is public because the decode and the initialisation are separable in
+    /// one real configuration — a caller feeding code blocks through
+    /// [`crate::ldpc_pipeline::LdpcPipeline`] writes LLRs into a pool slot on
+    /// one thread and decodes them on another, so the prologue has to happen
+    /// before submission rather than inside the decode call. Exposing it keeps
+    /// that path and `decode_5g` on one definition of what the initialisation
+    /// *is*, rather than two copies free to drift apart.
+    ///
+    /// # What it does
+    ///
+    /// * **Filler bits**, positions $[K' .. K)$ where $K = k_b \cdot Z$: these
+    ///   are known zeros, so they get a large positive LLR — $10^6$, chosen to
+    ///   be beyond anything belief propagation will overturn while staying far
+    ///   from `f32` overflow in the min-sum accumulator.
+    /// * **Punctured prefix**, positions $[0 .. 2Z)$: the first two systematic
+    ///   column blocks are never transmitted and arrive as erasures, so they
+    ///   are forced to `0.0`. On the normal path the caller has already left
+    ///   them at zero and this is a no-op; it is done unconditionally so the
+    ///   3GPP convention holds regardless of what the caller supplied.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr`      - Channel LLR buffer, length exactly
+    ///   [`QcLdpcDecoder::variable_node_count`]. Modified in place.
+    /// * `n_filler` - Number of filler bits ($K - K'$).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `llr` is not exactly
+    /// [`QcLdpcDecoder::variable_node_count`] long. Checking here rather than
+    /// deferring to the decode call matters: the filler and puncture writes
+    /// index into `llr` directly, so a short buffer would panic before any
+    /// decode-side validation could report it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 2, 0.5).unwrap();
+    /// let mut llr = vec![1.0f32; dec.variable_node_count()];
+    /// dec.init_5g_llr(&mut llr, 0).unwrap();
+    /// // The two punctured systematic column blocks are erasures.
+    /// assert!(llr[..4].iter().all(|&v| v == 0.0));
+    /// ```
+    pub fn init_5g_llr(&self, llr: &mut [f32], n_filler: usize) -> Result<(), FecError> {
+        let n = self.variable_node_count();
+        if llr.len() != n {
+            return Err(FecError::InvalidParam(
+                "llr length must equal variable_node_count()",
+            ));
+        }
+
         let z = self.params.z;
         let k_b = self.params.num_col_blocks - self.params.num_row_blocks;
         let k = k_b * z;
 
-        // Filler bits: positions (k - n_filler)..k are known-zero → very positive LLR.
-        // Value of 1e6 is large enough to never be overturned by belief propagation
-        // but small enough to avoid f32 overflow in the min-sum accumulator.
         const LLR_FILLER: f32 = 1_000_000.0;
         let k_prime = k.saturating_sub(n_filler);
         for filler_llr in &mut llr[k_prime..k] {
             *filler_llr = LLR_FILLER;
         }
-
-        // Punctured positions: first 2*Z systematic columns arrive as erasures.
-        // If the caller already zeroed them (the normal path), this is a no-op;
-        // otherwise we enforce the 3GPP convention.
         for punct_llr in &mut llr[..2 * z] {
             *punct_llr = 0.0;
         }
-
-        self.decode_layered_offset_min_sum(llr, edge_r, layer_scratch, hard_output, iterations)
+        Ok(())
     }
 
     /// Number of information bits visible to the 5G NR chain: $K = k_b \cdot Z$

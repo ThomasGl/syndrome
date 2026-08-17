@@ -49,7 +49,13 @@ fn main() {
             // LLR; LOMS belief propagation should pull it back towards +3.0.
             *v = if (bit + frame_id) % 7 == 0 { -0.5 } else { 3.0 };
         });
-        pipeline.submit(frame); // hands the slot to a worker via the work ring -- no lock taken.
+        // Hands the slot to a worker via the work ring -- no lock taken. On
+        // failure `submit` gives the frame back rather than swallowing it, so
+        // a full ring can never leak a pool slot; with 6 frames into a
+        // 16-slot pool it cannot happen here.
+        pipeline
+            .submit(frame)
+            .unwrap_or_else(|_| panic!("work ring full with only {N_FRAMES} frames in flight"));
         println!("  submitted frame {frame_id}");
     }
 

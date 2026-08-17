@@ -71,6 +71,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **`DlSchDecoder` can decode code blocks concurrently**
+  (`DlSchDecoder::with_pipeline`): the lock-free [`LdpcPipeline`] was built,
+  benchmarked and documented, but nothing in the transport-block chain used
+  it — `DlSchDecoder::decode` walked its code blocks one at a time on the
+  calling thread, so the concurrency machinery was not on the real path.
+  Installing a pipeline dispatches each code block to a worker instead.
+
+  It is opt-in and stays that way. `LdpcPipeline` spawns threads that spin for
+  the decoder's lifetime, which is right for a receiver processing a stream of
+  large transport blocks and wrong for a short-lived decoder or a transport
+  block that fits in one code block — so `DlSchDecoder::new` remains
+  thread-free, and `decode` takes the sequential path whenever $C = 1$ even
+  with a pipeline installed.
+
+  Nothing observable changes. Both paths run the same LOMS decoder over the
+  same HARQ-combined LLRs for the same iteration budget; code blocks merely
+  finish out of order and are reassembled by index rather than by arrival.
+  `pipelined_decode_matches_sequential_decode` asserts the two agree
+  bit-for-bit on the decoded transport block, the per-code-block CRC flags,
+  the transport-block CRC and the reported iteration count, over a noisy
+  channel — noise deliberately, because a clean one converges every code block
+  in a single iteration and they then complete in submission order, hiding the
+  reordering the test exists to catch. Three more cover more code blocks than
+  the pipeline has pool slots (which forces the back-pressure path), HARQ
+  combining across a retransmission, and the single-code-block case.
+
+  Two supporting additions: `QcLdpcDecoder::init_5g_llr` exposes the filler
+  and puncture initialisation `decode_5g` used to keep private, because the
+  pipelined path has to apply it before submitting a frame to a worker that
+  calls the plain decode entry point — one definition rather than two copies
+  free to drift; and `LdpcFrame::set_tag`/`tag` carry a caller-chosen
+  identifier through the pipeline, which is what lets completions be matched
+  back to their code block.
+
 - **Exhaustive model check of the SPSC ring's memory ordering**
   (`tests/loom_spsc.rs`, `src/sync_shim.rs`, CI job `loom`): five
   [loom](https://docs.rs/loom) models covering the single-item entry points,
@@ -101,6 +135,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UnsafeCell` wrapper unless `--cfg loom` is set.
 
 ### Changed
+
+- **`LdpcPipeline::submit` returns the frame on failure** instead of a bare
+  `bool`: `Result<(), LdpcFrame>` rather than `bool`. `LdpcFrame` has no
+  `Drop`, so a frame consumed by a failed submit simply vanished and its pool
+  slot never returned to the free list — the pipeline would quietly lose one
+  of its sixteen slots per occurrence and eventually stall with nothing
+  reported anywhere. The failure is unreachable by construction (at most
+  `POOL_SIZE` frames can be in flight and each ring holds `POOL_SIZE`), but a
+  signature that makes an invariant load-bearing is a poor place to rely on
+  it. `submit` also no longer advances its round-robin cursor on a failed
+  dispatch, so a full ring cannot silently skip a worker's turn.
+
+  Breaking for anyone calling `submit` directly; `if pipe.submit(f) { .. }`
+  becomes `if pipe.submit(f).is_ok() { .. }`.
 
 - **`SpscRing` now holds one `UnsafeCell` per slot** rather than one around
   the whole buffer array (`src/spsc_queue.rs`). With a single cell the

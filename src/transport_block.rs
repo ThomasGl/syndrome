@@ -44,6 +44,7 @@
 use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
 use crate::harq::HarqBuffer;
+use crate::ldpc_pipeline::LdpcPipeline;
 use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
 use crate::rate_matching::RateMatchCache;
 use crate::segmentation::{SegmentationParams, compute_segmentation, segment};
@@ -425,6 +426,81 @@ pub struct DlSchDecoder {
     /// is moved out into the returned [`DecodeReport::cb_crc`] every call,
     /// so keeping it as reusable scratch would just add a clone back.)
     all_info: Vec<u8>,
+    /// Optional multi-worker LDPC pipeline, installed by
+    /// [`DlSchDecoder::with_pipeline`]. `None` means every code block is
+    /// decoded on the calling thread, which is the default.
+    pipeline: Option<LdpcPipeline>,
+}
+
+/// Build the decoder-ready LLR buffer for one code block.
+///
+/// Shared by [`DlSchDecoder::decode`]'s sequential and pipelined paths, which
+/// is the whole reason it is a free function: the mapping below is subtle
+/// enough that two copies would be two chances to get it wrong, and it has
+/// been wrong here before (see the note on `ncb`).
+///
+/// Three steps:
+///
+/// 1. **HARQ combine.** This transmission's `E` received LLRs are scattered
+///    into the code block's circular buffer and accumulated with whatever
+///    earlier redundancy versions deposited there.
+/// 2. **Alignment.** The circular buffer excludes the $2Z$ punctured
+///    systematic positions — `harq[j]` is the LLR for codeword bit $2Z + j$ —
+///    so it lands at offset $2Z$ in the full $N$-length decode buffer, whose
+///    prefix stays at zero. `ncb` ($n_b \cdot Z$: $66Z$ for BG1, $50Z$ for
+///    BG2) is *already* $N - 2Z$, because $n_b$ is two less than the base
+///    graph's column count. Subtracting $2Z$ from it again — as an earlier
+///    version did — double-counts the puncture and silently drops the last
+///    $2Z$ accumulated LLRs of every combined codeword, which is exactly the
+///    region an `rv = 2`/`rv = 3` retransmission is walking into.
+/// 3. **5G initialisation.** [`QcLdpcDecoder::init_5g_llr`] pins the filler
+///    bits and forces the punctured prefix to the erasure value. The
+///    sequential path used to get this from `decode_5g`; the pipelined path
+///    cannot, because its worker thread calls the plain decode entry point,
+///    so both now call the same helper explicitly.
+///
+/// # Errors
+///
+/// Propagates [`FecError`] from the HARQ combine or from the 5G
+/// initialisation.
+fn prepare_cb_llr(
+    harq: &mut HarqBuffer,
+    decoder: &QcLdpcDecoder,
+    e_llr: &[f32],
+    rv: usize,
+    qm: usize,
+    z: usize,
+    n_filler: usize,
+    dest: &mut [f32],
+) -> Result<(), FecError> {
+    harq.combine(e_llr, rv, qm, 0)?;
+
+    let two_z = 2 * z;
+    let valid_len = harq.ncb();
+    debug_assert_eq!(
+        two_z + valid_len,
+        dest.len(),
+        "ncb (N - 2Z) plus the punctured prefix must exactly fill the N-length decode buffer"
+    );
+    dest.iter_mut().for_each(|v| *v = 0.0);
+    dest[two_z..two_z + valid_len].copy_from_slice(&harq.llr_buffer()[..valid_len]);
+
+    decoder.init_5g_llr(dest, n_filler)
+}
+
+/// Number of payload bits each code block contributes to the reassembled
+/// transport block: its systematic bits minus the CRC-24B trailer when the
+/// transport block was segmented.
+///
+/// Uniform across code blocks — segmentation gives every one the same $K'$ —
+/// which is what lets the pipelined path write completions straight into
+/// `all_info` at `ci * payload_bits(..)` instead of appending them in order.
+fn payload_bits(k_prime: usize, has_cb_crc: bool) -> usize {
+    if has_cb_crc {
+        k_prime.saturating_sub(24)
+    } else {
+        k_prime
+    }
 }
 
 impl DlSchDecoder {
@@ -508,7 +584,96 @@ impl DlSchDecoder {
             layer_scratch,
             hard: vec![0u8; n],
             all_info: Vec::with_capacity(all_info_capacity),
+            pipeline: None,
         })
+    }
+
+    /// Install a multi-worker LDPC pipeline, so the transport block's code
+    /// blocks decode concurrently instead of one after another.
+    ///
+    /// # Why this is opt-in
+    ///
+    /// [`LdpcPipeline`] spawns worker threads at construction and keeps them
+    /// spinning for the decoder's lifetime. That is the right trade for a
+    /// receiver decoding a stream of large transport blocks and the wrong one
+    /// almost everywhere else: a transport block small enough to fit in a
+    /// single code block — the common case — has nothing to parallelise, and
+    /// a short-lived decoder pays the spawn cost against no work. Making it a
+    /// separate call keeps [`DlSchDecoder::new`] free of hidden threads.
+    ///
+    /// The pipeline is used only when the transport block actually has more
+    /// than one code block; with $C = 1$ [`DlSchDecoder::decode`] takes the
+    /// sequential path regardless, because handing one code block to a worker
+    /// and waiting for it is strictly slower than decoding it here.
+    ///
+    /// # What stays the same
+    ///
+    /// Everything observable. Both paths run the same LOMS decoder over the
+    /// same HARQ-combined LLRs for the same iteration budget, so the decoded
+    /// transport block, the per-code-block CRC flags and the reported
+    /// iteration count are identical — only the order in which code blocks
+    /// finish differs, and results are reassembled by index rather than by
+    /// arrival. `pipelined_decode_matches_sequential_decode` in this module's
+    /// tests asserts that bit-for-bit.
+    ///
+    /// # Arguments
+    ///
+    /// * `n_workers` - Worker threads to spawn. [`LdpcPipeline`] clamps this
+    ///   into `1..=8`. Values above the code block count waste threads: no
+    ///   transport block can keep more workers busy than it has code blocks.
+    ///
+    /// # Returns
+    ///
+    /// `self`, with the pipeline installed, so this chains onto a
+    /// constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `n_workers` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::transport_block::DlSchDecoder;
+    ///
+    /// // A transport block large enough to segment into several code blocks.
+    /// let dec = DlSchDecoder::new(30000, 0.5, 2, 90000, 10, 0.5)
+    ///     .unwrap()
+    ///     .with_pipeline(4)
+    ///     .unwrap();
+    /// assert!(dec.num_code_blocks() > 1);
+    /// ```
+    pub fn with_pipeline(mut self, n_workers: usize) -> Result<Self, FecError> {
+        if n_workers == 0 {
+            return Err(FecError::InvalidParam("n_workers must be > 0"));
+        }
+        // The pipeline needs a decoder to clone into each worker; every entry
+        // in `decoders` is a clone of the same one, so any of them will do.
+        self.pipeline = Some(LdpcPipeline::with_workers(
+            self.decoders[0].clone(),
+            self.iterations,
+            n_workers,
+        ));
+        Ok(self)
+    }
+
+    /// Number of code blocks this transport block segments into.
+    ///
+    /// Worth checking before [`DlSchDecoder::with_pipeline`]: at `1` there is
+    /// nothing for extra workers to do.
+    #[must_use]
+    pub fn num_code_blocks(&self) -> usize {
+        self.params.c
+    }
+
+    /// Number of worker threads decoding code blocks, or `0` when no pipeline
+    /// is installed and decoding happens on the calling thread.
+    ///
+    /// [`LdpcPipeline`] clamps the requested worker count, so this can be
+    /// lower than what was passed to [`DlSchDecoder::with_pipeline`].
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.pipeline.as_ref().map_or(0, LdpcPipeline::worker_count)
     }
 
     /// Create a DL-SCH decoder from a named-field [`DlSchConfig`].
@@ -616,8 +781,9 @@ impl DlSchDecoder {
 
         // Per-CB LDPC scratch (`llr_cb`/`edge_r`/`layer_scratch`/`hard`) and
         // `all_info` are struct-owned (sized once in `new`, see their doc
-        // comments) rather than allocated here; `all_info` is cleared (not
-        // reallocated) at the start of every call.
+        // comments) rather than allocated here; `all_info` is resized (not
+        // reallocated, its capacity is set in `new`) at the start of every
+        // call.
         self.all_info.clear();
         let Self {
             harq_bufs,
@@ -628,80 +794,112 @@ impl DlSchDecoder {
             hard,
             all_info,
             cb_crc,
+            pipeline,
             ..
         } = self;
         let n = llr_cb.len();
 
-        for ci in 0..n_cb {
-            // Slice this CB's E received LLRs.
-            let e_start = ci * e_per_cb;
-            let e_llr = &rx_llr[e_start..e_start + e_per_cb];
+        let payload_len = payload_bits(k_prime, has_cb_crc);
+        // Every code block contributes the same number of payload bits, so the
+        // reassembled transport block is a flat array indexed by `ci *
+        // payload_len` — which is what lets the pipelined path below write
+        // out-of-order completions into their right place. The sequential path
+        // writes the same offsets in order.
+        all_info.resize(n_cb * payload_len, 0);
 
-            // HARQ: scatter + accumulate into the circular buffer.
-            harq_bufs[ci].combine(e_llr, rv, qm, 0)?;
+        match pipeline {
+            // ── Pipelined: code blocks decode concurrently on worker threads.
+            Some(pipe) if n_cb > 1 => {
+                let mut next_submit = 0usize;
+                let mut completed = 0usize;
 
-            // Copy accumulated LLR into the full-N decode buffer with correct alignment.
-            //
-            // The HARQ circular buffer excludes the first 2Z punctured systematic
-            // positions: HARQ buf[j] holds the LLR for codeword bit (2Z + j).
-            // The LDPC decoder (decode_5g) expects llr[i] = LLR for codeword bit i,
-            // i.e. it reads parity/systematic at positions [2Z..N] and zeros [0..2Z]
-            // itself (punctured erasure).
-            //
-            // Correct mapping: harq_buf[0..N-2Z] → llr_cb[2Z..N]
-            //                  llr_cb[0..2Z] stays 0.0 (decode_5g enforces this anyway).
-            //
-            // `ncb` (n_b * Z: 66Z for BG1, 50Z for BG2 — see HarqBuffer::new) is
-            // ALREADY defined as N - 2Z, since n_b is 2 less than the base
-            // graph's total column count (68 for BG1, 52 for BG2). So `ncb` is
-            // exactly the valid length above, with no further subtraction — a
-            // previous version computed `ncb - 2Z` here, double-subtracting the
-            // puncture width and silently dropping the last 2Z accumulated LLRs
-            // of every HARQ-combined codeword (the positions rv=2/rv=3
-            // retransmissions are specifically walking into) on the floor before
-            // they ever reached the decoder.
-            let two_z = 2 * z;
-            let valid_len = harq_bufs[ci].ncb();
-            debug_assert_eq!(
-                two_z + valid_len,
-                n,
-                "ncb (N - 2Z) plus the punctured prefix must exactly fill the N-length decode buffer"
-            );
-            llr_cb[..n].iter_mut().for_each(|v| *v = 0.0); // zero the full buffer first
-            {
-                let harq_data = harq_bufs[ci].llr_buffer();
-                llr_cb[two_z..two_z + valid_len].copy_from_slice(&harq_data[..valid_len]);
+                while completed < n_cb {
+                    // Fill and dispatch as many code blocks as there are free
+                    // pool slots. `acquire` returning None is ordinary
+                    // back-pressure, not an error: it means all sixteen slots
+                    // are in flight, so the loop falls through to draining.
+                    let mut progressed = false;
+                    while next_submit < n_cb {
+                        let Some(mut frame) = pipe.acquire() else {
+                            break;
+                        };
+                        let e_start = next_submit * e_per_cb;
+                        prepare_cb_llr(
+                            &mut harq_bufs[next_submit],
+                            &decoders[next_submit],
+                            &rx_llr[e_start..e_start + e_per_cb],
+                            rv,
+                            qm,
+                            z,
+                            n_filler,
+                            frame.llr_mut(),
+                        )?;
+                        frame.set_tag(next_submit);
+                        // Unreachable by construction (at most POOL_SIZE frames
+                        // in flight, each ring holds POOL_SIZE), and `submit`
+                        // hands the frame back rather than leaking its slot if
+                        // it ever were reachable — so put it back and retry.
+                        if let Err(frame) = pipe.submit(frame) {
+                            pipe.release(frame);
+                            break;
+                        }
+                        next_submit += 1;
+                        progressed = true;
+                    }
+
+                    // Drain whatever finished. Frames come back in completion
+                    // order, which is why each carries its code block index as
+                    // a tag.
+                    while let Some(frame) = pipe.try_recv() {
+                        let ci = frame.tag();
+                        let info_bits = &frame.hard()[..k_prime];
+                        cb_crc_results[ci] = !has_cb_crc || cb_crc.check(info_bits);
+                        all_info[ci * payload_len..(ci + 1) * payload_len]
+                            .copy_from_slice(&info_bits[..payload_len]);
+                        max_iters = max_iters.max(frame.iterations_used());
+                        pipe.release(frame);
+                        completed += 1;
+                        progressed = true;
+                    }
+
+                    if !progressed {
+                        // Everything is in flight and nothing has finished;
+                        // wait for a worker rather than burning the loop.
+                        std::hint::spin_loop();
+                    }
+                }
             }
 
-            // decode_5g sets filler LLRs + punctured LLRs correctly.
-            let cb_iters = decoders[ci].decode_5g(
-                llr_cb,
-                n_filler,
-                edge_r,
-                layer_scratch,
-                hard,
-                iterations,
-            )?;
-            max_iters = max_iters.max(cb_iters);
+            // ── Sequential: one code block at a time on this thread.
+            _ => {
+                for ci in 0..n_cb {
+                    let e_start = ci * e_per_cb;
+                    prepare_cb_llr(
+                        &mut harq_bufs[ci],
+                        &decoders[ci],
+                        &rx_llr[e_start..e_start + e_per_cb],
+                        rv,
+                        qm,
+                        z,
+                        n_filler,
+                        &mut llr_cb[..n],
+                    )?;
 
-            // Extract K' info bits (systematic only, no filler).
-            let k_prime_sys = k_prime; // without filler
-            let info_bits = &hard[..k_prime_sys];
+                    let cb_iters = decoders[ci].decode_layered_offset_min_sum(
+                        llr_cb,
+                        edge_r,
+                        layer_scratch,
+                        hard,
+                        iterations,
+                    )?;
+                    max_iters = max_iters.max(cb_iters);
 
-            // CRC-24B check (if segmented).
-            if has_cb_crc {
-                cb_crc_results[ci] = cb_crc.check(info_bits);
-            } else {
-                cb_crc_results[ci] = true;
+                    let info_bits = &hard[..k_prime];
+                    cb_crc_results[ci] = !has_cb_crc || cb_crc.check(info_bits);
+                    all_info[ci * payload_len..(ci + 1) * payload_len]
+                        .copy_from_slice(&info_bits[..payload_len]);
+                }
             }
-
-            // Collect info payload (strip CRC-24B if present).
-            let payload_len = if has_cb_crc {
-                k_prime_sys.saturating_sub(24)
-            } else {
-                k_prime_sys
-            };
-            all_info.extend_from_slice(&info_bits[..payload_len]);
         }
 
         // §5.1 — CRC-24A check on reconstructed TB.
@@ -760,6 +958,7 @@ fn crc_ok(results: &[bool]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel_sim::AwgnChannel;
 
     #[test]
     fn encoder_output_length_matches() {
@@ -987,5 +1186,237 @@ mod tests {
         dec.decode(&llr, 0, &mut tb_out).unwrap();
         dec.flush_harq();
         assert!(dec.harq_bufs.iter().all(|b| b.tx_count() == 0));
+    }
+
+    /// A multi-code-block transport block encoded once, then decoded twice —
+    /// sequentially and through the worker pipeline — must come back
+    /// **identical**, down to the per-code-block CRC flags and the reported
+    /// iteration count.
+    ///
+    /// This is the assertion that makes [`DlSchDecoder::with_pipeline`] a
+    /// scheduling change rather than a second decoder. Both paths run the
+    /// same LOMS kernel on the same HARQ-combined LLRs for the same iteration
+    /// budget; the only difference is that code blocks finish out of order
+    /// and are reassembled by index. If the reassembly were keyed off arrival
+    /// order — the obvious mistake, and one that passes any test using a
+    /// single worker or an all-zero payload — this comparison is where it
+    /// would show, because the two decodes would disagree on where each code
+    /// block's payload landed.
+    ///
+    /// Noise is deliberate: a clean channel converges every code block in one
+    /// iteration, which makes them finish in submission order and hides
+    /// exactly the reordering this is meant to catch.
+    #[test]
+    fn pipelined_decode_matches_sequential_decode() {
+        let cfg = DlSchConfig {
+            tb_size: 30_000,
+            target_rate: 0.5,
+            qm: 2,
+            g: 90_000,
+            ..DlSchConfig::default_decode_params()
+        };
+        let enc = DlSchEncoder::from_config(&cfg).unwrap();
+        assert!(
+            enc.num_code_blocks() > 1,
+            "this test needs a segmented transport block to be meaningful"
+        );
+
+        let mut tb = vec![0u8; cfg.tb_size];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for b in tb.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = ((state >> 27) & 1) as u8;
+        }
+
+        let mut coded = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded).unwrap();
+
+        // Moderate noise: enough that the decoder does real iterative work and
+        // code blocks converge after different numbers of passes.
+        let mut ch = AwgnChannel::new(2.0, cfg.target_rate, 0x5EED_0001);
+        let rx = ch.transmit(&coded);
+
+        let mut seq_out = vec![0u8; cfg.tb_size];
+        let mut seq_dec = DlSchDecoder::from_config(&cfg).unwrap();
+        assert_eq!(seq_dec.worker_count(), 0);
+        let seq = seq_dec.decode(&rx, 0, &mut seq_out).unwrap();
+
+        let mut pipe_out = vec![0u8; cfg.tb_size];
+        let mut pipe_dec = DlSchDecoder::from_config(&cfg)
+            .unwrap()
+            .with_pipeline(4)
+            .unwrap();
+        assert!(pipe_dec.worker_count() >= 1);
+        let pipelined = pipe_dec.decode(&rx, 0, &mut pipe_out).unwrap();
+
+        assert_eq!(
+            seq_out, pipe_out,
+            "pipelined decode produced a different transport block"
+        );
+        assert_eq!(
+            seq.cb_crc, pipelined.cb_crc,
+            "pipelined decode produced different per-code-block CRC results"
+        );
+        assert_eq!(
+            seq.crc_ok, pipelined.crc_ok,
+            "pipelined decode produced a different transport-block CRC result"
+        );
+        assert_eq!(
+            seq.max_iters_used, pipelined.max_iters_used,
+            "pipelined decode consumed a different number of iterations"
+        );
+    }
+
+    /// The pipeline must also survive more code blocks than the pool has
+    /// slots, which is where the submit/drain loop has to apply back-pressure
+    /// instead of assuming everything fits at once.
+    ///
+    /// `LdpcPipeline`'s pool holds 16 frames. A transport block segmenting
+    /// into more than that forces `acquire` to return `None` partway through
+    /// submission, so the loop has to drain completions before it can
+    /// continue — the path a smaller transport block never reaches.
+    #[test]
+    fn pipelined_decode_handles_more_code_blocks_than_pool_slots() {
+        let cfg = DlSchConfig {
+            tb_size: 160_000,
+            target_rate: 0.5,
+            qm: 2,
+            g: 480_000,
+            ..DlSchConfig::default_decode_params()
+        };
+        let enc = DlSchEncoder::from_config(&cfg).unwrap();
+        assert!(
+            enc.num_code_blocks() > 16,
+            "this test needs more code blocks than the pipeline's 16 pool slots; got {}",
+            enc.num_code_blocks()
+        );
+
+        let tb = vec![1u8; cfg.tb_size];
+        let mut coded = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded).unwrap();
+
+        let mut ch = AwgnChannel::new(4.0, cfg.target_rate, 0x5EED_0002);
+        let rx = ch.transmit(&coded);
+
+        let mut seq_out = vec![0u8; cfg.tb_size];
+        let seq = DlSchDecoder::from_config(&cfg)
+            .unwrap()
+            .decode(&rx, 0, &mut seq_out)
+            .unwrap();
+
+        let mut pipe_out = vec![0u8; cfg.tb_size];
+        let pipelined = DlSchDecoder::from_config(&cfg)
+            .unwrap()
+            .with_pipeline(3)
+            .unwrap()
+            .decode(&rx, 0, &mut pipe_out)
+            .unwrap();
+
+        assert_eq!(seq_out, pipe_out);
+        assert_eq!(seq.cb_crc, pipelined.cb_crc);
+        assert_eq!(seq.crc_ok, pipelined.crc_ok);
+    }
+
+    /// A single-code-block transport block must decode identically whether or
+    /// not a pipeline is installed.
+    ///
+    /// Note what this does and does not pin. It pins the *output*: installing
+    /// a pipeline never changes the answer, including in the degenerate case
+    /// the pipeline cannot help with. It does **not** verify that
+    /// [`DlSchDecoder::decode`] actually takes the sequential path at
+    /// $C = 1$ — routing the single code block through a worker would produce
+    /// the same bits, just more slowly, and there is no observable signal
+    /// here to tell the two apart. That bypass is a performance decision
+    /// documented on [`DlSchDecoder::with_pipeline`], not a correctness one,
+    /// and this test is deliberately not claiming to enforce it.
+    #[test]
+    fn single_code_block_decodes_identically_with_or_without_a_pipeline() {
+        let cfg = DlSchConfig {
+            tb_size: 1000,
+            target_rate: 0.5,
+            qm: 2,
+            g: 3000,
+            ..DlSchConfig::default_decode_params()
+        };
+        let enc = DlSchEncoder::from_config(&cfg).unwrap();
+        assert_eq!(enc.num_code_blocks(), 1);
+
+        let tb = vec![0u8; cfg.tb_size];
+        let mut coded = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded).unwrap();
+        let mut ch = AwgnChannel::new(3.0, cfg.target_rate, 0x5EED_0003);
+        let rx = ch.transmit(&coded);
+
+        let mut a = vec![0u8; cfg.tb_size];
+        let ra = DlSchDecoder::from_config(&cfg)
+            .unwrap()
+            .decode(&rx, 0, &mut a)
+            .unwrap();
+        let mut b = vec![0u8; cfg.tb_size];
+        let rb = DlSchDecoder::from_config(&cfg)
+            .unwrap()
+            .with_pipeline(4)
+            .unwrap()
+            .decode(&rx, 0, &mut b)
+            .unwrap();
+
+        assert_eq!(a, b);
+        assert_eq!(ra.crc_ok, rb.crc_ok);
+        assert_eq!(ra.max_iters_used, rb.max_iters_used);
+    }
+
+    /// HARQ state must survive the pipelined path: a failed first transmission
+    /// followed by a retransmission has to combine, exactly as it does
+    /// sequentially. The per-code-block HARQ buffers are touched on the
+    /// calling thread in both paths — only the decode moves — and this is
+    /// what pins that.
+    #[test]
+    fn pipelined_decode_combines_harq_across_transmissions() {
+        let cfg = DlSchConfig {
+            tb_size: 30_000,
+            target_rate: 0.5,
+            qm: 2,
+            g: 45_000,
+            ..DlSchConfig::default_decode_params()
+        };
+        let enc = DlSchEncoder::from_config(&cfg).unwrap();
+        assert!(enc.num_code_blocks() > 1);
+
+        let tb = vec![1u8; cfg.tb_size];
+        let mut coded_rv0 = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 0, &mut coded_rv0).unwrap();
+        let mut coded_rv2 = vec![0u8; enc.output_bits()];
+        enc.encode(&tb, 2, &mut coded_rv2).unwrap();
+
+        // Low SNR so the first transmission is expected to fail and the
+        // retransmission has something to add.
+        let mut ch = AwgnChannel::new(-1.0, cfg.target_rate, 0x5EED_0004);
+        let rx0 = ch.transmit(&coded_rv0);
+        let rx2 = ch.transmit(&coded_rv2);
+
+        let run = |pipeline: bool| {
+            let mut dec = DlSchDecoder::from_config(&cfg).unwrap();
+            if pipeline {
+                dec = dec.with_pipeline(4).unwrap();
+            }
+            let mut out = vec![0u8; cfg.tb_size];
+            let first = dec.decode(&rx0, 0, &mut out).unwrap();
+            let second = dec.decode(&rx2, 2, &mut out).unwrap();
+            (first, second, out)
+        };
+
+        let (seq_first, seq_second, seq_out) = run(false);
+        let (pipe_first, pipe_second, pipe_out) = run(true);
+
+        assert_eq!(seq_first.cb_crc, pipe_first.cb_crc);
+        assert_eq!(seq_second.cb_crc, pipe_second.cb_crc);
+        assert_eq!(seq_second.harq_tx_count, pipe_second.harq_tx_count);
+        assert_eq!(
+            seq_second.harq_tx_count, 2,
+            "the second call must be seen as a retransmission"
+        );
+        assert_eq!(seq_out, pipe_out);
     }
 }
