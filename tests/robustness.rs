@@ -427,6 +427,35 @@ fn finding_reed_solomon_encode_zero_data_shards_rejected() {
     assert!(rs.encode(&data).is_err());
 }
 
+/// FINDING (fixed): `wifi_rate_matching::shortening_and_puncture_counts`
+/// computed `n - (k - payload_bits)` after checking only
+/// `payload_bits <= k`, never that `n >= k`. Because `k` and `n` are free
+/// `usize` parameters rather than values read off a validated matrix, a
+/// caller could pass a pair no real block code has (rate above 1) and reach
+/// an unchecked subtraction.
+///
+/// The release-build behaviour was the worse half: the subtraction wrapped
+/// to a value near `usize::MAX`, so the `target_coded_bits > max_coded`
+/// range check below it passed for essentially any input and the function
+/// returned a meaningless puncture count instead of an error — a silent
+/// wrong answer rather than a crash.
+///
+/// Fix (`src/wifi_rate_matching.rs`): reject `n < k` up front with
+/// [`FecError::InvalidParam`].
+#[test]
+fn finding_wifi_shortening_n_below_k_rejected() {
+    use syndrome::wifi_rate_matching::shortening_and_puncture_counts;
+    // k > n: nonsense for a block code, and formerly an underflow.
+    assert!(shortening_and_puncture_counts(100, 10, 0, 10).is_err());
+    // The extreme form the fuzzer actually found.
+    assert!(shortening_and_puncture_counts(usize::MAX, 0, 0, 0).is_err());
+    // A well-formed 802.11-shaped call still works.
+    let (n_shrt, n_punc) =
+        shortening_and_puncture_counts(324, 648, 300, 600).expect("valid shape must succeed");
+    assert_eq!(n_shrt, 24);
+    assert_eq!(n_punc, 648 - 24 - 600);
+}
+
 // ===========================================================================
 // Hamming(7,4)
 // ===========================================================================
@@ -1306,4 +1335,377 @@ fn fuzz_harq_buffer_adversarial() {
 
     buf.flush();
     assert_eq!(buf.tx_count(), 0);
+}
+
+// ===========================================================================
+// Bluetooth FEC profiles
+//
+// The Bluetooth surfaces were the largest untested gap in this suite: every
+// entry point here takes caller-sized buffers whose required lengths are
+// derived from a code rate, so an off-by-one in a length check turns
+// straight into an out-of-bounds index. These drive each one with
+// mismatched buffer sizes, zero-length inputs, and non-0/1 "bit" values.
+// ===========================================================================
+
+/// `pattern_map_s8`/`pattern_demap_s8` implement the LE Coded PHY S=8
+/// pattern mapper, where one coded bit becomes four symbols. Both take two
+/// caller-supplied buffers whose lengths must satisfy that 1:4 ratio;
+/// anything else must be a typed error rather than an index panic.
+#[test]
+fn fuzz_bluetooth_pattern_map_demap() {
+    use syndrome::bluetooth::{pattern_demap_s8, pattern_map_s8};
+    let mut rng = Xorshift64::new(0xB10E_7007);
+
+    for _ in 0..300 {
+        let coded_len = rng.next_range(20);
+        let sym_len = rng.next_range(80);
+        // Deliberately unconstrained bit values: not every byte is 0/1.
+        // Half the cases use genuine 0/1 bits so the length rule is the
+        // only variable; the rest use arbitrary bytes to exercise the
+        // value check. `Ok` requires *both* rules to hold.
+        let binary = rng.next_bit() == 1;
+        let coded: Vec<u8> = (0..coded_len)
+            .map(|_| {
+                if binary {
+                    (rng.next_u64() & 1) as u8
+                } else {
+                    (rng.next_u64() & 0xFF) as u8
+                }
+            })
+            .collect();
+        let all_bits = coded.iter().all(|&b| b <= 1);
+        let mut symbols = vec![0u8; sym_len];
+        let r = no_panic("bluetooth pattern_map_s8", || {
+            pattern_map_s8(&coded, &mut symbols)
+        });
+        assert_eq!(
+            r.is_ok(),
+            sym_len == coded_len * 4 && all_bits,
+            "map: symbols={sym_len} coded={coded_len} all_bits={all_bits}"
+        );
+
+        let sym_llr = rng.next_llrs(sym_len);
+        let mut coded_llr = vec![0.0f32; coded_len];
+        let r = no_panic("bluetooth pattern_demap_s8", || {
+            pattern_demap_s8(&sym_llr, &mut coded_llr)
+        });
+        if sym_len == coded_len * 4 {
+            assert!(r.is_ok(), "demap rejected a well-formed 1:4 shape");
+            // NaN/inf LLRs may propagate, but must not become a panic and
+            // must not leave the buffer partially written with garbage
+            // lengths -- length is the invariant being checked here.
+            assert_eq!(coded_llr.len(), coded_len);
+        } else {
+            assert!(
+                r.is_err(),
+                "demap accepted {sym_len} symbols for {coded_len} coded"
+            );
+        }
+    }
+}
+
+/// The BR/EDR rate-1/3 repetition code: every input bit becomes three
+/// output bits, and decode majority-votes each triplet. Driven here with
+/// every buffer-length mismatch and with coded lengths that are not
+/// multiples of three.
+#[test]
+fn fuzz_bluetooth_fec13() {
+    use syndrome::bluetooth::{fec13_decode, fec13_encode};
+    let mut rng = Xorshift64::new(0xB113_0000);
+
+    for _ in 0..400 {
+        let in_len = rng.next_range(24);
+        let out_len = rng.next_range(72);
+        let binary = rng.next_bit() == 1;
+        let mask = if binary { 1u64 } else { 0xFF };
+        let bits: Vec<u8> = (0..in_len).map(|_| (rng.next_u64() & mask) as u8).collect();
+        let bits_ok = bits.iter().all(|&b| b <= 1);
+        let mut out = vec![0u8; out_len];
+        let r = no_panic("bluetooth fec13_encode", || fec13_encode(&bits, &mut out));
+        assert_eq!(r.is_ok(), out_len == in_len * 3 && bits_ok);
+
+        let coded: Vec<u8> = (0..out_len)
+            .map(|_| (rng.next_u64() & mask) as u8)
+            .collect();
+        let coded_ok = coded.iter().all(|&b| b <= 1);
+        let mut dec = vec![0u8; in_len];
+        let r = no_panic("bluetooth fec13_decode", || fec13_decode(&coded, &mut dec));
+        assert_eq!(r.is_ok(), out_len == in_len * 3 && coded_ok);
+        if r.is_ok() {
+            // Majority vote must always yield a real bit.
+            assert!(
+                dec.iter().all(|&b| b <= 1),
+                "fec13_decode emitted a non-bit value"
+            );
+        }
+    }
+}
+
+/// The BR/EDR (15,10) shortened Hamming code. Unlike the other two this
+/// has fixed lengths, so the adversarial surface is the buffer sizes and
+/// the arbitrary coded words fed to the decoder -- including ones far
+/// outside the code, where the syndrome decoder must report rather than
+/// mis-correct silently.
+#[test]
+fn fuzz_bluetooth_fec23() {
+    use syndrome::bluetooth::{FEC23_CODED_BITS, FEC23_INFO_BITS, fec23_decode, fec23_encode};
+    let mut rng = Xorshift64::new(0xB123_0000);
+
+    for _ in 0..500 {
+        let in_len = rng.next_range(20);
+        let out_len = rng.next_range(24);
+        let info: Vec<u8> = (0..in_len).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let mut out = vec![0u8; out_len];
+        let r = no_panic("bluetooth fec23_encode", || fec23_encode(&info, &mut out));
+        assert_eq!(
+            r.is_ok(),
+            in_len == FEC23_INFO_BITS && out_len == FEC23_CODED_BITS,
+            "fec23_encode accepted/rejected the wrong shape ({in_len} -> {out_len})"
+        );
+
+        let binary = rng.next_bit() == 1;
+        let mask = if binary { 1u64 } else { 0xFF };
+        let coded: Vec<u8> = (0..out_len)
+            .map(|_| (rng.next_u64() & mask) as u8)
+            .collect();
+        let coded_ok = coded.iter().all(|&b| b <= 1);
+        let mut dec = vec![0u8; in_len];
+        let r = no_panic("bluetooth fec23_decode", || fec23_decode(&coded, &mut dec));
+        assert_eq!(
+            r.is_ok(),
+            in_len == FEC23_INFO_BITS && out_len == FEC23_CODED_BITS && coded_ok
+        );
+        if r.is_ok() {
+            // Whatever the status, the output must be real bits.
+            assert!(
+                dec.iter().all(|&b| b <= 1),
+                "fec23_decode emitted a non-bit value"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Wi-Fi shortening / puncturing rate matching
+// ===========================================================================
+
+/// `shortening_and_puncture_counts` is pure arithmetic over four `usize`
+/// parameters and is the gatekeeper every other Wi-Fi rate-matching entry
+/// point calls first, so an overflow or an unchecked subtraction here would
+/// surface everywhere. Driven with values across the whole range including
+/// `usize::MAX`, where a naive `k - payload_bits` or `n - k` would wrap.
+#[test]
+fn fuzz_wifi_shortening_counts_arithmetic() {
+    use syndrome::wifi_rate_matching::shortening_and_puncture_counts;
+    let mut rng = Xorshift64::new(0x71F1_0000);
+
+    let interesting = [
+        0usize,
+        1,
+        2,
+        648,
+        1296,
+        1944,
+        usize::MAX / 2,
+        usize::MAX - 1,
+        usize::MAX,
+    ];
+    for _ in 0..2000 {
+        let pick = |rng: &mut Xorshift64| -> usize {
+            if rng.next_bit() == 1 {
+                interesting[rng.next_range(interesting.len()) % interesting.len()]
+            } else {
+                rng.next_range(4000)
+            }
+        };
+        let k = pick(&mut rng);
+        let n = pick(&mut rng);
+        let payload = pick(&mut rng);
+        let target = pick(&mut rng);
+        let r = no_panic("wifi shortening_and_puncture_counts", || {
+            shortening_and_puncture_counts(k, n, payload, target)
+        });
+        if let Ok((n_shrt, n_punc)) = r {
+            // A successful result must be internally consistent: the
+            // shortened bits plus the real payload account for K, and the
+            // punctured bits cannot exceed the parity actually available.
+            assert_eq!(n_shrt + payload, k, "n_shrt inconsistent with K");
+            assert!(
+                n_punc <= n.saturating_sub(k),
+                "punctured more parity than exists"
+            );
+            assert!(
+                target >= payload,
+                "accepted a target below the payload size"
+            );
+        }
+    }
+}
+
+/// The full shortened encode/decode pair driven with mismatched buffers and
+/// out-of-range payload/target sizes against a real 802.11 matrix.
+#[test]
+fn fuzz_wifi_encode_decode_shortened_adversarial() {
+    use syndrome::wifi_ldpc_tables::{wifi_ldpc_decoder, wifi_ldpc_encoder};
+    use syndrome::wifi_rate_matching::{decode_shortened, encode_shortened};
+    let mut rng = Xorshift64::new(0x71F1_DEC0);
+
+    // Z = 27 with rate 1/2 is the 648-bit 802.11 codeword (24 block
+    // columns x Z). Z is the lifting size, not the codeword length.
+    let enc = wifi_ldpc_encoder(27, 1, 2).expect("Z=27 R=1/2 is a real 802.11 matrix");
+    let dec = wifi_ldpc_decoder(27, 1, 2, 0.5).expect("same matrix, decoder side");
+    let k = enc.info_bit_count();
+    let n = enc.codeword_bit_count();
+
+    for _ in 0..200 {
+        // Payload and target sizes spanning valid, boundary and invalid.
+        let payload_bits = match rng.next_range(4) {
+            0 => 0,
+            1 => k,
+            2 => k + 1 + rng.next_range(10),
+            _ => rng.next_range(k + 1),
+        };
+        let target = match rng.next_range(4) {
+            0 => 0,
+            1 => n,
+            2 => n + 1 + rng.next_range(10),
+            _ => rng.next_range(n + 1),
+        };
+
+        let payload: Vec<u8> = (0..payload_bits)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
+        let mut out = vec![0u8; target];
+        let r = no_panic("wifi encode_shortened", || {
+            encode_shortened(&enc, &payload, target, &mut out)
+        });
+        if r.is_ok() {
+            assert_eq!(out.len(), target);
+            assert!(
+                out.iter().all(|&b| b <= 1),
+                "encoder emitted a non-bit value"
+            );
+        }
+
+        // Decode side: adversarial LLRs (NaN/inf/subnormal) and buffers
+        // that may be the wrong size.
+        let rx = rng.next_llrs(target);
+        let mut codeword_llr = vec![
+            0.0f32;
+            if rng.next_bit() == 1 {
+                n
+            } else {
+                rng.next_range(n + 2)
+            }
+        ];
+        let mut edge_r = vec![0.0f32; dec.required_edge_buffer()];
+        let mut scratch = vec![0.0f32; dec.required_layer_buffer()];
+        let mut hard = vec![
+            0u8;
+            if rng.next_bit() == 1 {
+                n
+            } else {
+                rng.next_range(n + 2)
+            }
+        ];
+        let iterations = rng.next_range(4);
+        let r = no_panic("wifi decode_shortened", || {
+            decode_shortened(
+                &dec,
+                payload_bits,
+                &rx,
+                &mut codeword_llr,
+                &mut edge_r,
+                &mut scratch,
+                &mut hard,
+                iterations,
+            )
+        });
+        if r.is_ok() {
+            assert!(
+                hard.iter().all(|&b| b <= 1),
+                "decoder emitted a non-bit value"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// bits: byte/bit conversion and hard decision
+// ===========================================================================
+
+/// The `bits` module is small, entirely length-driven, and used by every
+/// higher-level path to move between packed bytes and unpacked bits -- so a
+/// length-check slip here is an out-of-bounds write in a lot of places at
+/// once. Driven with every combination of mismatched lengths, plus
+/// non-multiple-of-8 bit counts and adversarial LLRs.
+#[test]
+fn fuzz_bits_conversions() {
+    use syndrome::bits::{
+        bits_to_bytes, bits_to_bytes_vec, bytes_to_bits, bytes_to_bits_vec, hard_decision,
+    };
+    let mut rng = Xorshift64::new(0xB175_0000);
+
+    for _ in 0..600 {
+        let n_bytes = rng.next_range(16);
+        let n_bits = rng.next_range(130);
+        let bytes: Vec<u8> = (0..n_bytes)
+            .map(|_| (rng.next_u64() & 0xFF) as u8)
+            .collect();
+
+        let mut bits = vec![0u8; n_bits];
+        let r = no_panic("bytes_to_bits", || bytes_to_bits(&bytes, &mut bits));
+        assert_eq!(
+            r.is_ok(),
+            n_bits == n_bytes * 8,
+            "bytes_to_bits length rule"
+        );
+        if r.is_ok() {
+            assert!(bits.iter().all(|&b| b <= 1));
+        }
+
+        // The Vec form derives its own length, so it must always succeed
+        // and always round-trip.
+        let v = no_panic("bytes_to_bits_vec", || bytes_to_bits_vec(&bytes));
+        assert_eq!(v.len(), n_bytes * 8);
+        let back = no_panic("bits_to_bytes_vec", || bits_to_bytes_vec(&v));
+        assert_eq!(
+            back.expect("a whole number of bytes must convert back"),
+            bytes
+        );
+
+        // Arbitrary bit buffers, including non-byte-aligned lengths and
+        // values outside {0, 1}.
+        let binary = rng.next_bit() == 1;
+        let mask = if binary { 1u64 } else { 0xFF };
+        let raw_bits: Vec<u8> = (0..n_bits).map(|_| (rng.next_u64() & mask) as u8).collect();
+        let raw_ok = raw_bits.iter().all(|&b| b <= 1);
+        let mut out_bytes = vec![0u8; n_bytes];
+        let r = no_panic("bits_to_bytes", || bits_to_bytes(&raw_bits, &mut out_bytes));
+        assert_eq!(
+            r.is_ok(),
+            n_bits == n_bytes * 8 && raw_ok,
+            "bits_to_bytes must require both a multiple-of-8 length and 0/1 values"
+        );
+
+        let r = no_panic("bits_to_bytes_vec ragged", || bits_to_bytes_vec(&raw_bits));
+        assert_eq!(
+            r.is_ok(),
+            n_bits.is_multiple_of(8) && raw_ok,
+            "bits_to_bytes_vec must reject ragged input and non-bit values"
+        );
+
+        // hard_decision over NaN/inf/subnormal LLRs.
+        let llr = rng.next_llrs(n_bits);
+        let mut hard = vec![0u8; rng.next_range(140)];
+        let expected_ok = hard.len() == n_bits;
+        let r = no_panic("hard_decision", || hard_decision(&llr, &mut hard));
+        assert_eq!(r.is_ok(), expected_ok, "hard_decision length rule");
+        if r.is_ok() {
+            assert!(
+                hard.iter().all(|&b| b <= 1),
+                "hard_decision emitted a non-bit value"
+            );
+        }
+    }
 }

@@ -97,6 +97,18 @@ pub fn shortening_and_puncture_counts(
     payload_bits: usize,
     target_coded_bits: usize,
 ) -> Result<(usize, usize), FecError> {
+    // `k` and `n` are free parameters here, not read off a validated
+    // matrix, so a caller can supply a pair no real code could have. Every
+    // block code satisfies n >= k (rate at most 1); without this check the
+    // `n - n_shrt` below underflows whenever n < k - payload_bits, which
+    // panics in a debug build and — worse — wraps silently in a release
+    // build, yielding an enormous `max_coded` that lets the range check
+    // pass and returns a meaningless puncture count.
+    if n < k {
+        return Err(FecError::InvalidParam(
+            "codeword length N must be at least the information length K",
+        ));
+    }
     if payload_bits > k {
         return Err(FecError::InvalidParam(
             "payload_bits exceeds this codeword's K; multi-codeword segmentation is not implemented",
