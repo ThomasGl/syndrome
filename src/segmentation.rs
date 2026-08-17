@@ -172,6 +172,56 @@ pub struct SegmentationParams {
     pub k_b: usize,
 }
 
+/// $K_b$ for lifting-size selection, per 3GPP TS 38.212 §5.2.2.
+///
+/// $K_b$ is the number of systematic base-graph columns the lifting size has
+/// to cover, and it is *not* the base graph's full systematic column count —
+/// for BG2 the spec steps it down for short transport blocks, so a small block
+/// gets a larger $Z$ than its information length alone would suggest. The
+/// difference between this and the encoder's fixed column count becomes filler
+/// bits.
+///
+/// | Base graph | $B$ | $K_b$ |
+/// |---|---|---|
+/// | BG1 | any | 22 |
+/// | BG2 | $> 640$ | 10 |
+/// | BG2 | $> 560$ | 9 |
+/// | BG2 | $> 192$ | 8 |
+/// | BG2 | otherwise | 6 |
+///
+/// Note every BG2 comparison is strict: at $B = 640$ exactly, $K_b$ is 9, not
+/// 10. This is a transcribed spec table feeding a value that shifts $Z$, $K$
+/// and the filler count, so it is a separate function purely so the ladder can
+/// be tested at each boundary from both sides — `cargo mutants` showed that
+/// through [`compute_segmentation`] alone, every one of those comparisons
+/// could be loosened to `>=` without failing a test, because $K_b$ is not
+/// among the fields [`SegmentationParams`] reports.
+///
+/// # Arguments
+///
+/// * `bg` - Selected base graph.
+/// * `b`  - $B = A + 24$, the transport block plus its CRC-24A.
+///
+/// # Returns
+///
+/// $K_b \in \lbrace 6, 8, 9, 10, 22 \rbrace$.
+fn lifting_selection_k_b(bg: BaseGraph, b: usize) -> usize {
+    match bg {
+        BaseGraph::Bg1 => 22,
+        BaseGraph::Bg2 => {
+            if b > 640 {
+                10
+            } else if b > 560 {
+                9
+            } else if b > 192 {
+                8
+            } else {
+                6
+            }
+        }
+    }
+}
+
 /// Compute segmentation parameters for a transport block.
 ///
 /// # Arguments
@@ -248,23 +298,7 @@ pub fn compute_segmentation(a: usize, target_rate: f32) -> Result<SegmentationPa
     // is zero-padded by `segment`).
     let k_prime = b_prime.div_ceil(c);
 
-    // Kb depends on BG and (for BG2) on B (§5.2.2):
-    //   BG1: Kb = 22
-    //   BG2: Kb = 10 if B > 640; 9 if B > 560; 8 if B > 192; else 6
-    let k_b: usize = match bg {
-        BaseGraph::Bg1 => 22,
-        BaseGraph::Bg2 => {
-            if b > 640 {
-                10
-            } else if b > 560 {
-                9
-            } else if b > 192 {
-                8
-            } else {
-                6
-            }
-        }
-    };
+    let k_b = lifting_selection_k_b(bg, b);
 
     let z = min_valid_z(k_prime, k_b)?;
 
@@ -381,6 +415,47 @@ pub fn segment(tb_with_crc: &[u8], p: &SegmentationParams) -> Result<Vec<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every $K_b$ threshold from TS 38.212 §5.2.2, tested on both sides.
+    ///
+    /// $K_b$ feeds lifting-size selection, so getting a comparison wrong
+    /// shifts $Z$, $K$ and the filler count for a *band* of transport block
+    /// sizes while leaving every size outside that band correct. `cargo
+    /// mutants` found that all four BG2 boundary comparisons could be loosened
+    /// to `>=` (or `==`) without failing anything: the round-trip tests sample
+    /// transport block sizes that are never *at* a threshold, which is
+    /// precisely where a transcription slip in a spec table lands.
+    ///
+    /// Every comparison in the ladder is strict, so each threshold value
+    /// itself belongs to the band *below* it.
+    #[test]
+    fn kb_thresholds_match_the_spec_on_both_sides() {
+        // (B, expected Kb) — each threshold and the value one bit above it.
+        const BG2_CASES: [(usize, usize); 9] = [
+            (0, 6),
+            (192, 6),  // at the threshold: `>` means 192 is still 6
+            (193, 8),  // one above
+            (560, 8),  // at the second threshold
+            (561, 9),  // one above
+            (640, 9),  // at the third threshold
+            (641, 10), // one above
+            (3824, 10),
+            (usize::MAX, 10),
+        ];
+        for (b, expected) in BG2_CASES {
+            assert_eq!(
+                lifting_selection_k_b(BaseGraph::Bg2, b),
+                expected,
+                "BG2 at B = {b}: TS 38.212 §5.2.2 gives Kb = {expected}"
+            );
+        }
+
+        // BG1 has no ladder: 22 at every B, including where BG2's thresholds
+        // sit, so a stray BG2 comparison leaking into the BG1 arm shows here.
+        for b in [0usize, 192, 193, 560, 641, 8448, usize::MAX] {
+            assert_eq!(lifting_selection_k_b(BaseGraph::Bg1, b), 22);
+        }
+    }
 
     #[test]
     fn bg_selection_boundary_values() {

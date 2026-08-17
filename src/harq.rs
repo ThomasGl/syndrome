@@ -234,6 +234,84 @@ mod tests {
         assert!(buf.copy_llr_into(&mut dst).is_err());
     }
 
+    /// `copy_llr_into` must accept a destination of exactly `ncb` elements.
+    ///
+    /// The length check is `dst.len() < acc.len()`, and every boundary check
+    /// has an off-by-one next door to it: `<=` here would reject the exactly
+    /// sized buffer, which is the one a caller who read
+    /// [`HarqBuffer::ncb`] would naturally allocate. The existing
+    /// short-buffer test cannot see that — it passes a 1-element destination,
+    /// which both forms reject. Found by `cargo mutants`.
+    #[test]
+    fn copy_llr_into_accepts_an_exactly_sized_destination() {
+        let buf = HarqBuffer::new(BaseGraph::Bg1, 2);
+        let mut exact = vec![0.0f32; buf.ncb()];
+        assert!(
+            buf.copy_llr_into(&mut exact).is_ok(),
+            "a destination of exactly ncb elements is large enough"
+        );
+
+        let mut one_short = vec![0.0f32; buf.ncb() - 1];
+        assert!(
+            buf.copy_llr_into(&mut one_short).is_err(),
+            "one element short must still be rejected"
+        );
+    }
+
+    /// A non-zero `n_filler_override` must actually override, including at
+    /// the smallest non-zero value.
+    ///
+    /// `combine`'s fourth parameter selects between the filler count fixed at
+    /// construction and a caller-supplied one, and every other test passes
+    /// `0` — so the override branch was never executed and deleting it would
+    /// not have failed anything. Found by `cargo mutants`.
+    ///
+    /// The assertion is an equivalence rather than a spot value: overriding
+    /// with `f` has to land in exactly the same place as constructing the
+    /// buffer with [`HarqBuffer::with_filler`] and overriding with nothing,
+    /// because those are two spellings of the same configuration. A third
+    /// buffer with no filler at all pins that the parameter changes the
+    /// result — without it, an override that silently did nothing would still
+    /// satisfy the first comparison.
+    ///
+    /// `f = 1` is in the list on purpose. The guard is `override > 0`, so `1`
+    /// is the boundary: testing only `5` leaves `> 1` — an off-by-one that
+    /// silently ignores a single filler bit — indistinguishable from correct.
+    ///
+    /// The transmission also has to be long enough to *reach* the filler
+    /// region or the inequality assertion is vacuous. Filler bits sit at
+    /// codeword positions $[K - f, K)$ with $K = k_b Z = 176$ here, which is
+    /// circular-buffer index $K - f - 2Z \ge 155$; a 32-element transmission
+    /// stops at 31 and every configuration produces byte-identical buffers.
+    /// 256 elements crosses it.
+    #[test]
+    fn nonzero_filler_override_matches_the_constructor_filler() {
+        const Z: usize = 8;
+        let e = vec![1.5f32; 256];
+
+        let mut no_filler = HarqBuffer::new(BaseGraph::Bg1, Z);
+        no_filler.combine(&e, 0, 1, 0).unwrap();
+
+        for n_filler in [1usize, 5] {
+            let mut overridden = HarqBuffer::new(BaseGraph::Bg1, Z);
+            overridden.combine(&e, 0, 1, n_filler).unwrap();
+
+            let mut constructed = HarqBuffer::with_filler(BaseGraph::Bg1, Z, n_filler);
+            constructed.combine(&e, 0, 1, 0).unwrap();
+
+            assert_eq!(
+                overridden.llr_buffer(),
+                constructed.llr_buffer(),
+                "override of {n_filler} must equal setting {n_filler} at construction"
+            );
+            assert_ne!(
+                overridden.llr_buffer(),
+                no_filler.llr_buffer(),
+                "an override of {n_filler} must change where LLRs land, or it is a no-op"
+            );
+        }
+    }
+
     /// FINDING 3/5 regression guard: `HarqBuffer::new(bg, 0)` followed by
     /// `combine` used to divide-by-zero inside `rate_dematch_llr` (`z == 0`
     /// makes `ncb == 0`). `rate_dematch_llr` now validates `z > 0` up front,

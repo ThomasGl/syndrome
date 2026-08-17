@@ -32,3 +32,7 @@ Thumbs.db
 # Compiled C++ benchmark binaries (built by bench/cpp/Makefile)
 /bench/cpp/loms_decode
 /bench/cpp/rs_encode
+
+# cargo-mutants working directory (build trees + per-run reports).
+/mutants.out/
+/mutants.out.old/

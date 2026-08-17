@@ -1,0 +1,45 @@
+# cargo-mutants configuration.
+#
+# WHAT A MUTANT IS FOR HERE
+#
+# `cargo mutants` rewrites one operator, constant or return value at a time and
+# re-runs the suite. A mutant that survives is a change to the source that no
+# test objected to — which usually means a boundary nobody tested, and
+# occasionally means a mutant that is genuinely equivalent to the original.
+# The point is not the score; it is the list of survivors.
+#
+# SCOPE, AND WHY IT IS NOT THE WHOLE CRATE
+#
+# A full run is ~4,500 mutants. With this suite's runtime that is measured in
+# weeks, so the audit runs per module. Two kinds of module are deliberately
+# left out rather than silently skipped:
+#
+#   * The SIMD kernels (`simd_avx2.rs`, `simd_neon.rs`) and the vectorized
+#     paths that call them. They already have a mutation-style gate of their
+#     own — each is proven bit-identical to a retained scalar reference on
+#     seeded random input — and mutating them mostly produces timeouts rather
+#     than information.
+#   * The benchmark exporters under `src/bin/`, which have no assertions to
+#     violate.
+#
+# Modules audited so far, with the survivors each produced, are recorded in
+# CHANGELOG.md. Running `cargo mutants -f src/<module>.rs` extends it.
+#
+# TIMEOUTS ARE DETECTIONS, BUT POOR ONES
+#
+# A mutated `SpscRing` makes the cross-thread stress tests spin forever, so
+# cargo-mutants reports TIMEOUT rather than CAUGHT. The defect *is* detected —
+# after 219 seconds of waiting. `tests/loom_spsc.rs` catches the same class in
+# milliseconds and says which ordering broke, which is the better tool for
+# that module; the mutation run is what showed how much of the SPSC coverage
+# rested on a hang.
+
+# Generated and non-asserting code.
+exclude_globs = [
+    "src/bin/**",
+    "benches/**",
+]
+
+# The suite has statistical tests that legitimately run for tens of seconds;
+# the default multiplier declares too many of them timeouts.
+timeout_multiplier = 4.0
