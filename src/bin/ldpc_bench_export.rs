@@ -1,20 +1,32 @@
 //! LDPC decode benchmark exporter — times QC-LDPC LOMS decode (BG1, Z=384, 10 iter)
 //! and writes bench/results/ldpc_rust.json for the dashboard Rust vs C++ comparison.
 //!
-//! Measures two kernel selections over the identical decode workload:
+//! Measures four kernel selections over the identical decode workload:
 //! `"loms_runtime_simd"` (the default entry point, which probes the host CPU
 //! at runtime and prefers AVX2 on x86_64 / NEON on aarch64) and
 //! `"loms_scalar"` (forced onto the pure scalar fallback via
 //! [`QcLdpcDecoder::decode_layered_offset_min_sum_scalar`] on every
-//! architecture). Both share the same LOMS implementation and differ only
-//! in which kernel is selected, so this is a fair scalar-vs-vectorized
+//! architecture), then the same pair for the fixed-point path,
+//! `"loms_i8_runtime_simd"` and `"loms_i8_scalar"`. Within each number
+//! format the two entries share one LOMS implementation and differ only in
+//! which kernel is selected, so each is a fair scalar-vs-vectorized
 //! comparison rather than two different algorithms.
+//!
+//! The fixed-point entries decode the *same* channel values, quantized: the
+//! `f32` LLR buffer is passed through
+//! [`syndrome::quantize::quantize_llr_i16`] at the crate's default scale.
+//! Comparing the two formats on throughput is only meaningful because the
+//! error-rate cost of that quantization has been measured separately and is
+//! small — see `tests/ldpc_int8_quantization_loss.rs`. The cross-language
+//! checksum below stays on the `f32` scalar kernel, since the C++ reference
+//! has no fixed-point path.
 //!
 //! Usage: `cargo run --release --bin ldpc_bench_export`
 //! Output: `bench/results/ldpc_rust.json`
 
 use std::time::Instant;
 use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+use syndrome::quantize::{QuantParams, quantize_llr_i16};
 
 const Z: usize = 384;
 const DECODE_ITERS: usize = 10;
@@ -66,6 +78,30 @@ fn median_decode_ns(
         init_llr(llr);
         let t0 = Instant::now();
         decode(llr, edge_r, scratch, hard);
+        samples.push(t0.elapsed().as_nanos());
+    }
+    samples.sort_unstable();
+    samples[BENCH_REPS / 2] as f64
+}
+
+/// [`median_decode_ns`] for the fixed-point path: the posterior buffer is
+/// re-quantized from the same `f32` LLR values before every rep, so each
+/// timed call starts from exactly the state the `f32` measurement starts
+/// from.
+fn median_decode_ns_i8(
+    llr: &[f32],
+    app: &mut [i16],
+    edge_r: &mut [i8],
+    scratch: &mut [i8],
+    hard: &mut [u8],
+    quant: QuantParams,
+    mut decode: impl FnMut(&mut [i16], &mut [i8], &mut [i8], &mut [u8]),
+) -> f64 {
+    let mut samples: Vec<u128> = Vec::with_capacity(BENCH_REPS);
+    for _ in 0..BENCH_REPS {
+        quantize_llr_i16(llr, app, quant.scale);
+        let t0 = Instant::now();
+        decode(app, edge_r, scratch, hard);
         samples.push(t0.elapsed().as_nanos());
     }
     samples.sort_unstable();
@@ -124,6 +160,58 @@ fn main() {
     println!("[loms_scalar]       Median ns/iter : {median_ns_scalar:.1}");
     println!("[loms_scalar]       Melem/s        : {melem_per_s_scalar:.2}");
 
+    // ── Fixed-point kernels over the same workload ───────────────────────
+    let quant = QuantParams::default();
+    let mut app = vec![0i16; n];
+    let mut edge_r_i8 = vec![0i8; edge_buf_len];
+    let mut scratch_i8 = vec![0i8; scratch_len];
+    init_llr(&mut llr);
+    let llr_ref = llr.clone();
+
+    let median_ns_i8_simd = median_decode_ns_i8(
+        &llr_ref,
+        &mut app,
+        &mut edge_r_i8,
+        &mut scratch_i8,
+        &mut hard,
+        quant,
+        |app, edge_r, scratch, hard| {
+            decoder
+                .decode_layered_offset_min_sum_i8(app, edge_r, scratch, hard, DECODE_ITERS, quant)
+                .expect("decode failed");
+        },
+    );
+    let melem_per_s_i8_simd = (n as f64 * DECODE_ITERS as f64) / (median_ns_i8_simd * 1e-9) / 1e6;
+
+    println!("[loms_i8_runtime_simd] Median ns/iter : {median_ns_i8_simd:.1}");
+    println!("[loms_i8_runtime_simd] Melem/s        : {melem_per_s_i8_simd:.2}");
+
+    let median_ns_i8_scalar = median_decode_ns_i8(
+        &llr_ref,
+        &mut app,
+        &mut edge_r_i8,
+        &mut scratch_i8,
+        &mut hard,
+        quant,
+        |app, edge_r, scratch, hard| {
+            decoder
+                .decode_layered_offset_min_sum_i8_scalar(
+                    app,
+                    edge_r,
+                    scratch,
+                    hard,
+                    DECODE_ITERS,
+                    quant,
+                )
+                .expect("decode failed");
+        },
+    );
+    let melem_per_s_i8_scalar =
+        (n as f64 * DECODE_ITERS as f64) / (median_ns_i8_scalar * 1e-9) / 1e6;
+
+    println!("[loms_i8_scalar]       Median ns/iter : {median_ns_i8_scalar:.1}");
+    println!("[loms_i8_scalar]       Melem/s        : {melem_per_s_i8_scalar:.2}");
+
     let record_simd = format!(
         r#"  {{"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns_simd:.1},"mib_per_s":0,"melem_per_s":{melem_per_s_simd:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
     );
@@ -131,7 +219,15 @@ fn main() {
         r#"  {{"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns_scalar:.1},"mib_per_s":0,"melem_per_s":{melem_per_s_scalar:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
     );
 
-    let json = format!("[\n{record_simd},\n{record_scalar}\n]\n");
+    let record_i8_simd = format!(
+        r#"  {{"lang":"rust","impl":"loms_i8_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns_i8_simd:.1},"mib_per_s":0,"melem_per_s":{melem_per_s_i8_simd:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
+    );
+    let record_i8_scalar = format!(
+        r#"  {{"lang":"rust","impl":"loms_i8_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":{n},"ns_per_iter":{median_ns_i8_scalar:.1},"mib_per_s":0,"melem_per_s":{melem_per_s_i8_scalar:.2},"n_variable_nodes":{n},"n_iters":{DECODE_ITERS}}}"#
+    );
+
+    let json =
+        format!("[\n{record_simd},\n{record_scalar},\n{record_i8_simd},\n{record_i8_scalar}\n]\n");
     let json_path = format!("{out_dir}/ldpc_rust.json");
     std::fs::write(&json_path, &json).expect("cannot write ldpc_rust.json");
     println!("Wrote {json_path}");

@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted a published figure for other decoders. That paragraph is replaced by
   this measurement.
 
+### Changed
+
+- `src/bin/ldpc_bench_export.rs` additionally times the fixed-point kernels
+  (`loms_i8_runtime_simd`, `loms_i8_scalar`) over the same decode workload,
+  quantizing the same `f32` LLR values, and writes them to
+  `bench/results/ldpc_rust.json`. The cross-language checksum gate stays on
+  the `f32` scalar kernel, since the C++ reference has no fixed-point path.
+
 ## [0.4.0] — 2026-08-16
 
 ### Added
