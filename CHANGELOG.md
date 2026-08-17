@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bench/results/ldpc_rust.json`. The cross-language checksum gate stays on
   the `f32` scalar kernel, since the C++ reference has no fixed-point path.
 
+  README §5.2.2 publishes the result: BG1 Z=384, 10 iterations, the vectorized
+  int8 kernel at ~854 Melem/s against the vectorized `f32` kernel's
+  ~216 Melem/s, a ~4.0× gap. The two *scalar* rows are the control that makes
+  that reading safe — narrowing the number format buys nothing without SIMD,
+  and they agree at ~64 Melem/s to within their own run-to-run spread, so the
+  gap above is the register width and not the arithmetic.
+
 ## [0.4.0] — 2026-08-16
 
 ### Added

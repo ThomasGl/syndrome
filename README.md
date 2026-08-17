@@ -719,11 +719,33 @@ The decoder has a second number format. `decode_layered_offset_min_sum_i8`
 runs the same layered offset min-sum algorithm with 8-bit check-to-variable
 messages and a 16-bit a-posteriori accumulator, which lets its AVX2 kernel
 work 32 z-positions per 256-bit register instead of the 8 the `f32` kernel
-gets. `bench/results/ldpc_rust.json` carries the timings for both formats
-(`loms_i8_runtime_simd` and `loms_i8_scalar` alongside the `f32` rows);
-regenerate it with `cargo run --release --bin ldpc_bench_export` on an idle
-machine, since §5.0's variance note applies with particular force to a kernel
-this short.
+gets.
+
+BG1, Z=384, 10 iterations, `cargo run --release --bin ldpc_bench_export`;
+each row is the exporter's median of 200 reps, and the figure quoted is the
+median across 7 such runs on an idle machine.
+
+| Kernel | Throughput | Wall-clock / call | Spread over 7 runs |
+|---|---|---|---|
+| **int8, AVX2 selected at runtime** | **~854 Melem/s** | **~0.31 ms** | 5.6% |
+| `f32`, AVX2 selected at runtime | ~216 Melem/s | ~1.21 ms | 3.8% |
+| int8, scalar kernel forced | ~64 Melem/s | ~4.09 ms | 2.3% |
+| `f32`, scalar kernel forced | ~64 Melem/s | ~4.08 ms | 3.0% |
+
+The vectorized int8 kernel is ~4.0× the vectorized `f32` one — a little more
+than the 4× the lane count alone would predict, because the batched posterior
+update also moves 16 `i16` lanes per instruction where the `f32` kernel has
+to scatter its deltas one at a time. The two *scalar* rows are the control
+that makes that reading safe: narrowing the number format buys nothing
+without SIMD, and they agree to within their own run-to-run spread, so the
+gap in the first two rows is the register width and not the arithmetic.
+
+Both int8 rows come from the same tool and the same runs as the `f32` rows
+beside them, so the ratio does not depend on §5.2's older cross-language
+table. §5.0's variance note applies with particular force here: this kernel
+is short enough that a busy machine changes the answer, and the same
+measurement taken under an unrelated multi-core workload on this host
+returned 88–161 Melem/s for the `f32` row.
 
 Quantization is lossy, so the question that decides whether the fixed-point
 path is usable is how much extra $E_b/N_0$ it needs to reach the same block
