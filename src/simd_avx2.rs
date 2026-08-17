@@ -13,6 +13,8 @@
 
 use std::arch::x86_64::*;
 
+use crate::quantize::MSG_MAX;
+
 /// Process passes 1 and 2 of one LOMS layer using AVX2 (8-wide f32 registers).
 ///
 /// # Safety
@@ -453,6 +455,346 @@ pub(crate) unsafe fn q_build_edge_avx2(
             }
             for j in i..shift {
                 q_row[q_base + span1 + j] = llr[var_base + j] - edge_r[base_edge + span1 + j];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-point (i8) LOMS layer kernel — 32 z-positions per instruction
+// ---------------------------------------------------------------------------
+//
+// # Why the cyclic shift is handled per 16-lane group
+//
+// A layer's edge reads and writes the posterior at `var_base + (z_idx +
+// shift) mod z`, so consecutive z-positions are consecutive `app` slots
+// except at the single point where the index wraps back to `var_base`. The
+// obvious way to vectorize that is to split the whole `z` range into the two
+// contiguous runs either side of the wrap and chunk each one — and it is a
+// trap. Every run then carries its own scalar tail, so the tail work is
+// `~2 * 16` elements *per edge* regardless of `z`, and at `Z = 128` that is
+// a quarter of the layer. Measured against the `f32` kernel that made the
+// fixed-point path *slower* below `Z ≈ 192`, with a decode time almost
+// independent of `Z`: the per-edge overhead, not the per-element work, was
+// setting the pace.
+//
+// What is done instead: chunk the arithmetic over the full `z` range and
+// test each 16-lane group for whether *it* straddles the wrap. At most one
+// group per edge does, so the scalar work is one group per edge plus the
+// `z mod 32` tail the vector loop cannot cover.
+
+/// Add 16 already-widened `i16` deltas into the posterior, clamping to
+/// `±app_clamp`.
+///
+/// `z_idx` is the first of the 16 z-positions; the posterior indices are
+/// `var_base + (z_idx + j + shift) mod z`. When those 16 indices do not wrap
+/// they are consecutive and the whole group is one load-add-store; the one
+/// group per edge that does wrap falls back to scalar.
+///
+/// # Safety
+///
+/// Caller must have verified AVX2 availability. `var_base + z` must be within
+/// `app`, `z_idx + 16 <= z`, and `app_clamp >= 0`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_delta16_i8_avx2(
+    app: &mut [i16],
+    var_base: usize,
+    shift: usize,
+    z: usize,
+    z_idx: usize,
+    delta: __m256i,
+    clamp_lo: __m256i,
+    clamp_hi: __m256i,
+    app_clamp: i16,
+) {
+    unsafe {
+        let s = z_idx + shift;
+        let start = if s >= z { s - z } else { s };
+        if start + 16 <= z {
+            let p = app.as_mut_ptr().add(var_base + start) as *mut __m256i;
+            let v = _mm256_adds_epi16(_mm256_loadu_si256(p as *const __m256i), delta);
+            _mm256_storeu_si256(p, _mm256_min_epi16(_mm256_max_epi16(v, clamp_lo), clamp_hi));
+        } else {
+            let mut tmp = [0i16; 16];
+            _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, delta);
+            for (j, &d) in tmp.iter().enumerate() {
+                let sj = start + j;
+                let idx = var_base + if sj >= z { sj - z } else { sj };
+                let slot = &mut *app.get_unchecked_mut(idx);
+                *slot = slot.saturating_add(d).clamp(-app_clamp, app_clamp);
+            }
+        }
+    }
+}
+
+/// AVX2 Q-build for one LOMS edge in the fixed-point path:
+/// `q_row[q_base + i] = sat8(app[var_base + (i + shift) mod z] - edge_r[base_edge + i])`.
+///
+/// 16 z-positions per iteration: one `__m256i` of `i16` posteriors against
+/// one `__m128i` of `i8` messages, widened before the subtraction so an
+/// out-of-range posterior cannot wrap. The wrap in the posterior index is
+/// handled per group exactly as in [`apply_delta16_i8_avx2`].
+///
+/// # Safety
+///
+/// Caller must have verified AVX2 availability. `app` must cover
+/// `var_base + z` elements, `edge_r` must cover `base_edge + z`, and `q_row`
+/// must cover `q_base + z`.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn q_build_edge_i8_avx2(
+    z: usize,
+    shift: usize,
+    var_base: usize,
+    q_base: usize,
+    base_edge: usize,
+    app: &[i16],
+    edge_r: &[i8],
+    q_row: &mut [i8],
+) {
+    unsafe {
+        let msg_hi = _mm256_set1_epi16(MSG_MAX as i16);
+        let msg_lo = _mm256_set1_epi16(-(MSG_MAX as i16));
+        let full = z & !15;
+
+        let mut i = 0usize;
+        while i < full {
+            let s = i + shift;
+            let start = if s >= z { s - z } else { s };
+            let a = if start + 16 <= z {
+                _mm256_loadu_si256(app.as_ptr().add(var_base + start) as *const __m256i)
+            } else {
+                // The one group per edge whose posterior reads wrap: gather
+                // the 16 values, then rejoin the vector path.
+                let mut tmp = [0i16; 16];
+                for (j, slot) in tmp.iter_mut().enumerate() {
+                    let sj = start + j;
+                    *slot = *app.get_unchecked(var_base + if sj >= z { sj - z } else { sj });
+                }
+                _mm256_loadu_si256(tmp.as_ptr() as *const __m256i)
+            };
+
+            let r8 = _mm_loadu_si128(edge_r.as_ptr().add(base_edge + i) as *const __m128i);
+            let r = _mm256_cvtepi8_epi16(r8);
+            // Saturating i16 subtract then clamp to the message range: for an
+            // in-range posterior the saturation never engages, and where it
+            // would it lands on the same side as the clamp, so this matches
+            // the scalar `(app as i32 - r as i32).clamp(..)` exactly.
+            let d = _mm256_subs_epi16(a, r);
+            let dc = _mm256_min_epi16(_mm256_max_epi16(d, msg_lo), msg_hi);
+
+            // packs_epi16 works per 128-bit lane, so `packs(dc, dc)` puts
+            // lanes 0..8 in the low 64 bits of the low half and lanes 8..16
+            // in the low 64 bits of the high half. Values are already inside
+            // i8 range, so the saturation in the pack is a no-op.
+            let packed = _mm256_packs_epi16(dc, dc);
+            _mm_storel_epi64(
+                q_row.as_mut_ptr().add(q_base + i) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
+            _mm_storel_epi64(
+                q_row.as_mut_ptr().add(q_base + i + 8) as *mut __m128i,
+                _mm256_extracti128_si256(packed, 1),
+            );
+            i += 16;
+        }
+
+        // Scalar tail (at most 15 elements).
+        for j in i..z {
+            let s = j + shift;
+            let var_idx = var_base + if s >= z { s - z } else { s };
+            let d =
+                *app.get_unchecked(var_idx) as i32 - *edge_r.get_unchecked(base_edge + j) as i32;
+            *q_row.get_unchecked_mut(q_base + j) = d.clamp(-(MSG_MAX as i32), MSG_MAX as i32) as i8;
+        }
+    }
+}
+
+/// Process passes 1 and 2 of one fixed-point LOMS layer using AVX2 (32-wide
+/// `i8` registers).
+///
+/// This is the reason the fixed-point path exists: the magnitude and sign
+/// arithmetic that the `f32` kernel does 8 lanes at a time runs 32 lanes at a
+/// time here, on the same 256-bit registers.
+///
+/// # Safety
+///
+/// Caller must verify AVX2 support at runtime, e.g. with
+/// `is_x86_feature_detected!("avx2")`. `min1`, `min2` and `sxor` must each
+/// have length `≥ z`; `q_row` must have length `≥ row_degree * z`; `edge_r`
+/// must cover `(layer_begin + row_degree - 1) * z + z` elements; every
+/// `submatrix_cols[layer_begin + e] * z + z` must be within `app`. All
+/// accesses are unaligned loads/stores, so no alignment guarantee is
+/// required. `app_clamp` must be non-negative, `beta_q` in `[0, 127]`, and
+/// every `q_row` value in `[-127, 127]`.
+///
+/// `row_degree` must be `≥ 2`. A layer of degree 0 or 1 has no second
+/// smallest magnitude, and the sentinel fix-up for that case lives only in
+/// the scalar path — the caller routes such layers there. No 3GPP or IEEE
+/// 802.11 base graph contains one (minimum row degree is 3 for BG1 and BG2).
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn decode_layer_passes_i8_avx2(
+    z: usize,
+    row_degree: usize,
+    beta_q: i8,
+    app_clamp: i16,
+    q_row: &[i8],
+    edge_r: &mut [i8],
+    layer_begin: usize,
+    submatrix_cols: &[usize],
+    submatrix_shifts: &[i16],
+    app: &mut [i16],
+    min1: &mut [i8],
+    min2: &mut [i8],
+    sxor: &mut [u8],
+) {
+    unsafe {
+        let sign_mask = _mm256_set1_epi8(0x80u8 as i8);
+        let msg_max_v = _mm256_set1_epi8(MSG_MAX);
+        let ones = _mm256_set1_epi8(1);
+        let beta_v = _mm256_set1_epi8(beta_q);
+        let zero = _mm256_setzero_si256();
+        let clamp_hi = _mm256_set1_epi16(app_clamp);
+        let clamp_lo = _mm256_set1_epi16(-app_clamp);
+        let full = z & !31;
+
+        // ── Pass 1: min1 / min2 / sign-XOR across the layer's edges ─────────
+        // min1 and min2 start at MSG_MAX, which is the true upper bound on a
+        // message magnitude rather than an out-of-range sentinel, so no
+        // fix-up pass is needed afterwards (contrast the f32 kernel, which
+        // must clamp its f32::MAX sentinels).
+        for i in (0..full).step_by(32) {
+            _mm256_storeu_si256(min1.as_mut_ptr().add(i) as *mut __m256i, msg_max_v);
+            _mm256_storeu_si256(min2.as_mut_ptr().add(i) as *mut __m256i, msg_max_v);
+            _mm256_storeu_si256(sxor.as_mut_ptr().add(i) as *mut __m256i, zero);
+        }
+        for i in full..z {
+            *min1.get_unchecked_mut(i) = MSG_MAX;
+            *min2.get_unchecked_mut(i) = MSG_MAX;
+            *sxor.get_unchecked_mut(i) = 0;
+        }
+
+        for edge in 0..row_degree {
+            let q_ptr = q_row.as_ptr().add(edge * z);
+            for c in (0..full).step_by(32) {
+                let q = _mm256_loadu_si256(q_ptr.add(c) as *const __m256i);
+                let a = _mm256_abs_epi8(q);
+
+                let sx_ptr = sxor.as_mut_ptr().add(c) as *mut __m256i;
+                _mm256_storeu_si256(
+                    sx_ptr,
+                    _mm256_xor_si256(
+                        _mm256_loadu_si256(sx_ptr as *const __m256i),
+                        _mm256_and_si256(q, sign_mask),
+                    ),
+                );
+
+                // Branch-free sorted insertion of `a` into the pair
+                // (min1 ≤ min2): min1 ← min(min1, a), min2 ← min(min2,
+                // max(min1, a)). Three instructions, and it reproduces the
+                // scalar two-branch form exactly, ties included.
+                let m1_ptr = min1.as_mut_ptr().add(c) as *mut __m256i;
+                let m2_ptr = min2.as_mut_ptr().add(c) as *mut __m256i;
+                let m1 = _mm256_loadu_si256(m1_ptr as *const __m256i);
+                let m2 = _mm256_loadu_si256(m2_ptr as *const __m256i);
+                _mm256_storeu_si256(m1_ptr, _mm256_min_epi8(m1, a));
+                _mm256_storeu_si256(m2_ptr, _mm256_min_epi8(m2, _mm256_max_epi8(m1, a)));
+            }
+            // Scalar tail (at most 31 elements).
+            for i in full..z {
+                let q = *q_row.get_unchecked(edge * z + i);
+                let a = q.saturating_abs();
+                *sxor.get_unchecked_mut(i) ^= (q as u8) & 0x80;
+                let m1 = *min1.get_unchecked(i);
+                *min1.get_unchecked_mut(i) = m1.min(a);
+                let m2 = *min2.get_unchecked(i);
+                *min2.get_unchecked_mut(i) = m2.min(m1.max(a));
+            }
+        }
+
+        // ── Pass 2: new R, then delta-update the posterior ───────────────────
+        for edge in 0..row_degree {
+            let col_block = *submatrix_cols.get_unchecked(layer_begin + edge);
+            let shift = *submatrix_shifts.get_unchecked(layer_begin + edge) as usize;
+            let base_edge = (layer_begin + edge) * z;
+            let var_base = col_block * z;
+            let q_ptr = q_row.as_ptr().add(edge * z);
+            let r_ptr = edge_r.as_mut_ptr().add(base_edge);
+
+            for c in (0..full).step_by(32) {
+                let q = _mm256_loadu_si256(q_ptr.add(c) as *const __m256i);
+                let a = _mm256_abs_epi8(q);
+                let m1 = _mm256_loadu_si256(min1.as_ptr().add(c) as *const __m256i);
+                let m2 = _mm256_loadu_si256(min2.as_ptr().add(c) as *const __m256i);
+                let sx = _mm256_loadu_si256(sxor.as_ptr().add(c) as *const __m256i);
+
+                // Exclusive minimum: min2 for the edge that *was* the layer
+                // minimum, min1 for every other edge. Integer equality is
+                // exact, and where two edges tie for the minimum min2 == min1
+                // anyway.
+                let eq = _mm256_cmpeq_epi8(a, m1);
+                let min_excl = _mm256_blendv_epi8(m1, m2, eq);
+
+                // Offset correction, floored at zero. Both operands are in
+                // [0, 127], so the subtraction stays inside i8.
+                let mag = _mm256_max_epi8(_mm256_sub_epi8(min_excl, beta_v), zero);
+
+                // Exclusive sign: XOR of every edge's sign with this edge
+                // removed. `sign_epi8` multiplies by the signum of its second
+                // operand, so OR-ing in 1 turns the sign bit into a ±1
+                // selector (a plain OR would be wrong here — these are
+                // two's-complement values, not sign-magnitude floats).
+                let sign_excl = _mm256_xor_si256(sx, _mm256_and_si256(q, sign_mask));
+                let new_r = _mm256_sign_epi8(mag, _mm256_or_si256(sign_excl, ones));
+
+                let old_r = _mm256_loadu_si256(r_ptr.add(c) as *const __m256i);
+                _mm256_storeu_si256(r_ptr.add(c) as *mut __m256i, new_r);
+
+                // Widen both halves to i16 and delta-update the posterior.
+                let d_lo = _mm256_sub_epi16(
+                    _mm256_cvtepi8_epi16(_mm256_castsi256_si128(new_r)),
+                    _mm256_cvtepi8_epi16(_mm256_castsi256_si128(old_r)),
+                );
+                let d_hi = _mm256_sub_epi16(
+                    _mm256_cvtepi8_epi16(_mm256_extracti128_si256(new_r, 1)),
+                    _mm256_cvtepi8_epi16(_mm256_extracti128_si256(old_r, 1)),
+                );
+                apply_delta16_i8_avx2(
+                    app, var_base, shift, z, c, d_lo, clamp_lo, clamp_hi, app_clamp,
+                );
+                apply_delta16_i8_avx2(
+                    app,
+                    var_base,
+                    shift,
+                    z,
+                    c + 16,
+                    d_hi,
+                    clamp_lo,
+                    clamp_hi,
+                    app_clamp,
+                );
+            }
+
+            // Scalar tail (at most 31 elements).
+            for i in full..z {
+                let q = *q_row.get_unchecked(edge * z + i);
+                let a = q.saturating_abs();
+                let sign_excl = *sxor.get_unchecked(i) ^ ((q as u8) & 0x80);
+                let m1 = *min1.get_unchecked(i);
+                let min_excl = if a == m1 { *min2.get_unchecked(i) } else { m1 };
+                let mag = (min_excl - beta_q).max(0);
+                // Branch-free negate; see the scalar kernel in `qc_ldpc` for
+                // why a sign branch is not affordable here.
+                let neg = (sign_excl as i8) >> 7;
+                let new_r = (mag ^ neg).wrapping_sub(neg);
+                let old_r = *edge_r.get_unchecked(base_edge + i);
+                *edge_r.get_unchecked_mut(base_edge + i) = new_r;
+                let delta = new_r as i16 - old_r as i16;
+                let s = i + shift;
+                let var_idx = var_base + if s >= z { s - z } else { s };
+                let slot = &mut *app.get_unchecked_mut(var_idx);
+                *slot = slot.saturating_add(delta).clamp(-app_clamp, app_clamp);
             }
         }
     }

@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Fixed-point QC-LDPC decode path** (`src/qc_ldpc.rs`, `src/quantize.rs`,
+  `src/simd_avx2.rs`): `QcLdpcDecoder::decode_layered_offset_min_sum_i8`,
+  its forced-scalar twin `..._i8_scalar`, and the 5G wrapper `decode_5g_i8`
+  run the same layered offset min-sum algorithm as the `f32` path with
+  8-bit check-to-variable messages and a 16-bit a-posteriori accumulator.
+  `quantize.rs` gains `QuantParams` (scale and posterior clamp),
+  `quantize_llr_i16`, and the constants `DEFAULT_SCALE`, `MSG_MAX`,
+  `APP_CLAMP_WIDE` and `APP_CLAMP_I8`.
+
+  The AVX2 kernel works 32 z-positions per 256-bit register, against 8 for
+  the `f32` kernel, and the scalar reference remains the tested definition of
+  the path: every operation is integer, so the two are required to agree
+  bit-for-bit — `tests/ldpc_int8_kernel_equivalence.rs` asserts that on
+  seeded random channel data across both 3GPP base graphs, the 802.11
+  matrices, and lifting sizes chosen to exercise the vector body, the
+  32-element tail, the 16-element Q-build tail, and the group that straddles
+  the cyclic-shift wrap.
+
+  There is no NEON kernel for the fixed-point path: on AArch64 it runs its
+  scalar reference, and only the `f32` path is vectorized there.
+
+- **Measured quantization loss** (`tests/ldpc_int8_quantization_loss.rs`):
+  the extra $E_b/N_0$ the fixed-point decoder needs to reach the same block
+  error rate as the `f32` one, over the crate's BPSK AWGN channel with
+  $s = 8$, $\beta = 0.5$ and 10 iterations.
+
+  | Code | $E_b/N_0$ | Shift | 95% CI |
+  |---|---|---|---|
+  | BG1, $Z = 128$ | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
+  | BG1, $Z = 384$ | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
+  | BG2, $Z = 128$ | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
+  | BG2, $Z = 384$ | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
+
+  Every interval excludes zero, so the loss is real; it is between 0.003 and
+  0.010 dB, with every upper bound below 0.013 dB. Resolving a hundredth of a
+  dB is possible because the trials are **paired** — each hands the same
+  received vector to both decoders, so the channel's variance cancels and
+  only the trials the two disagree on carry information — and because the
+  waterfall is steep enough that a 0.01 dB displacement still moves the block
+  error rate by about 10%. The file also carries the sweeps behind the two
+  format decisions: the posterior width (clamping it to the message range
+  roughly doubles the block error rate and raises the bit error rate about
+  eightyfold, an error floor rather than an offset) and the scale (a broad
+  plateau from $s = 8$ to $s = 24$, with $s = 2$ and $s = 32$
+  resolvably worse).
+
+  Until now `src/quantize.rs` documented its own loss as unmeasured and
+  quoted a published figure for other decoders. That paragraph is replaced by
+  this measurement.
+
 ## [0.4.0] — 2026-08-16
 
 ### Added

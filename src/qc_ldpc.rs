@@ -63,6 +63,7 @@ use crate::bg_tables::{
     BG2_ROWS,
 };
 use crate::error::FecError;
+use crate::quantize::{MSG_MAX, QuantParams};
 
 /// Supported 5G NR QC-LDPC base graph identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1161,6 +1162,541 @@ impl QcLdpcDecoder {
                     let s = z_idx + shift;
                     let var = col * z + if s >= z { s - z } else { s };
                     parity ^= (llr[var] < 0.0) as u8;
+                }
+                if parity != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ── Fixed-point (i8 message / i16 posterior) LOMS decode path ──────────
+
+    /// Decode a block of quantized LLRs using layered offset min-sum in fixed
+    /// point: `i8` messages, `i16` a-posteriori accumulator.
+    ///
+    /// # Why the two widths differ
+    ///
+    /// The check-to-variable messages are `i8` because that is the point of
+    /// the exercise: the magnitude/sign arithmetic that dominates LOMS runs
+    /// 32 lanes per 256-bit register instead of 8, and a min-sum message is a
+    /// *comparison* quantity whose useful dynamic range is small — its
+    /// magnitude is bounded by the smallest incoming magnitude in the layer,
+    /// so extra bits buy nothing.
+    ///
+    /// The posterior is not that kind of quantity. It is a *sum*: the channel
+    /// LLR plus one message per incident edge, up to 31 terms for BG1 column
+    /// 0. Holding it in `i8` too would clamp it at
+    /// [`MSG_MAX`] and the clamp would bite on
+    /// exactly the variable nodes the decoder is most confident about,
+    /// flattening the beliefs it propagates back into later layers. That
+    /// costs error-rate performance, and
+    /// `tests/ldpc_int8_quantization_loss.rs` measures how much rather than
+    /// asserting it: pass
+    /// [`APP_CLAMP_I8`](crate::quantize::APP_CLAMP_I8) in `quant` to
+    /// reproduce the narrow accumulator and compare.
+    ///
+    /// # Relationship to the `f32` path
+    ///
+    /// Identical algorithm, identical layer schedule, identical early
+    /// termination — see
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum`] for the update
+    /// equations. The only differences are the number format and that
+    /// $\beta$ arrives as
+    /// [`QuantParams::beta_q`] of this
+    /// decoder's `offset_beta`. This path is *not* bit-equivalent to the
+    /// `f32` path — quantization is lossy by construction, and the size of
+    /// that loss in dB is what the test above reports.
+    ///
+    /// # Arguments
+    ///
+    /// * `app`           - Quantized channel LLRs on input (use
+    ///   [`quantize_llr_i16`](crate::quantize::quantize_llr_i16)), overwritten
+    ///   with a-posteriori values. Length must equal
+    ///   [`QcLdpcDecoder::variable_node_count`].
+    /// * `edge_r`        - Preallocated flat C→V message buffer. Minimum
+    ///   length: [`QcLdpcDecoder::required_edge_buffer`].
+    /// * `layer_scratch` - Per-layer V→C scratch. Minimum length:
+    ///   [`QcLdpcDecoder::required_layer_buffer`].
+    /// * `hard_output`   - Hard-decision output of length $N$.
+    /// * `iterations`    - Number of full layered passes.
+    /// * `quant`         - Fixed-point format
+    ///   ([`QuantParams`]); the `scale` field
+    ///   must match the scale the caller quantized `app` with, since it is
+    ///   what converts $\beta$ into message units.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed, which is smaller than
+    /// `iterations` when the syndrome check passes early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `app` or `hard_output` do not
+    /// have exactly length [`QcLdpcDecoder::variable_node_count`], or
+    /// [`FecError::BufferTooSmall`] if `edge_r` or `layer_scratch` are
+    /// smaller than [`QcLdpcDecoder::required_edge_buffer`] /
+    /// [`QcLdpcDecoder::required_layer_buffer`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    /// use syndrome::quantize::{QuantParams, quantize_llr_i16};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 16, 0.5).unwrap();
+    /// let quant = QuantParams::default();
+    /// let n = dec.variable_node_count();
+    ///
+    /// // Strong all-zero channel.
+    /// let llr = vec![5.0f32; n];
+    /// let mut app = vec![0i16; n];
+    /// quantize_llr_i16(&llr, &mut app, quant.scale);
+    ///
+    /// let mut edge_r = vec![0i8; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0i8; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// dec.decode_layered_offset_min_sum_i8(
+    ///     &mut app, &mut edge_r, &mut scratch, &mut hard, 10, quant,
+    /// ).unwrap();
+    /// assert!(hard.iter().all(|&b| b == 0));
+    /// ```
+    pub fn decode_layered_offset_min_sum_i8(
+        &self,
+        app: &mut [i16],
+        edge_r: &mut [i8],
+        layer_scratch: &mut [i8],
+        hard_output: &mut [u8],
+        iterations: usize,
+        quant: QuantParams,
+    ) -> Result<usize, FecError> {
+        self.decode_layered_offset_min_sum_i8_dispatch(
+            app,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            quant,
+            KernelChoice::Auto,
+        )
+    }
+
+    /// Identical arithmetic to
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`] with the kernel
+    /// selection forced to the portable scalar path on every architecture.
+    ///
+    /// Unlike the `f32` pair, the two fixed-point kernels are *exactly*
+    /// equal, not merely equal up to floating-point reassociation: every
+    /// operation is integer, so the AVX2 kernel and this one must agree
+    /// bit-for-bit on the messages, the posterior and the hard decisions.
+    /// `tests/ldpc_int8_kernel_equivalence.rs` asserts that on seeded random
+    /// channel data, which is what makes this the reference the vectorized
+    /// kernel is checked against rather than a second implementation that
+    /// could quietly drift.
+    ///
+    /// # Arguments
+    ///
+    /// See [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`]; the arguments
+    /// are identical.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    /// use syndrome::quantize::{QuantParams, quantize_llr_i16};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg2, 16, 0.5).unwrap();
+    /// let quant = QuantParams::default();
+    /// let n = dec.variable_node_count();
+    /// let mut app = vec![0i16; n];
+    /// quantize_llr_i16(&vec![4.0f32; n], &mut app, quant.scale);
+    /// let mut edge_r = vec![0i8; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0i8; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// dec.decode_layered_offset_min_sum_i8_scalar(
+    ///     &mut app, &mut edge_r, &mut scratch, &mut hard, 10, quant,
+    /// ).unwrap();
+    /// assert!(hard.iter().all(|&b| b == 0));
+    /// ```
+    pub fn decode_layered_offset_min_sum_i8_scalar(
+        &self,
+        app: &mut [i16],
+        edge_r: &mut [i8],
+        layer_scratch: &mut [i8],
+        hard_output: &mut [u8],
+        iterations: usize,
+        quant: QuantParams,
+    ) -> Result<usize, FecError> {
+        self.decode_layered_offset_min_sum_i8_dispatch(
+            app,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            quant,
+            KernelChoice::Scalar,
+        )
+    }
+
+    /// 5G NR-compliant fixed-point decode wrapper (TS 38.212 §5.3.2).
+    ///
+    /// The fixed-point counterpart of [`QcLdpcDecoder::decode_5g`]: sets the
+    /// filler-bit and punctured-position posteriors, then runs
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`].
+    ///
+    /// Filler bits are known zeros, so the `f32` path pins them at $10^6$.
+    /// Fixed point has no such headroom, and the value it can use is exactly
+    /// [`QuantParams::app_clamp`] —
+    /// the largest posterior the format admits. With the default
+    /// [`APP_CLAMP_WIDE`](crate::quantize::APP_CLAMP_WIDE) that is far above
+    /// the $127 \cdot 30 = 3810$ that all incident check messages together
+    /// could subtract, so a filler bit can never be overturned. With a
+    /// narrow accumulator it can be, which is one of the concrete costs of
+    /// clamping the posterior.
+    ///
+    /// # Arguments
+    ///
+    /// * `app`       - Quantized channel LLR buffer of length $N$. The caller
+    ///   must have filled $[2Z .. K']$ and $[K .. N]$; positions
+    ///   $[0 .. 2Z]$ are forced to the erasure value 0 and $[K' .. K]$ to the
+    ///   filler value by this function.
+    /// * `n_filler`  - Number of filler bits ($K - K'$).
+    /// * `edge_r`    - Caller-owned C→V buffer.
+    /// * `layer_scratch` - Caller-owned per-layer scratch.
+    /// * `hard_output`   - Hard-decision output of length $N$.
+    /// * `iterations`    - Number of layered passes.
+    /// * `quant`         - Fixed-point format.
+    ///
+    /// # Returns
+    ///
+    /// The number of iterations actually performed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::qc_ldpc::{BaseGraph, QcLdpcDecoder};
+    /// use syndrome::quantize::{QuantParams, quantize_llr_i16};
+    ///
+    /// let dec = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg1, 16, 0.5).unwrap();
+    /// let quant = QuantParams::default();
+    /// let n = dec.variable_node_count();
+    /// let mut app = vec![0i16; n];
+    /// quantize_llr_i16(&vec![5.0f32; n], &mut app, quant.scale);
+    /// let mut edge_r = vec![0i8; dec.required_edge_buffer()];
+    /// let mut scratch = vec![0i8; dec.required_layer_buffer()];
+    /// let mut hard = vec![0u8; n];
+    /// dec.decode_5g_i8(&mut app, 0, &mut edge_r, &mut scratch, &mut hard, 10, quant).unwrap();
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_5g_i8(
+        &self,
+        app: &mut [i16],
+        n_filler: usize,
+        edge_r: &mut [i8],
+        layer_scratch: &mut [i8],
+        hard_output: &mut [u8],
+        iterations: usize,
+        quant: QuantParams,
+    ) -> Result<usize, FecError> {
+        let z = self.params.z;
+        let k_b = self.params.num_col_blocks - self.params.num_row_blocks;
+        let k = k_b * z;
+
+        if app.len() != self.variable_node_count() {
+            return Err(FecError::InvalidParam(
+                "app length must equal variable_node_count()",
+            ));
+        }
+
+        let filler_app = quant.app_clamp.max(0);
+        let k_prime = k.saturating_sub(n_filler);
+        for slot in &mut app[k_prime..k] {
+            *slot = filler_app;
+        }
+        for slot in &mut app[..2 * z] {
+            *slot = 0;
+        }
+
+        self.decode_layered_offset_min_sum_i8(
+            app,
+            edge_r,
+            layer_scratch,
+            hard_output,
+            iterations,
+            quant,
+        )
+    }
+
+    /// Shared implementation behind
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8`] and
+    /// [`QcLdpcDecoder::decode_layered_offset_min_sum_i8_scalar`]. `kernel`
+    /// is resolved to a plain boolean once, before the iteration loop.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layered_offset_min_sum_i8_dispatch(
+        &self,
+        app: &mut [i16],
+        edge_r: &mut [i8],
+        layer_scratch: &mut [i8],
+        hard_output: &mut [u8],
+        iterations: usize,
+        quant: QuantParams,
+        kernel: KernelChoice,
+    ) -> Result<usize, FecError> {
+        // Referenced unconditionally so this parameter is never flagged as
+        // unused on architectures without a vectorized fixed-point kernel.
+        let _ = kernel;
+
+        let n = self.variable_node_count();
+        if app.len() != n {
+            return Err(FecError::InvalidParam(
+                "app length must equal variable_node_count()",
+            ));
+        }
+        if hard_output.len() != n {
+            return Err(FecError::InvalidParam(
+                "hard_output length must equal variable_node_count()",
+            ));
+        }
+        let edge_count = self.required_edge_buffer();
+        if edge_r.len() < edge_count {
+            return Err(FecError::BufferTooSmall {
+                required: edge_count,
+                provided: edge_r.len(),
+            });
+        }
+        let layer_scratch_len = self.required_layer_buffer();
+        if layer_scratch.len() < layer_scratch_len {
+            return Err(FecError::BufferTooSmall {
+                required: layer_scratch_len,
+                provided: layer_scratch.len(),
+            });
+        }
+
+        let z = self.params.z;
+        let beta_q = quant.beta_q(self.offset_beta);
+        // Negative clamps are meaningless and `-i16::MIN` is not
+        // representable, so the usable range is [0, i16::MAX].
+        let app_clamp = quant.app_clamp.max(0);
+
+        // Messages start at zero; the posterior starts at the channel value,
+        // brought inside the format's range so the kernel invariant
+        // |app| <= app_clamp holds from the first layer on.
+        for r in edge_r.iter_mut().take(edge_count) {
+            *r = 0;
+        }
+        for slot in app.iter_mut() {
+            *slot = (*slot).clamp(-app_clamp, app_clamp);
+        }
+
+        // Per-z scratch, sized for the largest valid 3GPP lifting size.
+        // Stack cost: 384 * 3 = 1.1 KiB. Aligned for the same reason the f32
+        // path aligns its scratch, though the fixed-point AVX2 kernel uses
+        // unaligned accesses throughout and does not depend on it.
+        const Z_MAX: usize = 384;
+        #[repr(align(64))]
+        struct Align64I8([i8; Z_MAX]);
+        #[repr(align(64))]
+        struct Align64U8([u8; Z_MAX]);
+        let mut min1_buf = Align64I8([MSG_MAX; Z_MAX]);
+        let mut min2_buf = Align64I8([MSG_MAX; Z_MAX]);
+        let mut sxor_buf = Align64U8([0u8; Z_MAX]);
+        let min1_buf = &mut min1_buf.0;
+        let min2_buf = &mut min2_buf.0;
+        let sxor_buf = &mut sxor_buf.0;
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = matches!(kernel, KernelChoice::Auto) && is_x86_feature_detected!("avx2");
+
+        let mut iters_used = 0usize;
+        for _ in 0..iterations {
+            iters_used += 1;
+            for layer in 0..self.params.num_row_blocks {
+                let layer_begin = self.params.layer_offsets[layer];
+                let layer_end = self.params.layer_offsets[layer + 1];
+                let row_degree = layer_end - layer_begin;
+
+                let q_row = &mut layer_scratch[..row_degree * z];
+                let min1 = &mut min1_buf[..z];
+                let min2 = &mut min2_buf[..z];
+                let sxor = &mut sxor_buf[..z];
+
+                // ── Q-build: V→C messages for this layer ─────────────────
+                for edge in 0..row_degree {
+                    let col_block = self.params.submatrix_cols[layer_begin + edge];
+                    let shift = self.params.submatrix_shifts[layer_begin + edge] as usize;
+                    let base_edge = (layer_begin + edge) * z;
+                    let var_base = col_block * z;
+                    let q_base = edge * z;
+
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx2 {
+                        unsafe {
+                            crate::simd_avx2::q_build_edge_i8_avx2(
+                                z, shift, var_base, q_base, base_edge, app, edge_r, q_row,
+                            );
+                        }
+                        continue;
+                    }
+
+                    for z_idx in 0..z {
+                        let s = z_idx + shift;
+                        let var_idx = var_base + if s >= z { s - z } else { s };
+                        let d = app[var_idx] as i32 - edge_r[base_edge + z_idx] as i32;
+                        q_row[q_base + z_idx] = d.clamp(-(MSG_MAX as i32), MSG_MAX as i32) as i8;
+                    }
+                }
+
+                // ── Passes 1+2: SIMD or scalar ───────────────────────────
+                // Degree-0 and degree-1 layers are routed to the scalar path,
+                // which carries the fix-up for "there is no second smallest
+                // magnitude"; no 3GPP or 802.11 base graph has one.
+                #[cfg(target_arch = "x86_64")]
+                if use_avx2 && row_degree >= 2 {
+                    unsafe {
+                        crate::simd_avx2::decode_layer_passes_i8_avx2(
+                            z,
+                            row_degree,
+                            beta_q,
+                            app_clamp,
+                            q_row,
+                            edge_r,
+                            layer_begin,
+                            &self.params.submatrix_cols,
+                            &self.params.submatrix_shifts,
+                            app,
+                            min1,
+                            min2,
+                            sxor,
+                        );
+                    }
+                    continue;
+                }
+
+                {
+                    // Pass 1: min1 / min2 / sign-XOR across the layer's edges.
+                    // MSG_MAX is the true upper bound on |q|, so initialising
+                    // to it is a correct starting value rather than an
+                    // out-of-range sentinel needing a fix-up afterwards.
+                    min1.iter_mut().for_each(|v| *v = MSG_MAX);
+                    min2.iter_mut().for_each(|v| *v = MSG_MAX);
+                    sxor.iter_mut().for_each(|v| *v = 0);
+
+                    for edge in 0..row_degree {
+                        let q_base = edge * z;
+                        for z_idx in 0..z {
+                            let q = q_row[q_base + z_idx];
+                            // |q| never overflows: q was clamped to
+                            // [-MSG_MAX, MSG_MAX] above, so -128 is unreachable.
+                            let a = q.saturating_abs();
+                            sxor[z_idx] ^= (q as u8) & 0x80;
+                            let m1 = min1[z_idx];
+                            min1[z_idx] = m1.min(a);
+                            min2[z_idx] = min2[z_idx].min(m1.max(a));
+                        }
+                    }
+
+                    if row_degree < 2 {
+                        // A layer with fewer than two edges has no "second
+                        // smallest", which in the f32 kernel shows up as an
+                        // unconsumed f32::MAX sentinel. Mirror its
+                        // convention so the two number formats do not
+                        // disagree on a degenerate graph.
+                        for z_idx in 0..z {
+                            if row_degree == 0 {
+                                min1[z_idx] = 0;
+                            }
+                            min2[z_idx] = min1[z_idx];
+                        }
+                    }
+
+                    // Pass 2: new R, then delta-update the posterior.
+                    for edge in 0..row_degree {
+                        let col_block = self.params.submatrix_cols[layer_begin + edge];
+                        let shift = self.params.submatrix_shifts[layer_begin + edge] as usize;
+                        let base_edge = (layer_begin + edge) * z;
+                        let var_base = col_block * z;
+                        let q_base = edge * z;
+                        for z_idx in 0..z {
+                            let q = q_row[q_base + z_idx];
+                            let a = q.saturating_abs();
+                            let sign_excl = sxor[z_idx] ^ ((q as u8) & 0x80);
+                            let min_excl = if a == min1[z_idx] {
+                                min2[z_idx]
+                            } else {
+                                min1[z_idx]
+                            };
+                            // Both operands are in [0, MSG_MAX], so this
+                            // stays inside i8 without saturation.
+                            let mag = (min_excl - beta_q).max(0);
+                            // Branch-free two's-complement negate: `neg` is
+                            // 0 or -1 (all ones), and `(mag ^ neg) - neg` is
+                            // `mag` or `-mag`. A `if sign_excl != 0` here
+                            // would be a coin-flip branch at low SNR, and
+                            // measurably was: the mispredictions cost more
+                            // than the whole vector saving at Z = 128, where
+                            // the per-run tails are a quarter of every layer.
+                            let neg = (sign_excl as i8) >> 7;
+                            let new_r = (mag ^ neg).wrapping_sub(neg);
+                            let old_r = edge_r[base_edge + z_idx];
+                            edge_r[base_edge + z_idx] = new_r;
+                            let delta = new_r as i16 - old_r as i16;
+                            let s = z_idx + shift;
+                            let var_idx = var_base + if s >= z { s - z } else { s };
+                            app[var_idx] = app[var_idx]
+                                .saturating_add(delta)
+                                .clamp(-app_clamp, app_clamp);
+                        }
+                    }
+                } // end scalar fallback
+            }
+
+            if self.check_syndrome_i16(app) {
+                break;
+            }
+        }
+
+        for i in 0..n {
+            hard_output[i] = (app[i] < 0) as u8;
+        }
+
+        Ok(iters_used)
+    }
+
+    /// Fixed-point counterpart of [`QcLdpcDecoder::check_syndrome_f32`]:
+    /// whether every parity equation is satisfied by the hard decisions
+    /// implied by the `i16` posterior.
+    ///
+    /// No heap allocation; runs in $O(\text{total\\_edges} \cdot Z)$ and
+    /// stops at the first failed check.
+    fn check_syndrome_i16(&self, app: &[i16]) -> bool {
+        let z = self.params.z;
+        for layer in 0..self.params.num_row_blocks {
+            let layer_begin = self.params.layer_offsets[layer];
+            let layer_end = self.params.layer_offsets[layer + 1];
+            let row_degree = layer_end - layer_begin;
+            for z_idx in 0..z {
+                let mut parity = 0u8;
+                for edge in 0..row_degree {
+                    let col = self.params.submatrix_cols[layer_begin + edge];
+                    let shift = self.params.submatrix_shifts[layer_begin + edge] as usize;
+                    let s = z_idx + shift;
+                    let var = col * z + if s >= z { s - z } else { s };
+                    parity ^= (app[var] < 0) as u8;
                 }
                 if parity != 0 {
                     return false;

@@ -137,11 +137,11 @@ syndrome/
 │   │   ── 5G NR TS 38.212 transport-block chain ──────────────────────
 │   ├── crc.rs              — CRC-24A/B/C/16/11/6 (§5.1 generator polynomials)
 │   ├── segmentation.rs     — Code block segmentation + BG selection (§5.2.2)
-│   ├── qc_ldpc.rs          — LOMS QC-LDPC encoder + decoder, BG1/BG2, SIMD
+│   ├── qc_ldpc.rs          — LOMS QC-LDPC encoder + decoder, BG1/BG2, SIMD, f32 + int8
 │   ├── rate_matching.rs    — Bit selection, interleaving, RV starting offsets (§5.4.2)
 │   ├── harq.rs             — Soft-combining LLR accumulator across HARQ rounds
 │   ├── transport_block.rs  — DlSchEncoder / DlSchDecoder (full TB chain)
-│   ├── quantize.rs         — f32 → i8 LLR quantization (scale + clamp, −127..127)
+│   ├── quantize.rs         — Fixed-point LDPC format: f32 → i8 messages, i16 posterior (§5.2.2)
 │   │
 │   │   ── Multi-standard FEC cores ──────────────────────────────────
 │   ├── viterbi.rs          — Rate-1/2 K=7 Viterbi (hard Hamming ACS + soft max-log-MAP, zero-tail + tail-biting)
@@ -398,19 +398,21 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (425 tests total on x86-64; 423 on AArch64)
+### 4.1 Component coverage (450 tests total on x86-64; 448 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 235 (x86-64) / 233 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 239 (x86-64) / 237 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
+| int8 LDPC kernel equivalence (scalar vs AVX2, bit-for-bit) | 8 | `tests/ldpc_int8_kernel_equivalence.rs` |
+| int8 quantization-loss gates (paired BLER, confidence intervals) | 3 (+3 study runs, `#[ignore]`d) | `tests/ldpc_int8_quantization_loss.rs` |
 | Wi-Fi LDPC integration (encode→AWGN→decode, all 12 (Z,R)) | 3 | `tests/wifi_ldpc_integration.rs` |
 | Wi-Fi shortening/puncturing integration (encode→AWGN→decode, all 12 (Z,R)) | 2 | `tests/wifi_shortening_puncturing_integration.rs` |
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
-| Doctests | 118 | `///` examples in all public API |
+| Doctests | 128 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
@@ -700,6 +702,77 @@ investigation also found a genuine small bug — the pipeline worker was
 zeroing its ~474 KiB extrinsic buffer before every decode call
 (`ldpc_pipeline.rs`), redundant with the decoder already doing so internally
 — now removed.
+
+### 5.2.2 Fixed-point (int8) decode path — what 8-bit messages cost
+
+The decoder has a second number format. `decode_layered_offset_min_sum_i8`
+runs the same layered offset min-sum algorithm with 8-bit check-to-variable
+messages and a 16-bit a-posteriori accumulator, which lets its AVX2 kernel
+work 32 z-positions per 256-bit register instead of the 8 the `f32` kernel
+gets. `bench/results/ldpc_rust.json` carries the timings for both formats
+(`loms_i8_runtime_simd` and `loms_i8_scalar` alongside the `f32` rows);
+regenerate it with `cargo run --release --bin ldpc_bench_export` on an idle
+machine, since §5.0's variance note applies with particular force to a kernel
+this short.
+
+Quantization is lossy, so the question that decides whether the fixed-point
+path is usable is how much extra $E_b/N_0$ it needs to reach the same block
+error rate. `tests/ldpc_int8_quantization_loss.rs` measures exactly that, on
+this crate's own decoders, over the BPSK AWGN channel of
+[`channel_sim`](src/channel_sim.rs) with $s = 8$, $\beta = 0.5$ and 10
+iterations:
+
+| Code | $E_b/N_0$ | SNR shift vs. `f32` | 95% CI |
+|---|---|---|---|
+| BG1, $Z = 128$ | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
+| BG1, $Z = 384$ | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
+| BG2, $Z = 128$ | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
+| BG2, $Z = 384$ | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
+
+Every interval excludes zero, so the loss is real rather than lost in noise —
+and it is between 0.003 and 0.010 dB, with every upper bound below 0.013 dB.
+
+Resolving a hundredth of a dB needs two things. The trials are **paired**:
+each draws one channel realisation and hands the same received vector to both
+decoders, so the channel's variance cancels and only the trials the two
+disagree on carry information about the difference. And the waterfall is
+steep — of order 10 nats per dB for these codes — so a 0.01 dB displacement
+still moves the block error rate by about 10%, which a few thousand error
+events resolve comfortably. The dB figure is a block-error-rate ratio divided
+by the waterfall's locally measured slope; the test module states that
+assumption and the interval arithmetic behind it.
+
+Two format decisions in that file are measurements rather than assertions,
+the same standard §5.3's $\beta$ is held to:
+
+- **The posterior is wider than the messages.** A message magnitude is
+  bounded by the smallest incoming magnitude in its layer, so 8 bits is a
+  real ceiling. A posterior is a *sum* — the channel LLR plus one message per
+  incident edge, up to 31 terms for BG1 column 0 — and clamping it to the
+  message range does not cost a constant factor, it produces an error floor:
+  on BG1 $Z = 128$ at 0.8 dB it roughly doubles the block error rate (0.165
+  to 0.312) and raises the bit error rate about eightyfold. The same sweep
+  shows how little width is needed — every clamp from 255 upward is
+  bit-identical to unclamped — so the 16-bit accumulator is the natural type
+  for a nine-bit quantity, not a hedge.
+- **The scale.** Too small and the LLR distribution is coarsely resolved, too
+  large and its tails clip. The sweep finds a broad plateau: on both base
+  graphs every $s$ from 8 to 24 is indistinguishable, while $s = 2$ and
+  $s = 32$ are resolvably worse. The default sits at the plateau's lower edge
+  because the optimum falls as the operating $E_b/N_0$ rises.
+
+Scope, stated rather than implied: the shift is measured on BPSK AWGN in the
+waterfall at the operating points above, and a different rate, modulation or
+fading model needs its own run — the `#[ignore]`d studies in that file are
+what to re-run. The loss is a *decoder-input* quantization loss: the LLRs fed
+to `quantize_llr_i16` are the exact ones the `f32` path receives, so nothing
+here accounts for a receiver that also quantizes upstream. And the
+fixed-point path has no NEON kernel — on AArch64 it runs its scalar
+reference, and only the `f32` path is vectorized there.
+
+```bash
+cargo test --release --test ldpc_int8_quantization_loss -- --ignored --nocapture
+```
 
 ### 5.3 BER Waterfall (5G NR BG1)
 

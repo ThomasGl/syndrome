@@ -8,6 +8,13 @@
 //! extended binary Golay code, IEEE 802.11 Wi-Fi LDPC with shortening and
 //! puncturing, and the Bluetooth FEC profiles (LE Coded PHY, BR/EDR).
 //!
+//! The QC-LDPC decoder has two number formats: an `f32` path with AVX2 and
+//! NEON kernels, and a fixed-point path carrying `i8` messages in a 16-bit
+//! posterior, with an AVX2 kernel that works 32 lanes at a time. There is no
+//! NEON kernel for the fixed-point path — on AArch64 it runs its scalar
+//! reference. `tests/ldpc_int8_quantization_loss.rs` measures what the
+//! fixed-point format costs in error-rate terms.
+//!
 //! Designed for zero-allocation hot paths, AVX2 (x86-64) and NEON (AArch64)
 //! SIMD acceleration, and lock-free SPSC pipeline concurrency.
 
@@ -66,7 +73,7 @@ pub use harq::HarqBuffer;
 pub use ldpc_pipeline::{LdpcFrame, LdpcPipeline};
 pub use polar::{PolarDecoder, PolarEncoder};
 pub use qc_ldpc::{BaseGraph, LdpcWorkspace, QcLdpcDecoder, QcLdpcEncoder};
-pub use quantize::{dequantize_llr, quantize_llr};
+pub use quantize::{QuantParams, dequantize_llr, quantize_llr, quantize_llr_i16};
 pub use rate_matching::{rate_dematch_llr, rate_match};
 pub use reed_solomon::ReedSolomon;
 pub use segmentation::{SegmentationParams, compute_segmentation, segment};
