@@ -16,8 +16,12 @@
 //! $$
 //! where $g_0, g_1$ are the generator polynomials in binary.
 //!
-//! The decoder recovers the maximum-likelihood input sequence by searching all
-//! $2^{K-1}$ states with an ACS forward pass followed by a traceback.
+//! The decoder recovers the maximum-likelihood input *sequence* by searching
+//! all $2^{K-1}$ states with an ACS forward pass followed by a traceback.
+//! "Maximum likelihood" is a claim with limits — it is sequence-optimal
+//! rather than bit-optimal, holds only under the channel model each branch
+//! metric assumes, and does not extend to the tail-biting decoder; see
+//! "What 'maximum likelihood' means here" below before relying on it.
 //!
 //! # Trellis intuition: Add-Compare-Select (ACS)
 //!
@@ -60,10 +64,84 @@
 //!
 //! # Zero termination
 //!
-//! The encoder is assumed to start and end in state 0 (zero-terminated frame):
-//! $(K-1)$ tail zeros are appended to the information bits before encoding.
-//! The decoder exploits this: the traceback always starts from state 0 at the
-//! end of the trellis.
+//! [`ViterbiDecoder::encode`]/[`decode_hard`](ViterbiDecoder::decode_hard)/
+//! [`decode_soft`](ViterbiDecoder::decode_soft) assume the encoder starts
+//! *and* ends in state 0 (zero-terminated frame): $(K-1)$ tail zeros are
+//! appended to the information bits before encoding, and the decoder
+//! exploits this by always starting its traceback from state 0 at the end
+//! of the trellis.
+//!
+//! # Tail-biting (WAVA)
+//!
+//! [`ViterbiDecoder::encode_tail_biting`]/
+//! [`decode_hard_tail_biting`](ViterbiDecoder::decode_hard_tail_biting)/
+//! [`decode_soft_tail_biting`](ViterbiDecoder::decode_soft_tail_biting)
+//! implement the other framing convention this module's header names as a
+//! target use case: LTE PDCCH/PBCH-style tail-biting, where the encoder's
+//! register is *pre-loaded* with the last $K-1$ message bits (instead of
+//! being reset to 0) so that the trellis's start and end state coincide —
+//! but that shared state is data-dependent and unknown to the receiver, so
+//! the zero-terminated decoder's "always trace back from state 0" shortcut
+//! does not apply.
+//!
+//! The decoder instead runs the **Wrap-Around Viterbi Algorithm (WAVA)**
+//! (Cox & Sundberg, *"An efficient adaptive circular Viterbi algorithm for
+//! decoding generalized tailbiting convolutional codes"*, IEEE Trans.
+//! Vehicular Technology, 1994): initialize every state's path metric
+//! equally (the true start state is unknown), run the ordinary ACS
+//! recursion once across the full block, and check whether the state with
+//! the best final metric is *self-consistent* — whether tracing back from
+//! it through that pass reproduces that same state as the implied starting
+//! state. A self-consistent path is, by construction, a closed loop around
+//! the circular trellis and therefore a valid tail-biting codeword. If the
+//! check fails, the previous pass's ending metrics are carried forward
+//! (never reset) as the next pass's starting metrics — equivalent to
+//! continuing around the same circular trellis for another lap — and the
+//! consistency check is retried, up to a small capped number of laps before
+//! settling for the best candidate found. This wrapper reuses the exact
+//! same per-step ACS kernels (scalar and AVX2/NEON) as the zero-terminated
+//! path; only the initial metric vector and the number of passes differ.
+//!
+//! # What "maximum likelihood" means here, and where it stops applying
+//!
+//! "Maximum likelihood" above is a precise claim with precise limits, and
+//! the differences matter when choosing between this decoder and the
+//! [`crate::turbo`] BCJR:
+//!
+//! * **Sequence, not bit.** Viterbi is maximum-likelihood *sequence*
+//!   detection (MLSD): it returns the single most likely transmitted
+//!   sequence, minimizing the probability that the whole sequence is wrong.
+//!   It does **not** minimize the per-bit error probability, and it produces
+//!   no per-bit reliability. The decoder that minimizes bit error
+//!   probability is the bitwise-MAP (BCJR) decoder in [`crate::turbo`],
+//!   which computes a posterior for each bit separately. The two disagree:
+//!   the bit-by-bit most likely values need not form the most likely
+//!   sequence, nor vice versa. Use Viterbi when the whole frame is accepted
+//!   or rejected together; use BCJR when soft output feeds a further
+//!   decoding stage.
+//!
+//! * **Only under the metric's own channel model.** ML is a statement
+//!   relative to a channel. The hard-decision path's Hamming-distance
+//!   metric is the ML metric for a binary symmetric channel with crossover
+//!   probability $p < 1/2$, and for nothing else — feed it the output of a
+//!   channel it does not describe and "minimum Hamming distance" stops
+//!   coinciding with "most likely". The soft path's correlation metric is
+//!   the ML metric for BPSK over AWGN, which is where the LLRs from
+//!   [`crate::channel_sim::AwgnChannel`] come from. Hard decisions on a
+//!   soft channel discard information and cost roughly 2 dB; that is a
+//!   property of quantizing the input, not a defect in the search.
+//!
+//! * **Not for tail-biting.** The WAVA decoder above is explicitly **not**
+//!   guaranteed maximum-likelihood. Exact ML decoding of a tail-biting code
+//!   means finding the best circular path over all $2^{K-1}$ possible start
+//!   states, which costs a full Viterbi pass per start state. WAVA is a
+//!   well-founded approximation to that: when its self-consistency check
+//!   succeeds the path it returns is a valid tail-biting codeword and is
+//!   usually the ML one, but when the lap cap is reached it returns the best
+//!   candidate found rather than a certified optimum, and the returned bits
+//!   carry no flag distinguishing the two cases. The gap is small in
+//!   practice and is why WAVA is used in preference to the exhaustive
+//!   search, but it is a gap.
 //!
 //! # Examples
 //!
@@ -663,13 +741,98 @@ fn default_generators(k: usize) -> (u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Decode scratch (preallocated, shared by all four decode paths)
+// Scalar ACS step (shared reference kernel)
+// ---------------------------------------------------------------------------
+//
+// These two functions are the state-by-state (non-butterfly-grouped) ACS
+// recursion for one trellis step, extracted so both the zero-terminated
+// scalar decoders (`decode_hard_scalar`/`decode_soft_scalar`) and the
+// tail-biting WAVA scalar decoders below call the exact same reference
+// logic rather than duplicating it. The two call sites differ only in how
+// `cur_met` is initialised before the recursion runs (state 0 known vs. all
+// states equally likely) and in how many times the recursion is repeated
+// over the same input, never in the per-step math itself.
+
+/// One scalar trellis step of the hard-decision (Hamming-metric) ACS
+/// recursion. `cur_met`/`nxt_met` are length-`n_states` metric arrays;
+/// `traceback_row` is the length-`n_states` traceback row for this step
+/// (previous state that won each next-state). `r0`/`r1` are this step's
+/// received hard bits. Mirrors [`avx2_acs::acs_step_hard`] /
+/// [`neon_acs::acs_step_hard`] one state at a time instead of in
+/// butterfly-grouped SIMD lanes.
+fn acs_step_hard_scalar(
+    trellis: &TrellisTable,
+    cur_met: &[u32],
+    nxt_met: &mut [u32],
+    traceback_row: &mut [u8],
+    r0: u8,
+    r1: u8,
+) {
+    const INF: u32 = u32::MAX / 2;
+    nxt_met.iter_mut().for_each(|m| *m = INF);
+    for s in 0..trellis.n_states {
+        if cur_met[s] == INF {
+            continue;
+        }
+        for b in 0..2usize {
+            let ns = trellis.next_state[s * 2 + b] as usize;
+            let o0 = trellis.out0[s * 2 + b];
+            let o1 = trellis.out1[s * 2 + b];
+            let bm = ((r0 ^ o0) + (r1 ^ o1)) as u32;
+            let new = cur_met[s].saturating_add(bm);
+            if new < nxt_met[ns] {
+                nxt_met[ns] = new;
+                traceback_row[ns] = s as u8;
+            }
+        }
+    }
+}
+
+/// One scalar trellis step of the soft-decision (max-log-MAP) ACS
+/// recursion. Mirrors [`acs_step_hard_scalar`] with $\pm 1$-weighted LLR
+/// branch metrics $\mathrm{bm} = (1-2c_0)L_0 + (1-2c_1)L_1$ in place of
+/// Hamming distance, and a max- rather than min-merge. Mirrors
+/// [`avx2_acs::acs_step_soft`] / [`neon_acs::acs_step_soft`] one state at a
+/// time instead of in butterfly-grouped SIMD lanes.
+fn acs_step_soft_scalar(
+    trellis: &TrellisTable,
+    cur_met: &[f32],
+    nxt_met: &mut [f32],
+    traceback_row: &mut [u8],
+    l0: f32,
+    l1: f32,
+) {
+    nxt_met.iter_mut().for_each(|m| *m = f32::NEG_INFINITY);
+    for s in 0..trellis.n_states {
+        if cur_met[s] == f32::NEG_INFINITY {
+            continue;
+        }
+        for b in 0..2usize {
+            let ns = trellis.next_state[s * 2 + b] as usize;
+            let o0 = trellis.out0[s * 2 + b] as f32;
+            let o1 = trellis.out1[s * 2 + b] as f32;
+            let bm = (1.0 - 2.0 * o0) * l0 + (1.0 - 2.0 * o1) * l1;
+            let new = cur_met[s] + bm;
+            if new > nxt_met[ns] {
+                nxt_met[ns] = new;
+                traceback_row[ns] = s as u8;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode scratch (preallocated, shared by every decode path)
 // ---------------------------------------------------------------------------
 
-/// Preallocated scratch shared by `decode_hard`/`decode_soft` (scalar and
-/// AVX2 variants), replacing the original per-call `vec![...; n_states]` /
-/// `vec![0u8; n_states * t_max]` allocations (mirrors the pattern already
-/// used by [`crate::turbo::TurboDecoder`]'s constructor-time scratch).
+/// Preallocated scratch shared by `decode_hard`/`decode_soft` (scalar,
+/// AVX2, and NEON variants) and their tail-biting/WAVA counterparts
+/// (`decode_{hard,soft}_tail_biting_{scalar,avx2,neon}`, which run the same
+/// per-step recursion for possibly several laps over this same scratch
+/// rather than needing scratch of their own), replacing the original
+/// per-call `vec![...; n_states]` / `vec![0u8; n_states * t_max]`
+/// allocations (mirrors the pattern already used by
+/// [`crate::turbo::TurboDecoder`]'s constructor-time scratch).
 ///
 /// `cur_met_*`/`nxt_met_*` are exactly `n_states` long, fixed for the
 /// lifetime of a [`ViterbiDecoder`] (constraint length never changes after
@@ -741,9 +904,15 @@ impl ViterbiScratch {
 
 /// Rate-1/2 Viterbi convolutional decoder.
 ///
-/// Decodes zero-terminated frames encoded with the matching convolutional
-/// encoder.  Supports both hard-decision (Hamming-metric) and soft-decision
-/// (max-log-MAP branch metric) modes.
+/// Decodes both zero-terminated frames ([`decode_hard`](Self::decode_hard)/
+/// [`decode_soft`](Self::decode_soft), encoded with [`encode`](Self::encode))
+/// and tail-biting frames
+/// ([`decode_hard_tail_biting`](Self::decode_hard_tail_biting)/
+/// [`decode_soft_tail_biting`](Self::decode_soft_tail_biting), encoded with
+/// [`encode_tail_biting`](Self::encode_tail_biting); see the module doc's
+/// "Tail-biting (WAVA)" section). Supports both hard-decision
+/// (Hamming-metric) and soft-decision (max-log-MAP branch metric) modes in
+/// either framing.
 pub struct ViterbiDecoder {
     /// Constraint length $K$.  The encoder register holds $K-1$ bits.
     pub constraint_length: usize,
@@ -754,6 +923,16 @@ pub struct ViterbiDecoder {
     /// non-reentrant use per call).
     scratch: std::cell::RefCell<ViterbiScratch>,
 }
+
+/// Maximum number of WAVA "laps" (full passes around the circular block,
+/// each continuing rather than resetting the ACS metrics — see the module
+/// doc's "Tail-biting (WAVA)" section) attempted before giving up on
+/// self-consistency and returning the best candidate found. 4 laps is the
+/// usual figure cited for WAVA in the tail-biting decoding literature:
+/// self-consistency is overwhelmingly reached within the first 1-2 laps in
+/// practice (this crate's own tests never need more), so this is a safety
+/// cap on pathological inputs, not a tuned performance parameter.
+const WAVA_MAX_LAPS: usize = 4;
 
 impl ViterbiDecoder {
     /// Create a decoder for a rate-1/2, constraint-length `k` code using the
@@ -882,6 +1061,88 @@ impl ViterbiDecoder {
         coded
     }
 
+    /// Encode `info` bits as a **tail-biting** rate-1/2 convolutional stream
+    /// (LTE PDCCH/PBCH-style — see the module doc's "Tail-biting" section).
+    ///
+    /// Unlike [`encode`](Self::encode), no tail bits are appended: the
+    /// encoder's $(K-1)$-bit shift register is instead *pre-loaded*, before
+    /// the first bit is encoded, with the last $K-1$ bits of `info` (the
+    /// standard tail-biting construction). Concretely, per the state
+    /// convention `TrellisTable::build` uses (new input enters the *most
+    /// significant* bit, oldest retained bit is the least significant —
+    /// $\mathrm{ns}(s, b) = (b \ll (K-2)) \mathrel{|} (s \gg 1)$), the
+    /// preload state's bit $i$ (for $i = 0 \dots K-2$) is set to
+    /// `info[info.len() - (K-1) + i]`, i.e. the same $(K-1)$-bit value the
+    /// shift register would hold immediately *after* encoding those bits in
+    /// their normal position at the end of the message.
+    ///
+    /// Because a shift register's state after $\geq K-1$ steps depends only
+    /// on the most recent $K-1$ inputs (not on the state it started in),
+    /// encoding the full message from this preload deterministically ends
+    /// back in that same preload state — the defining property of a
+    /// tail-biting code: the trellis's start and end state coincide, even
+    /// though the receiver does not know in advance what that state is (see
+    /// [`decode_hard_tail_biting`](Self::decode_hard_tail_biting) /
+    /// [`decode_soft_tail_biting`](Self::decode_soft_tail_biting), which
+    /// recover it via the Wrap-Around Viterbi Algorithm).
+    ///
+    /// A public method (rather than test-only) because callers implementing
+    /// a tail-biting profile (e.g. LTE PDCCH) need to produce tail-biting
+    /// codewords, not just decode them.
+    ///
+    /// # Arguments
+    ///
+    /// * `info` - Information bits (values `0`/`1`); length must be at least
+    ///   $K-1$ (there must be enough bits to pre-load the register).
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` of length `2 * info.len()` — no tail overhead, unlike
+    /// [`encode`](Self::encode).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if `info.len() < K - 1`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::viterbi::ViterbiDecoder;
+    /// let dec = ViterbiDecoder::new(7).unwrap();
+    /// let info: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 0, 1];
+    /// let coded = dec.encode_tail_biting(&info).unwrap();
+    /// assert_eq!(coded.len(), 2 * info.len()); // no tail, unlike `encode`
+    /// ```
+    pub fn encode_tail_biting(&self, info: &[u8]) -> Result<Vec<u8>, FecError> {
+        let k = self.constraint_length;
+        let reg_len = k.saturating_sub(1);
+        if info.len() < reg_len {
+            return Err(FecError::InvalidParam(
+                "tail-biting encode requires at least K-1 info bits to pre-load the register",
+            ));
+        }
+        let n = info.len();
+        let mut state = 0usize;
+        // Bit i of the preload state = info[n - reg_len + i]: bit (reg_len-1)
+        // (MSB) is the *last* message bit (most recently shifted in, per
+        // `TrellisTable::build`'s `ns = (b << (K-2)) | (s >> 1)` convention),
+        // bit 0 (LSB) is the oldest of the K-1 retained bits.
+        for i in 0..reg_len {
+            let bit = (info[n - reg_len + i] & 1) as usize;
+            state |= bit << i;
+        }
+        let mut coded = Vec::with_capacity(n * 2);
+        for &bit in info {
+            let b = (bit & 1) as usize;
+            let o0 = self.trellis.out0[state * 2 + b];
+            let o1 = self.trellis.out1[state * 2 + b];
+            coded.push(o0);
+            coded.push(o1);
+            state = self.trellis.next_state[state * 2 + b] as usize;
+        }
+        Ok(coded)
+    }
+
     /// Hard-decision Viterbi decode.
     ///
     /// `coded` must contain flat pairs `[c0, c1, c0, c1, …]` of 0/1 values
@@ -948,23 +1209,8 @@ impl ViterbiDecoder {
         for t in 0..t_max {
             let r0 = coded[2 * t] & 1;
             let r1 = coded[2 * t + 1] & 1;
-            nxt_met.iter_mut().for_each(|m| *m = INF);
-            for s in 0..n_states {
-                if cur_met[s] == INF {
-                    continue;
-                }
-                for b in 0..2usize {
-                    let ns = self.trellis.next_state[s * 2 + b] as usize;
-                    let o0 = self.trellis.out0[s * 2 + b];
-                    let o1 = self.trellis.out1[s * 2 + b];
-                    let bm = ((r0 ^ o0) + (r1 ^ o1)) as u32;
-                    let new = cur_met[s].saturating_add(bm);
-                    if new < nxt_met[ns] {
-                        nxt_met[ns] = new;
-                        traceback[t * n_states + ns] = s as u8;
-                    }
-                }
-            }
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            acs_step_hard_scalar(&self.trellis, cur_met, nxt_met, row, r0, r1);
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
@@ -1158,24 +1404,8 @@ impl ViterbiDecoder {
         for t in 0..t_max {
             let l0 = llr[2 * t];
             let l1 = llr[2 * t + 1];
-            nxt_met.iter_mut().for_each(|m| *m = f32::NEG_INFINITY);
-            for s in 0..n_states {
-                if cur_met[s] == f32::NEG_INFINITY {
-                    continue;
-                }
-                for b in 0..2usize {
-                    let ns = self.trellis.next_state[s * 2 + b] as usize;
-                    let o0 = self.trellis.out0[s * 2 + b] as f32;
-                    let o1 = self.trellis.out1[s * 2 + b] as f32;
-                    // Max-log-MAP: (1-2*c)*LLR, positively correlated with correctness.
-                    let bm = (1.0 - 2.0 * o0) * l0 + (1.0 - 2.0 * o1) * l1;
-                    let new = cur_met[s] + bm;
-                    if new > nxt_met[ns] {
-                        nxt_met[ns] = new;
-                        traceback[t * n_states + ns] = s as u8;
-                    }
-                }
-            }
+            let row = &mut traceback[t * n_states..(t + 1) * n_states];
+            acs_step_soft_scalar(&self.trellis, cur_met, nxt_met, row, l0, l1);
             core::mem::swap(&mut cur_met, &mut nxt_met);
         }
 
@@ -1321,6 +1551,497 @@ impl ViterbiDecoder {
         self.traceback_from_zero(t_max, n_info, &traceback[..n_states * t_max])
     }
 
+    /// Hard-decision Viterbi decode of a **tail-biting** frame (LTE
+    /// PDCCH/PBCH-style; see the module doc's "Tail-biting (WAVA)" section).
+    ///
+    /// Unlike [`decode_hard`](Self::decode_hard), `coded` carries no
+    /// zero-tail (it must be the direct output of
+    /// [`encode_tail_biting`](Self::encode_tail_biting) or an equivalent
+    /// tail-biting encoder) and the trellis's start/end state is not
+    /// assumed to be 0 — it is recovered by the Wrap-Around Viterbi
+    /// Algorithm (WAVA), which runs the same ACS recursion used by
+    /// [`decode_hard`](Self::decode_hard) for up to four circular passes
+    /// over `coded` until the best-metric final state is self-consistent
+    /// with its own traceback.
+    ///
+    /// # Arguments
+    ///
+    /// * `coded` - Flat `[c0, c1, c0, c1, ...]` pairs of 0/1 values, length
+    ///   a multiple of 2, with **no** zero-tail appended.
+    ///
+    /// # Returns
+    ///
+    /// Decoded information bits, length `coded.len()/2`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::viterbi::ViterbiDecoder;
+    /// let dec = ViterbiDecoder::new(7).unwrap();
+    /// let info: Vec<u8> = vec![1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1];
+    /// let coded = dec.encode_tail_biting(&info).unwrap();
+    /// assert_eq!(dec.decode_hard_tail_biting(&coded), info);
+    /// ```
+    pub fn decode_hard_tail_biting(&self, coded: &[u8]) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+            return self.decode_hard_tail_biting_avx2(coded);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.trellis.n_states == 64 {
+            return self.decode_hard_tail_biting_neon(coded);
+        }
+        self.decode_hard_tail_biting_scalar(coded)
+    }
+
+    /// Scalar reference implementation of tail-biting hard-decision decode
+    /// (see [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)).
+    /// Kept `pub(crate)` so tests can compare it directly against the
+    /// AVX2/NEON variants, mirroring
+    /// [`decode_hard_scalar`](Self::decode_hard_scalar). Calls the exact
+    /// same [`acs_step_hard_scalar`] kernel `decode_hard_scalar` uses — the
+    /// only differences are the initial metric vector (every state starts
+    /// equally likely here, since the true start state is unknown, versus
+    /// "state 0 only" there) and that the recursion may run for more than
+    /// one pass over `coded` (a WAVA "lap") when the first pass's
+    /// best-metric state is not yet self-consistent.
+    pub(crate) fn decode_hard_tail_biting_scalar(&self, coded: &[u8]) -> Vec<u8> {
+        let n_states = self.trellis.n_states;
+        let t_max = coded.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let mut scratch = self.scratch.borrow_mut();
+        // WAVA: the true start state is unknown, so every state starts
+        // equally likely (contrast decode_hard_scalar's "state 0 only" init).
+        scratch.cur_met_u32.iter_mut().for_each(|m| *m = 0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_u32,
+            nxt_met_u32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_u32.as_mut_slice(), nxt_met_u32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let r0 = coded[2 * t] & 1;
+                let r1 = coded[2 * t + 1] & 1;
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                acs_step_hard_scalar(&self.trellis, cur_met, nxt_met, row, r0, r1);
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] < cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break; // self-consistent circular path: done
+            }
+            // Renormalize before the next lap (a uniform shift changes no
+            // ACS comparison's outcome) to keep metrics bounded across laps.
+            let floor = cur_met[best_state];
+            cur_met
+                .iter_mut()
+                .for_each(|m| *m = m.saturating_sub(floor));
+        }
+        decoded
+    }
+
+    /// AVX2-vectorised tail-biting hard-decision decode for the K=7
+    /// (64-state) trellis. Same WAVA lap structure as
+    /// [`decode_hard_tail_biting_scalar`](Self::decode_hard_tail_biting_scalar);
+    /// each step calls the identical [`avx2_acs::acs_step_hard`] kernel
+    /// used by [`decode_hard_avx2`](Self::decode_hard_avx2) (no duplicated
+    /// kernel), simply run repeatedly over the same input with the
+    /// previous lap's ending metrics carried forward as the next lap's
+    /// starting metrics.
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)
+    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// exposed as `pub(crate)` for the equivalence tests, which perform the
+    /// same check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn decode_hard_tail_biting_avx2(&self, coded: &[u8]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "AVX2 ACS path requires K=7");
+        let n_states = self.trellis.n_states;
+        let t_max = coded.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_i32.iter_mut().for_each(|m| *m = 0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_i32,
+            nxt_met_i32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_i32.as_mut_slice(), nxt_met_i32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+        let bfly = &self.trellis.bfly;
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let r0 = (coded[2 * t] & 1) as i32;
+                let r1 = (coded[2 * t + 1] & 1) as i32;
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                // SAFETY: caller guarantees AVX2 support (checked in
+                // `decode_hard_tail_biting`/test callers); `bfly.half == 32`.
+                unsafe {
+                    avx2_acs::acs_step_hard(cur_met, nxt_met, row, bfly, r0, r1);
+                }
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] < cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break;
+            }
+            let floor = cur_met[best_state];
+            cur_met.iter_mut().for_each(|m| *m -= floor);
+        }
+        decoded
+    }
+
+    /// NEON-vectorised tail-biting hard-decision decode for the K=7
+    /// (64-state) trellis. AArch64 counterpart of
+    /// [`decode_hard_tail_biting_avx2`](Self::decode_hard_tail_biting_avx2);
+    /// same WAVA lap structure and rationale, calling the identical
+    /// [`neon_acs::acs_step_hard`] kernel used by
+    /// [`decode_hard_neon`](Self::decode_hard_neon).
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)
+    /// after checking `n_states == 64`; exposed as `pub(crate)` for the
+    /// equivalence tests, which perform the same check. NEON is mandatory
+    /// on AArch64, so no runtime feature check is needed here.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn decode_hard_tail_biting_neon(&self, coded: &[u8]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "NEON ACS path requires K=7");
+        let n_states = self.trellis.n_states;
+        let t_max = coded.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_i32.iter_mut().for_each(|m| *m = 0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_i32,
+            nxt_met_i32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_i32.as_mut_slice(), nxt_met_i32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+        let bfly = &self.trellis.bfly;
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let r0 = (coded[2 * t] & 1) as i32;
+                let r1 = (coded[2 * t + 1] & 1) as i32;
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                // SAFETY: NEON is mandatory on AArch64; `bfly.half == 32`.
+                unsafe {
+                    neon_acs::acs_step_hard(cur_met, nxt_met, row, bfly, r0, r1);
+                }
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] < cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break;
+            }
+            let floor = cur_met[best_state];
+            cur_met.iter_mut().for_each(|m| *m -= floor);
+        }
+        decoded
+    }
+
+    /// Soft-decision Viterbi decode (max-log-MAP branch metric) of a
+    /// **tail-biting** frame; see [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)
+    /// for the framing contract and [`decode_soft`](Self::decode_soft) for
+    /// the LLR sign convention and branch-metric formula, both unchanged
+    /// here — only the initial metrics and the (possibly repeated) WAVA lap
+    /// structure differ.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` - Flat `[L0, L1, L0, L1, ...]` paired LLR values (see
+    ///   [`decode_soft`](Self::decode_soft)'s sign convention), length a
+    ///   multiple of 2, with **no** zero-tail appended.
+    ///
+    /// # Returns
+    ///
+    /// Decoded information bits, length `llr.len()/2`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::viterbi::ViterbiDecoder;
+    /// let dec = ViterbiDecoder::new(7).unwrap();
+    /// let info: Vec<u8> = vec![1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1];
+    /// let coded = dec.encode_tail_biting(&info).unwrap();
+    /// let llr: Vec<f32> = coded.iter().map(|&b| if b == 0 { 10.0 } else { -10.0 }).collect();
+    /// assert_eq!(dec.decode_soft_tail_biting(&llr), info);
+    /// ```
+    pub fn decode_soft_tail_biting(&self, llr: &[f32]) -> Vec<u8> {
+        #[cfg(target_arch = "x86_64")]
+        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+            return self.decode_soft_tail_biting_avx2(llr);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.trellis.n_states == 64 {
+            return self.decode_soft_tail_biting_neon(llr);
+        }
+        self.decode_soft_tail_biting_scalar(llr)
+    }
+
+    /// Scalar reference implementation of tail-biting soft-decision decode
+    /// (see [`decode_soft_tail_biting`](Self::decode_soft_tail_biting)).
+    /// Kept `pub(crate)` so tests can compare it directly against the
+    /// AVX2/NEON variants. Calls the exact same [`acs_step_soft_scalar`]
+    /// kernel `decode_soft_scalar` uses; see
+    /// [`decode_hard_tail_biting_scalar`](Self::decode_hard_tail_biting_scalar)'s
+    /// doc comment for how the WAVA wrapper differs from the single-pass
+    /// zero-terminated decoders.
+    pub(crate) fn decode_soft_tail_biting_scalar(&self, llr: &[f32]) -> Vec<u8> {
+        let n_states = self.trellis.n_states;
+        let t_max = llr.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let mut scratch = self.scratch.borrow_mut();
+        // WAVA: every state starts equally likely (contrast
+        // decode_soft_scalar's "state 0 only" init); no state is ever
+        // unreachable here, so unlike decode_soft_scalar there is no
+        // `f32::NEG_INFINITY` sentinel to seed.
+        scratch.cur_met_f32.iter_mut().for_each(|m| *m = 0.0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let l0 = llr[2 * t];
+                let l1 = llr[2 * t + 1];
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                acs_step_soft_scalar(&self.trellis, cur_met, nxt_met, row, l0, l1);
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] > cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break;
+            }
+            // Renormalize before the next lap; see
+            // `decode_hard_tail_biting_scalar`'s matching comment.
+            let ceiling = cur_met[best_state];
+            cur_met.iter_mut().for_each(|m| *m -= ceiling);
+        }
+        decoded
+    }
+
+    /// AVX2-vectorised tail-biting soft-decision (max-log-MAP) decode for
+    /// the K=7 (64-state) trellis. Same WAVA lap structure as
+    /// [`decode_soft_tail_biting_scalar`](Self::decode_soft_tail_biting_scalar);
+    /// each step calls the identical [`avx2_acs::acs_step_soft`] kernel
+    /// used by [`decode_soft_avx2`](Self::decode_soft_avx2) (no duplicated
+    /// kernel).
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_soft_tail_biting`](Self::decode_soft_tail_biting)
+    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// exposed as `pub(crate)` for the equivalence tests, which perform the
+    /// same check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn decode_soft_tail_biting_avx2(&self, llr: &[f32]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "AVX2 ACS path requires K=7");
+        let n_states = self.trellis.n_states;
+        let t_max = llr.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let bfly = &self.trellis.bfly;
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_f32.iter_mut().for_each(|m| *m = 0.0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let l0 = llr[2 * t];
+                let l1 = llr[2 * t + 1];
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                // SAFETY: caller guarantees AVX2 support (checked in
+                // `decode_soft_tail_biting`/test callers); `bfly.half == 32`.
+                unsafe {
+                    avx2_acs::acs_step_soft(
+                        cur_met,
+                        nxt_met,
+                        row,
+                        bfly,
+                        &bfly.sign0_even,
+                        &bfly.sign1_even,
+                        &bfly.sign0_odd,
+                        &bfly.sign1_odd,
+                        l0,
+                        l1,
+                    );
+                }
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] > cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break;
+            }
+            let ceiling = cur_met[best_state];
+            cur_met.iter_mut().for_each(|m| *m -= ceiling);
+        }
+        decoded
+    }
+
+    /// NEON-vectorised tail-biting soft-decision (max-log-MAP) decode for
+    /// the K=7 (64-state) trellis. AArch64 counterpart of
+    /// [`decode_soft_tail_biting_avx2`](Self::decode_soft_tail_biting_avx2);
+    /// same WAVA lap structure and rationale, calling the identical
+    /// [`neon_acs::acs_step_soft`] kernel used by
+    /// [`decode_soft_neon`](Self::decode_soft_neon).
+    ///
+    /// # Safety requirement (caller-enforced)
+    ///
+    /// Only called from [`decode_soft_tail_biting`](Self::decode_soft_tail_biting)
+    /// after checking `n_states == 64`; exposed as `pub(crate)` for the
+    /// equivalence tests, which perform the same check. NEON is mandatory
+    /// on AArch64, so no runtime feature check is needed here.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn decode_soft_tail_biting_neon(&self, llr: &[f32]) -> Vec<u8> {
+        debug_assert_eq!(self.trellis.n_states, 64, "NEON ACS path requires K=7");
+        let n_states = self.trellis.n_states;
+        let t_max = llr.len() / 2;
+        if t_max == 0 {
+            return vec![];
+        }
+
+        let bfly = &self.trellis.bfly;
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.cur_met_f32.iter_mut().for_each(|m| *m = 0.0);
+        scratch.ensure_traceback(n_states * t_max);
+        let ViterbiScratch {
+            cur_met_f32,
+            nxt_met_f32,
+            traceback,
+            ..
+        } = &mut *scratch;
+        let (mut cur_met, mut nxt_met) = (cur_met_f32.as_mut_slice(), nxt_met_f32.as_mut_slice());
+        let tb = &mut traceback[..n_states * t_max];
+
+        let mut decoded = Vec::new();
+        for _lap in 0..WAVA_MAX_LAPS {
+            for t in 0..t_max {
+                let l0 = llr[2 * t];
+                let l1 = llr[2 * t + 1];
+                let row = &mut tb[t * n_states..(t + 1) * n_states];
+                // SAFETY: NEON is mandatory on AArch64; `bfly.half == 32`.
+                unsafe {
+                    neon_acs::acs_step_soft(
+                        cur_met,
+                        nxt_met,
+                        row,
+                        bfly,
+                        &bfly.sign0_even,
+                        &bfly.sign1_even,
+                        &bfly.sign0_odd,
+                        &bfly.sign1_odd,
+                        l0,
+                        l1,
+                    );
+                }
+                core::mem::swap(&mut cur_met, &mut nxt_met);
+            }
+
+            let mut best_state = 0usize;
+            for s in 1..n_states {
+                if cur_met[s] > cur_met[best_state] {
+                    best_state = s;
+                }
+            }
+            let (bits, implied_start) = self.wava_traceback(t_max, best_state, tb);
+            decoded = bits;
+            if implied_start == best_state {
+                break;
+            }
+            let ceiling = cur_met[best_state];
+            cur_met.iter_mut().for_each(|m| *m -= ceiling);
+        }
+        decoded
+    }
+
     /// Decode hard-decision coded bits (alias for [`ViterbiDecoder::decode_hard`]).
     ///
     /// Kept for backward compatibility with the original stub API; see
@@ -1373,6 +2094,45 @@ impl ViterbiDecoder {
             s = ps;
         }
         decoded
+    }
+
+    /// Trace back `t_max` steps from `start_state` through a `traceback`
+    /// table (`n_states` columns per step, `t_max` rows — the layout
+    /// documented on [`decode_hard_scalar`](Self::decode_hard_scalar)),
+    /// returning the recovered bits — all `t_max` of them, since a
+    /// tail-biting frame carries no discardable zero-tail (contrast
+    /// [`traceback_from_zero`](Self::traceback_from_zero), which drops the
+    /// last `K-1`) — and the state the walk lands on at time 0 (the
+    /// *implied start state*).
+    ///
+    /// A tail-biting path is self-consistent exactly when this implied
+    /// start state equals `start_state`: that means the traced path forms a
+    /// closed loop around the circular trellis, exactly what a genuine
+    /// tail-biting encoding produces (see the module doc's "Tail-biting
+    /// (WAVA)" section). Shared by every `decode_{hard,soft}_tail_biting_*`
+    /// variant (scalar, AVX2, NEON), since they all build an
+    /// identically-shaped traceback table regardless of metric domain.
+    fn wava_traceback(
+        &self,
+        t_max: usize,
+        start_state: usize,
+        traceback: &[u8],
+    ) -> (Vec<u8>, usize) {
+        let n_states = self.trellis.n_states;
+        let mut decoded = vec![0u8; t_max];
+        let mut s = start_state;
+
+        for t in (0..t_max).rev() {
+            let ps = traceback[t * n_states + s] as usize;
+            let b = if self.trellis.next_state[ps * 2] as usize == s {
+                0u8
+            } else {
+                1u8
+            };
+            decoded[t] = b;
+            s = ps;
+        }
+        (decoded, s)
     }
 }
 
@@ -1644,5 +2404,278 @@ mod tests {
             decoded, info,
             "moderate-noise soft decode must still recover info bits"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tail-biting (WAVA) encode/decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tail_biting_encode_requires_min_length() {
+        // K=7 needs at least K-1=6 info bits to pre-load the register.
+        let dec = ViterbiDecoder::new(7).unwrap();
+        assert!(dec.encode_tail_biting(&[1, 0, 1, 0, 1]).is_err()); // 5 bits, too short
+        assert!(dec.encode_tail_biting(&[1, 0, 1, 0, 1, 0]).is_ok()); // exactly K-1
+    }
+
+    #[test]
+    fn tail_biting_encode_final_state_matches_preload_all_64_states() {
+        // Mechanical property test (independent of decoding): for K=7 (64
+        // states), construct messages whose last K-1=6 bits are set to
+        // encode each of the 64 possible preload states, then independently
+        // replay the encoder's own state transitions forward (via
+        // `trellis.next_state`, not `encode_tail_biting`'s internal
+        // formula) to confirm the final register state always equals the
+        // preloaded one -- the defining property of tail-biting.
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let reg_len = 6usize;
+        let mut seed = 0xABCD_1234_5678_EF01u64;
+        for state_val in 0usize..64 {
+            for _trial in 0..3 {
+                let len = 20 + (splitmix64(&mut seed) as usize % 80); // 20..=99
+                let mut info: Vec<u8> = (0..len)
+                    .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                    .collect();
+                // Force the last reg_len bits to encode `state_val` per the
+                // documented preload convention: bit i = info[n-reg_len+i].
+                let n = info.len();
+                for i in 0..reg_len {
+                    info[n - reg_len + i] = ((state_val >> i) & 1) as u8;
+                }
+                let coded = dec.encode_tail_biting(&info).unwrap();
+                assert_eq!(coded.len(), 2 * info.len());
+
+                // Independently replay the shift register forward from the
+                // documented preload state and confirm it lands back there.
+                let mut replay_state = state_val;
+                for &bit in &info {
+                    let b = (bit & 1) as usize;
+                    replay_state = dec.trellis.next_state[replay_state * 2 + b] as usize;
+                }
+                assert_eq!(
+                    replay_state, state_val,
+                    "tail-biting final state must equal preload state {state_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_biting_hard_wava_exact_recovery_all_64_start_states() {
+        // Primary correctness bar: noiseless tail-biting round trip via the
+        // WAVA decoder, across every one of the 64 possible K=7 start
+        // states, for several random messages per state.
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let reg_len = 6usize;
+        let mut seed = 0x0BAD_F00D_1357_2468u64;
+        for state_val in 0usize..64 {
+            for _trial in 0..3 {
+                let len = 20 + (splitmix64(&mut seed) as usize % 80); // 20..=99
+                let mut info: Vec<u8> = (0..len)
+                    .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                    .collect();
+                let n = info.len();
+                for i in 0..reg_len {
+                    info[n - 1 - i] = ((state_val >> i) & 1) as u8;
+                }
+                let coded = dec.encode_tail_biting(&info).unwrap();
+                let decoded = dec.decode_hard_tail_biting(&coded);
+                assert_eq!(
+                    decoded, info,
+                    "hard WAVA decode must exactly recover info bits for start state {state_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_biting_soft_wava_exact_recovery_all_64_start_states() {
+        // Noiseless soft-decision counterpart of the hard-decision test
+        // above, using the same error-free-LLR convention as
+        // `encode_decode_soft_roundtrip_k7`.
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let reg_len = 6usize;
+        let mut seed = 0x1122_3344_5566_7788u64;
+        for state_val in 0usize..64 {
+            for _trial in 0..2 {
+                let len = 20 + (splitmix64(&mut seed) as usize % 80); // 20..=99
+                let mut info: Vec<u8> = (0..len)
+                    .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                    .collect();
+                let n = info.len();
+                for i in 0..reg_len {
+                    info[n - 1 - i] = ((state_val >> i) & 1) as u8;
+                }
+                let coded = dec.encode_tail_biting(&info).unwrap();
+                let llr: Vec<f32> = coded
+                    .iter()
+                    .map(|&b| if b == 0 { 8.0 } else { -8.0 })
+                    .collect();
+                let decoded = dec.decode_soft_tail_biting(&llr);
+                assert_eq!(
+                    decoded, info,
+                    "soft WAVA decode must exactly recover info bits for start state {state_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_biting_soft_wava_ber_trends_down_with_snr() {
+        use crate::channel_sim::AwgnChannel;
+        // BER at increasing Eb/N0 should trend downward (not required to
+        // hit zero at every point -- that's not realistic on a noisy
+        // channel -- just confirm sane, monotone-ish behaviour).
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let ebno_points = [-1.0f32, 1.0, 3.0, 6.0];
+        let trials_per_point = 20u64;
+        let msg_len = 200;
+        let mut avg_bers = Vec::new();
+        let mut seed = 0x9E37_79B9_1234_5678u64;
+
+        for &ebno in &ebno_points {
+            let mut total_ber = 0.0f64;
+            for trial in 0..trials_per_point {
+                let info: Vec<u8> = (0..msg_len)
+                    .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                    .collect();
+                let coded = dec.encode_tail_biting(&info).unwrap();
+                let mut ch = AwgnChannel::new(ebno, 0.5, seed ^ trial);
+                let llr = ch.transmit(&coded);
+                let decoded = dec.decode_soft_tail_biting(&llr);
+                total_ber += AwgnChannel::bit_error_rate(&decoded, &info);
+            }
+            avg_bers.push(total_ber / trials_per_point as f64);
+        }
+
+        // Sanity: BER must be small at high Eb/N0 and clearly worse at the
+        // lowest tested Eb/N0.
+        let (lowest, highest) = (avg_bers[0], *avg_bers.last().unwrap());
+        assert!(
+            highest < lowest,
+            "BER should trend down as Eb/N0 increases: {avg_bers:?}"
+        );
+        assert!(
+            highest < 0.05,
+            "BER at the highest tested Eb/N0 should be small: {avg_bers:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AVX2/NEON vs. scalar equivalence for the tail-biting (WAVA) paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn decode_hard_tail_biting_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no AVX2");
+            return;
+        }
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0x2222_AAAA_3333_BBBBu64;
+        for trial in 0..30 {
+            let len = 50 + (splitmix64(&mut seed) as usize % 200);
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let mut coded = dec.encode_tail_biting(&info).unwrap();
+            for bit in coded.iter_mut() {
+                if splitmix64(&mut seed).is_multiple_of(20) {
+                    *bit ^= 1;
+                }
+            }
+            let scalar = dec.decode_hard_tail_biting_scalar(&coded);
+            let avx2 = dec.decode_hard_tail_biting_avx2(&coded);
+            assert_eq!(
+                scalar, avx2,
+                "trial {trial} (len={len}) tail-biting hard decode mismatch between scalar and AVX2"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn decode_soft_tail_biting_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no AVX2");
+            return;
+        }
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0x4444_CCCC_5555_DDDDu64;
+        for trial in 0..30 {
+            let len = 50 + (splitmix64(&mut seed) as usize % 200);
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let coded = dec.encode_tail_biting(&info).unwrap();
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| {
+                    let base = if b == 0 { 3.0 } else { -3.0 };
+                    let noise = (splitmix64(&mut seed) % 2401) as f32 / 1000.0 - 1.2;
+                    base + noise
+                })
+                .collect();
+            let scalar = dec.decode_soft_tail_biting_scalar(&llr);
+            let avx2 = dec.decode_soft_tail_biting_avx2(&llr);
+            assert_eq!(
+                scalar, avx2,
+                "trial {trial} (len={len}) tail-biting soft decode mismatch between scalar and AVX2"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn decode_hard_tail_biting_neon_matches_scalar() {
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0x2222_AAAA_3333_BBBBu64;
+        for trial in 0..30 {
+            let len = 50 + (splitmix64(&mut seed) as usize % 200);
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let mut coded = dec.encode_tail_biting(&info).unwrap();
+            for bit in coded.iter_mut() {
+                if splitmix64(&mut seed).is_multiple_of(20) {
+                    *bit ^= 1;
+                }
+            }
+            let scalar = dec.decode_hard_tail_biting_scalar(&coded);
+            let neon = dec.decode_hard_tail_biting_neon(&coded);
+            assert_eq!(
+                scalar, neon,
+                "trial {trial} (len={len}) tail-biting hard decode mismatch between scalar and NEON"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn decode_soft_tail_biting_neon_matches_scalar() {
+        let dec = ViterbiDecoder::new(7).unwrap();
+        let mut seed = 0x4444_CCCC_5555_DDDDu64;
+        for trial in 0..30 {
+            let len = 50 + (splitmix64(&mut seed) as usize % 200);
+            let info: Vec<u8> = (0..len)
+                .map(|_| (splitmix64(&mut seed) & 1) as u8)
+                .collect();
+            let coded = dec.encode_tail_biting(&info).unwrap();
+            let llr: Vec<f32> = coded
+                .iter()
+                .map(|&b| {
+                    let base = if b == 0 { 3.0 } else { -3.0 };
+                    let noise = (splitmix64(&mut seed) % 2401) as f32 / 1000.0 - 1.2;
+                    base + noise
+                })
+                .collect();
+            let scalar = dec.decode_soft_tail_biting_scalar(&llr);
+            let neon = dec.decode_soft_tail_biting_neon(&llr);
+            assert_eq!(
+                scalar, neon,
+                "trial {trial} (len={len}) tail-biting soft decode mismatch between scalar and NEON"
+            );
+        }
     }
 }
