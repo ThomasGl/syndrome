@@ -1,6 +1,37 @@
 <!-- KaTeX for rustdoc math. Rationale and the SRI-recompute command are in
      Cargo.toml under [package.metadata.docs.rs]; this file is copied verbatim
-     into the <head> of every generated page, so it is kept short. -->
+     into the <head> of every generated page, so it is kept short.
+
+     WRITING MATH IN DOC COMMENTS -- one rule, and it is counter-intuitive.
+     rustdoc runs the comment through CommonMark BEFORE KaTeX sees it, and
+     CommonMark drops a backslash that precedes ASCII punctuation. So a LaTeX
+     command whose next character is punctuation arrives mutilated, while one
+     followed by a letter arrives intact:
+
+         \,  \;  \!  ->  , ; !          (literal punctuation, not spacing)
+         \{  \}       ->  { }            (grouping; the braces vanish)
+         \\           ->  \              (row break lost)
+         \&            ->  &              (alignment char -> KaTeX error)
+         \_ in \text{} ->  _              (KaTeX error: `_` in text mode)
+
+     Therefore, in `///` and `//!` comments:
+       * prefer letter-only macros -- \thinspace \thickspace \negthinspace
+         \lbrace \rbrace -- which pass through untouched;
+       * where none exists, double the backslash so one survives: `\\&`, and
+         `\\_` inside \text{} / \mathrm{};
+       * write a row break as `\\\\` (four), which reaches KaTeX as `\\`;
+       * a bare `\_` OUTSIDE \text{} is correct for a subscript -- markdown
+         turns it into `_`, which is what you wanted.
+
+     This applies to rustdoc ONLY. README.md, CHANGELOG.md and
+     system_architecture.md are rendered by GitHub, whose math extension keeps
+     backslashes verbatim, so those files use ordinary LaTeX (`\,`, `\{`,
+     `_`). Do not copy either convention into the other.
+
+     To check: render every math span through KaTeX after any doc edit rather
+     than eyeballing it -- `throwOnError: false` below means a malformed
+     expression shows up as red raw source on the page instead of failing
+     loudly. -->
 <link
   rel="stylesheet"
   href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css"

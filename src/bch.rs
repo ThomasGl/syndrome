@@ -19,7 +19,7 @@
 //!
 //! Implements primitive, narrow-sense binary Bose–Chaudhuri–Hocquenghem (BCH)
 //! codes with block length $n = 255$ built over $GF(2^8)$, for a configurable
-//! error-correction capability $t \in \{1, \ldots, 10\}$. The generator
+//! error-correction capability $t \in \lbrace 1, \ldots, 10\rbrace$. The generator
 //! polynomial is computed programmatically from cyclotomic cosets of the
 //! primitive element $\alpha$ (no hardcoded coset or generator tables), the
 //! encoder is a systematic bit-serial LFSR, and the decoder is the classic
@@ -57,7 +57,7 @@
 //! $$ g(x) = \mathrm{lcm}\bigl(m_1(x), m_3(x), m_5(x), \ldots, m_{2t-1}(x)\bigr) $$
 //! where $m_i(x)$ is the minimal polynomial of $\alpha^i$ over $GF(2)$. Each
 //! $m_i(x)$ is the product $\prod_{j \in C_i} (x + \alpha^j)$ over the
-//! cyclotomic coset $C_i = \{ i \cdot 2^s \bmod 255 : s \ge 0 \}$, computed
+//! cyclotomic coset $C_i = \lbrace i \cdot 2^s \bmod 255 : s \ge 0 \rbrace$, computed
 //! with $GF(2^8)$ arithmetic (the result is provably binary since it is
 //! fixed by the Frobenius automorphism $x \mapsto x^2$). Cosets that overlap
 //! (e.g. sharing a common minimal polynomial) are only multiplied into
@@ -67,7 +67,7 @@
 //!
 //! ## Encoding (systematic)
 //!
-//! $$ c(x) = x^{n-k} \, i(x) + \bigl( x^{n-k} \, i(x) \bmod g(x) \bigr) $$
+//! $$ c(x) = x^{n-k} \thinspace i(x) + \bigl( x^{n-k} \thinspace i(x) \bmod g(x) \bigr) $$
 //! computed with a single bit-serial LFSR of width $n-k$ (mirrors
 //! [`crate::crc::Crc24::compute`], generalized to a `u128` register).
 //! Complexity: $O(k)$ LFSR steps over an $(n-k)$-bit register, i.e.
@@ -78,7 +78,7 @@
 //! 1. **Syndromes** $S_1, \ldots, S_{2t}$: $S_j = c(\alpha^j)$ via Horner's
 //!    rule. Only odd $S_j$ need a full $O(n)$ Horner evaluation; even-indexed
 //!    syndromes follow from the binary-field Frobenius identity
-//!    $S_{2i} = S_i^2$ (since $c_j \in \{0,1\}$, so $c_j^2 = c_j$), halving
+//!    $S_{2i} = S_i^2$ (since $c_j \in \lbrace 0,1\rbrace$, so $c_j^2 = c_j$), halving
 //!    the number of Horner passes. Cost: $O(n \cdot t)$.
 //! 2. **Berlekamp–Massey**: finds the minimal-degree error-locator polynomial
 //!    $\Lambda(x)$ satisfying $S_{i} + \sum_{j=1}^{L} \Lambda_j S_{i-j} = 0$
@@ -130,7 +130,7 @@ use crate::error::FecError;
 const N: usize = 255;
 /// Maximum supported error-correction capability.
 const MAX_T: usize = 10;
-/// Maximum syndrome count ($2 \cdot \text{MAX\_T}$).
+/// Maximum syndrome count ($2 \cdot \text{MAX\\_T}$).
 const MAX_TWO_T: usize = 2 * MAX_T;
 /// Maximum cyclotomic coset size in $GF(2^8)$ (divides $8 = \deg GF(2^8)$).
 const MAX_COSET: usize = 8;
@@ -163,7 +163,7 @@ fn gf_inv(exp: &[u8; 512], log: &[u8; 256], a: u8) -> u8 {
     exp[255 - la]
 }
 
-/// Cyclotomic coset of `i` modulo `255`: $\{ i \cdot 2^s \bmod 255 \}$.
+/// Cyclotomic coset of `i` modulo `255`: $\lbrace i \cdot 2^s \bmod 255 \rbrace$.
 ///
 /// Returns a fixed-size buffer and the number of valid entries.
 fn cyclotomic_coset_mod255(i: usize) -> ([usize; MAX_COSET], usize) {
@@ -488,7 +488,7 @@ impl BchCode {
     /// already has `deg g(x) = 8`), so the standard byte-at-a-time division
     /// identity applies: for register `R` (width `nk`, mask `M`) and next
     /// input byte `x` (MSB-first),
-    /// $$ R' = ((R \ll 8) \,\&\, M) \oplus T\bigl((R \gg (nk-8)) \oplus
+    /// $$ R' = ((R \ll 8) \thinspace \\&\thinspace M) \oplus T\bigl((R \gg (nk-8)) \oplus
     /// x\bigr) $$
     /// where `T` is the 256-entry `lfsr_byte_table` built once in
     /// [`BchCode::new`] (`T[y]` = the remainder of feeding the 8 bits of `y`
@@ -707,7 +707,7 @@ impl BchCode {
     /// Horner multiply chain (which forces a 255-deep sequential dependency
     /// through `gf_mul`'s data-dependent zero-check branch). Instead it uses
     /// the precomputed `syn_pow` position-power table: since codeword bits
-    /// are binary, $S_j = \bigoplus_{i:\,c_i=1} \alpha^{j(N-1-i) \bmod 255}$,
+    /// are binary, $S_j = \bigoplus_{i:\thinspace c_i=1} \alpha^{j(N-1-i) \bmod 255}$,
     /// so each position contributes independently via a branch-free
     /// table-XOR (`mask = 0 - bit` is `0x00`/`0xFF`, no data-dependent
     /// branch). Four independent accumulators break the reduction into

@@ -255,7 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_mm256_gf2p8affine_epi64_epi8`) and prefer it over the existing AVX2
   VPSHUFB nibble-table kernel when available, falling back to VPSHUFB where
   GFNI isn't present. Multiplying by a fixed `GF(256)` coefficient is
-  $\mathbb{F}\_2$-linear, so GFNI applies the coefficient's precomputed
+  $\mathbb{F}_2$-linear, so GFNI applies the coefficient's precomputed
   $8 \times 8$ bit matrix directly in one instruction per 32 bytes, instead
   of VPSHUFB's four-instruction shuffle/mask/blend sequence for the same 32
   bytes. Measured by `reed_solomon::tests::bench_gfni_vs_avx2_nibble`, which

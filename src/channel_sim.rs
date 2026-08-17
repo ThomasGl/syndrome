@@ -7,7 +7,7 @@
 //! # Signal model
 //!
 //! A BPSK symbol is mapped as:
-//! $$x = \begin{cases} +1 & \text{if bit} = 0 \\ -1 & \text{if bit} = 1 \end{cases}$$
+//! $$x = \begin{cases} +1 & \text{if bit} = 0 \\\\ -1 & \text{if bit} = 1 \end{cases}$$
 //!
 //! After passing through an AWGN channel with noise standard deviation $\sigma$:
 //! $$r = x + n, \quad n \sim \mathcal{N}(0, \sigma^2)$$
@@ -17,7 +17,7 @@
 //!
 //! The noise standard deviation is derived from the $E_b/N_0$ (energy per bit to
 //! noise spectral density ratio) and the code rate $R$:
-//! $$\sigma = \sqrt{\frac{1}{2 R \cdot 10^{E_b/N_0 \,[\text{dB}] / 10}}}$$
+//! $$\sigma = \sqrt{\frac{1}{2 R \cdot 10^{E_b/N_0 \thinspace[\text{dB}] / 10}}}$$
 
 /// BPSK AWGN channel simulator with a deterministic xorshift64 PRNG.
 ///
@@ -596,7 +596,7 @@ mod tests {
     ///
     /// The channel returns $\text{LLR} = 2r/\sigma^2$ with $r = x + n$, so
     /// with the transmitted bits known the noise is
-    /// $n = \text{LLR}\,\sigma^2/2 - x$. Recovering the noise rather than
+    /// $n = \text{LLR}\thinspace \sigma^2/2 - x$. Recovering the noise rather than
     /// inspecting LLRs directly is what lets these tests check the *noise*
     /// distribution against its specification.
     fn recover_noise(ch: &AwgnChannel, bits: &[u8], llrs: &[f32]) -> Vec<f64> {

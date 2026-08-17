@@ -9,13 +9,13 @@
 //!
 //! Each constituent encoder implements the transfer function
 //! $$ G(D) = \left[1, \frac{g_1(D)}{g_0(D)}\right], \quad
-//!    g_0(D) = 1 + D^2 + D^3 \;(\text{octal } 13), \quad
-//!    g_1(D) = 1 + D + D^3 \;(\text{octal } 15). $$
+//!    g_0(D) = 1 + D^2 + D^3 \thickspace(\text{octal } 13), \quad
+//!    g_1(D) = 1 + D + D^3 \thickspace(\text{octal } 15). $$
 //! The 3-bit shift register $s = (s_0, s_1, s_2) = (d_{k-1}, d_{k-2}, d_{k-3})$
 //! gives 8 trellis states.  At each step, given input bit $x_k$:
 //! $$ d_k = x_k \oplus s_1 \oplus s_2 \quad (\text{feedback, from } g_0), $$
 //! $$ z_k = d_k \oplus s_0 \oplus s_2 \quad (\text{parity, from } g_1), $$
-//! and the register shifts: $s_2 \leftarrow s_1,\; s_1 \leftarrow s_0,\; s_0 \leftarrow d_k$.
+//! and the register shifts: $s_2 \leftarrow s_1,\thickspace s_1 \leftarrow s_0,\thickspace s_0 \leftarrow d_k$.
 //!
 //! Encoder 1 processes the $K$ information bits in natural order; encoder 2
 //! processes the same bits permuted through the QPP interleaver
@@ -124,7 +124,7 @@ use crate::error::FecError;
 /// Which BCJR combining rule a [`TurboDecoder`] uses.
 ///
 /// The BCJR recursions repeatedly need
-/// $\ln\!\left(e^{a} + e^{b}\right)$, the "max-star" operator. Its exact
+/// $\ln\negthinspace \left(e^{a} + e^{b}\right)$, the "max-star" operator. Its exact
 /// form is the Jacobian logarithm
 ///
 /// $$\max{}^*(a, b) = \max(a, b) + \ln\left(1 + e^{-|a-b|}\right),$$

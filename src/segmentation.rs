@@ -15,7 +15,7 @@
 //!
 //! $K_{cb}$ = maximum code block size = 8448 (BG1) or 3840 (BG2).
 //!
-//! $$C = \begin{cases} 1 & \text{if } B \le K_{cb} \\ \lceil B / (K_{cb} - 24) \rceil & \text{otherwise} \end{cases}$$
+//! $$C = \begin{cases} 1 & \text{if } B \le K_{cb} \\\\ \lceil B / (K_{cb} - 24) \rceil & \text{otherwise} \end{cases}$$
 //!
 //! $L = 24$ if $C > 1$, else $L = 0$ (CRC-24B is only added when segmenting).
 //!
@@ -47,7 +47,7 @@
 //! sizes.
 //!
 //! Choose minimum valid 3GPP $Z$ from Table 5.3.2-1 such that $K_b \cdot Z \ge K'$,
-//! where $K_b = 22$ (BG1) or $\{10, 9, 8, 6\}$ (BG2, depending on $B$).
+//! where $K_b = 22$ (BG1) or $\lbrace 10, 9, 8, 6\rbrace$ (BG2, depending on $B$).
 //!
 //! $K = K_b \cdot Z$ = full systematic length (includes filler bits).
 //!

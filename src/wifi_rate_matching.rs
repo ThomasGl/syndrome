@@ -68,8 +68,8 @@ const LLR_KNOWN_ZERO: f32 = 1_000_000.0;
 ///
 /// `(n_shrt, n_punc)`: the number of shortened (unsent, known-zero
 /// systematic) bits and punctured (unsent, erased parity) bits.
-/// $n_{shrt} = K - \text{payload\_bits}$, and $n_{punc} = (N - n_{shrt}) -
-/// \text{target\_coded\_bits}$.
+/// $n_{shrt} = K - \text{payload\\_bits}$, and $n_{punc} = (N - n_{shrt}) -
+/// \text{target\\_coded\\_bits}$.
 ///
 /// # Errors
 ///

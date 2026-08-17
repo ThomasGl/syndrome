@@ -21,9 +21,9 @@
 //! $$ Q\_{v \to c} = \mathrm{LLR}\_v - R\_{c \to v}^{\text{(previous)}} $$
 //!
 //! $$ R_{c \to v} = \left(\prod_{v' \in \mathcal{N}(c) \setminus v}
-//! \operatorname{sign}(Q_{v' \to c})\right) \cdot \max\!\left(
+//! \operatorname{sign}(Q_{v' \to c})\right) \cdot \max\negthinspace \left(
 //! \min_{v' \in \mathcal{N}(c) \setminus v} \lvert Q_{v' \to c} \rvert -
-//! \beta,\; 0 \right) $$
+//! \beta,\thickspace 0 \right) $$
 //!
 //! $$ \mathrm{LLR}\_v \mathrel{+}= R\_{c \to v}^{\text{(new)}} - R\_{c \to
 //! v}^{\text{(previous)}} $$
@@ -1146,7 +1146,7 @@ impl QcLdpcDecoder {
     /// at the first failed check to keep the overhead low in the common
     /// (converged) case.
     ///
-    /// No heap allocation; runs in $O(\text{total\_edges} \cdot Z)$.
+    /// No heap allocation; runs in $O(\text{total\\_edges} \cdot Z)$.
     fn check_syndrome_f32(&self, llr: &[f32]) -> bool {
         let z = self.params.z;
         for layer in 0..self.params.num_row_blocks {

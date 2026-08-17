@@ -21,15 +21,15 @@
 //! $\mathrm{GF}(2)$ regardless of whether $B$ happens to be symmetric).
 //!
 //! $B$ is the classical $12 \times 12$ "bordered circulant" built from the
-//! quadratic residues of $11$: $QR_{11} = \{1,3,4,5,9\}$. Index rows/columns
+//! quadratic residues of $11$: $QR_{11} = \lbrace 1,3,4,5,9\rbrace$. Index rows/columns
 //! $0..10$ by $\mathrm{GF}(11)$ and index $11$ by a distinguished "point at
 //! infinity". Then
 //!
 //! $$
 //! B_{ij} = \begin{cases}
-//!   1 & i = 11 \text{ or } j = 11, \text{ except } B_{11,11} = 0 \\
-//!   1 & i = j \ne 11 \\
-//!   1 & i \ne j,\ (i - j) \bmod 11 \in QR_{11} \\
+//!   1 & i = 11 \text{ or } j = 11, \text{ except } B_{11,11} = 0 \\\\
+//!   1 & i = j \ne 11 \\\\
+//!   1 & i \ne j,\ (i - j) \bmod 11 \in QR_{11} \\\\
 //!   0 & \text{otherwise}
 //! \end{cases}
 //! $$
@@ -135,7 +135,7 @@ pub const GOLAY_D: usize = 8;
 /// # Returns
 ///
 /// An 11-entry boolean table with `is_qr[r] == true` for
-/// $r \in \{1,3,4,5,9\}$.
+/// $r \in \lbrace 1,3,4,5,9\rbrace$.
 fn quadratic_residues_mod_11() -> [bool; 11] {
     let mut is_qr = [false; 11];
     for i in 1..11usize {
@@ -293,7 +293,7 @@ fn u32_to_bits(v: u32, n: usize, out: &mut [u8]) {
 /// Extended binary Golay code $G(24,12,8)$ encoder/decoder.
 ///
 /// Precomputes an encode table and a syndrome-based decode table once in
-/// [`GolayCode::new`] ($\approx 16\,\text{KiB} + 16\,\text{KiB}$); afterwards
+/// [`GolayCode::new`] ($\approx 16\thinspace \text{KiB} + 16\thinspace \text{KiB}$); afterwards
 /// [`encode`](Self::encode) and [`decode`](Self::decode) are $O(1)$
 /// table lookups with no heap allocation.
 pub struct GolayCode {

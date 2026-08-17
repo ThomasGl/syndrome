@@ -26,8 +26,8 @@
 //!
 //! $$
 //! H = \begin{pmatrix}
-//! 1 & 0 & 1 & 0 & 1 & 0 & 1 \\
-//! 0 & 1 & 1 & 0 & 0 & 1 & 1 \\
+//! 1 & 0 & 1 & 0 & 1 & 0 & 1 \\\\
+//! 0 & 1 & 1 & 0 & 0 & 1 & 1 \\\\
 //! 0 & 0 & 0 & 1 & 1 & 1 & 1
 //! \end{pmatrix}
 //! $$
@@ -43,7 +43,7 @@
 //! # Syndrome decoding
 //!
 //! For a received word $r \in \mathbb{F}_2^7$, the syndrome is
-//! $$ s = H\,r^{\mathsf T} \in \mathbb{F}_2^3. $$
+//! $$ s = H\thinspace r^{\mathsf T} \in \mathbb{F}_2^3. $$
 //! If $r$ is a valid codeword (no error), $s = 0$: every parity check
 //! agrees. If exactly one bit at position $j$ was flipped, $r = c \oplus
 //! e_j$ for the true codeword $c$, so
@@ -83,7 +83,7 @@ use crate::error::FecError;
 /// * `H_ROWS[2]` ($p_4$'s row) = `0b1111000`: covers positions 4, 5, 6, 7.
 const H_ROWS: [u8; 3] = [0b1010101, 0b1100110, 0b1111000];
 
-/// Compute the 3-bit syndrome $s = H\,r^{\mathsf T}$ (over $\mathrm{GF}(2)$)
+/// Compute the 3-bit syndrome $s = H\thinspace r^{\mathsf T}$ (over $\mathrm{GF}(2)$)
 /// of a received 7-bit word `r` (low 7 bits significant; same bit layout as
 /// [`Hamming74::encode`]'s output — see module docs).
 ///

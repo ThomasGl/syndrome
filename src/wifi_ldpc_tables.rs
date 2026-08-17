@@ -1,8 +1,8 @@
 //! The 12 real IEEE 802.11 LDPC parity-check prototype matrices (shift tables).
 //!
 //! This module supplies the actual sparse $(row, col, shift)$ edge lists for
-//! all 12 802.11 QC-LDPC base graphs — 3 lifting sizes $Z \in \{27, 54, 81\}$
-//! times 4 code rates $R \in \{1/2, 2/3, 3/4, 5/6\}$ — so that
+//! all 12 802.11 QC-LDPC base graphs — 3 lifting sizes $Z \in \lbrace 27, 54, 81\rbrace$
+//! times 4 code rates $R \in \lbrace 1/2, 2/3, 3/4, 5/6\rbrace$ — so that
 //! [`crate::qc_ldpc::QcLdpcEncoder`]/[`crate::qc_ldpc::QcLdpcDecoder`] can be
 //! instantiated for real 802.11 codewords via
 //! [`crate::qc_ldpc::QcLdpcParams::from_raw_edges`].
@@ -91,7 +91,7 @@ use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
 /// this differs from the 3GPP per-iLS scaled tables.
 #[derive(Debug, Clone, Copy)]
 pub struct WifiLdpcMatrix {
-    /// Lifting size $Z \in \{27, 54, 81\}$.
+    /// Lifting size $Z \in \lbrace 27, 54, 81\rbrace$.
     pub z: usize,
     /// Numerator of the code rate fraction.
     pub rate_num: usize,
@@ -440,7 +440,7 @@ pub(crate) const WIFI_LDPC_MATRICES: [WifiLdpcMatrix; 12] = [
 ///
 /// # Arguments
 ///
-/// * `z` - Lifting size; must be one of $\{27, 54, 81\}$.
+/// * `z` - Lifting size; must be one of $\lbrace 27, 54, 81\rbrace$.
 /// * `rate_num`, `rate_den` - Code rate fraction; must be one of the four
 ///   802.11 rates $1/2, 2/3, 3/4, 5/6$ (in exactly this reduced form).
 ///

@@ -15,7 +15,7 @@
 //!   LSB-first-indexed; its module docs cover that.)
 //! - **LLR sign follows the crate-wide rule**: a positive log-likelihood
 //!   ratio $L = \ln\frac{P(b=0)}{P(b=1)}$ favours bit 0, a negative one
-//!   favours bit 1, so the hard decision is $\hat{b} = \mathbb{1}\\{L < 0\\}$.
+//!   favours bit 1, so the hard decision is $\hat{b} = \mathbb{1}\lbrace L < 0\rbrace$.
 //!   An exact zero (an erasure) decides 0, consistent with
 //!   `f32::is_sign_negative` being false for `+0.0`.
 

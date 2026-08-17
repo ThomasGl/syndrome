@@ -23,7 +23,7 @@
 //! observed count $k$ has variance $n p (1-p)$, so the estimator
 //! $\hat p = k/n$ has relative standard error
 //!
-//! $$\frac{\sigma_{\hat p}}{p} = \sqrt{\frac{1-p}{p\,n}} \approx
+//! $$\frac{\sigma_{\hat p}}{p} = \sqrt{\frac{1-p}{p\thinspace n}} \approx
 //!   \frac{1}{\sqrt{k}} \quad \text{for small } p .$$
 //!
 //! The relative precision therefore depends on $k$ — the number of error
@@ -256,7 +256,7 @@ pub struct MonteCarloResult {
     pub ci_low: f64,
     /// Upper end of the Wilson score interval.
     pub ci_high: f64,
-    /// Relative standard error $\sqrt{(1-\hat p)/(\hat p\, n)}$ of the point
+    /// Relative standard error $\sqrt{(1-\hat p)/(\hat p\thinspace n)}$ of the point
     /// estimate; `f64::INFINITY` when no events were observed.
     pub relative_standard_error: f64,
     /// Why the run stopped. Treat [`StopReason::MaxTrials`] as "did not

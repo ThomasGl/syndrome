@@ -13,11 +13,11 @@
 //! # 802.11 LDPC structure
 //!
 //! All 802.11ax/be LDPC codes are quasi-cyclic with exactly 24 column blocks and
-//! a lifting size $Z \in \{27, 54, 81\}$:
+//! a lifting size $Z \in \lbrace 27, 54, 81\rbrace$:
 //!
 //! $$N = 24 Z, \quad K = \lfloor N \cdot R \rfloor, \quad M = N - K$$
 //!
-//! where $R \in \{1/2,\, 2/3,\, 3/4,\, 5/6\}$ and the parity row-block count is
+//! where $R \in \lbrace 1/2,\thinspace 2/3,\thinspace 3/4,\thinspace 5/6\rbrace$ and the parity row-block count is
 //! $M / Z$.
 //!
 //! The LOMS decoding algorithm is structurally identical to 5G NR QC-LDPC;
@@ -77,13 +77,13 @@ pub enum WifiStandard {
 ///
 /// # Field relationships
 ///
-/// $$N = 24 Z, \quad K = N \cdot \frac{\text{rate\_num}}{\text{rate\_den}},
-///   \quad M = N - K, \quad \text{row\_blocks} = M / Z$$
+/// $$N = 24 Z, \quad K = N \cdot \frac{\text{rate\\_num}}{\text{rate\\_den}},
+///   \quad M = N - K, \quad \text{row\\_blocks} = M / Z$$
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiLdpcParams {
     /// Wi-Fi generation for which these parameters are selected.
     pub standard: WifiStandard,
-    /// Lifting size $Z \in \{27, 54, 81\}$.
+    /// Lifting size $Z \in \lbrace 27, 54, 81\rbrace$.
     pub z: usize,
     /// Codeword length $N = 24 Z$.
     pub n: usize,
@@ -106,7 +106,7 @@ pub struct WifiLdpcParams {
 impl WifiLdpcParams {
     /// Compute the code rate as a floating-point value.
     ///
-    /// $$R = \frac{\text{rate\_num}}{\text{rate\_den}}$$
+    /// $$R = \frac{\text{rate\\_num}}{\text{rate\\_den}}$$
     ///
     /// # Returns
     ///
@@ -250,13 +250,13 @@ fn closest_rate(target_rate: f32) -> (usize, usize) {
 /// Select the smallest LDPC codeword that can carry `payload_bytes` information
 /// bits at the rate closest to `target_rate`.
 ///
-/// The three available lifting sizes $Z \in \{27, 54, 81\}$ yield information
+/// The three available lifting sizes $Z \in \lbrace 27, 54, 81\rbrace$ yield information
 /// capacities (at a given rate $R$):
 ///
 /// $$K(Z, R) = 24 Z \cdot R$$
 ///
 /// The selector picks the smallest $Z$ such that $K(Z, R) \ge 8 \cdot
-/// \text{payload\_bytes}$.  If no single codeword is large enough (payload
+/// \text{payload\\_bytes}$.  If no single codeword is large enough (payload
 /// exceeds $K(81, R)$) the largest codeword ($Z = 81$) is returned and the
 /// caller is responsible for segmentation.
 ///
@@ -305,7 +305,7 @@ pub fn select_wifi_ldpc(
 /// A single entry in the 802.11ax/be Modulation and Coding Scheme table.
 ///
 /// The throughput in bits per OFDM subcarrier per spatial stream is:
-/// $$\eta = \text{bits\_per\_symbol} \times \frac{\text{code\_rate\_num}}{\text{code\_rate\_den}}$$
+/// $$\eta = \text{bits\\_per\\_symbol} \times \frac{\text{code\\_rate\\_num}}{\text{code\\_rate\\_den}}$$
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WifiMcs {
     /// MCS index (0-based).
@@ -553,7 +553,7 @@ pub const WIFI7_MCS_TABLE: [WifiMcs; 14] = [
 /// # Returns
 ///
 /// The smallest [`WifiLdpcParams`] whose information capacity $K$ is at least
-/// $8 \times \text{payload\_bytes}$ at the MCS code rate.
+/// $8 \times \text{payload\\_bytes}$ at the MCS code rate.
 ///
 /// # Examples
 ///
@@ -664,7 +664,7 @@ mod tests {
     }
 
     /// Verify structural invariants for all $(Z, R)$ combinations:
-    /// $N = 24Z$, $M = N - K$, $\text{row\_blocks} = M / Z$, $\text{col\_blocks} = 24$.
+    /// $N = 24Z$, $M = N - K$, $\text{row\\_blocks} = M / Z$, $\text{col\\_blocks} = 24$.
     #[test]
     fn structural_invariants_all_combinations() {
         for &z in &[27_usize, 54, 81] {

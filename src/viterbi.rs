@@ -1338,7 +1338,7 @@ impl ViterbiDecoder {
     /// $L_i > 0$ means bit $i$ is likely 0, $L_i < 0$ means likely 1.
     /// (Standard log-likelihood ratio convention.)
     ///
-    /// The branch metric is $\sum_j (1 - 2\,c_j)\,L_j$ (maximized), which
+    /// The branch metric is $\sum_j (1 - 2\thinspace c_j)\thinspace L_j$ (maximized), which
     /// is the max-log-MAP approximation.
     ///
     /// # Arguments

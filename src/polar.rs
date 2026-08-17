@@ -8,7 +8,7 @@
 //! # Encoding (§5.3.1)
 //!
 //! The generator matrix is $G_N = F^{\otimes n}$ where $F = \begin{bmatrix}1 &
-//! 0 \\ 1 & 1\end{bmatrix}$ and $n = \log_2 N$.  The encoding operation is:
+//! 0 \\\\ 1 & 1\end{bmatrix}$ and $n = \log_2 N$.  The encoding operation is:
 //!
 //! $$x = u \cdot G_N, \quad u_i = 0 \text{ for frozen bits}$$
 //!
@@ -182,7 +182,7 @@ const RELIABILITY_TABLE_MAX_N: usize = 1024;
 /// code this module documents supporting -- `frozen_mask` falls back to a
 /// **polarization-weight (PW)** heuristic:
 ///
-/// $$W(i) = \sum_{b : \text{bit } b \text{ of } i \text{ is set}} 2^{0.25 \, b}$$
+/// $$W(i) = \sum_{b : \text{bit } b \text{ of } i \text{ is set}} 2^{0.25 \thinspace b}$$
 ///
 /// ranking indices by ascending $W$ (ties broken by index). This is a
 /// standard closed-form approximation to the true (Bhattacharyya-parameter)

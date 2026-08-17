@@ -118,7 +118,7 @@ impl SixgModulation {
     ///
     /// # Returns
     ///
-    /// $Q_m \in \{1, 2, 4, 6, 8, 10, 12\}$.
+    /// $Q_m \in \lbrace 1, 2, 4, 6, 8, 10, 12\rbrace$.
     ///
     /// # Examples
     ///
