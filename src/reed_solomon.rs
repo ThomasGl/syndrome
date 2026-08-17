@@ -205,6 +205,10 @@ impl GfTables {
 ///    paths that need no precomputed tables.
 /// 5. [`ReedSolomon::decode`] — erasure repair; automatically uses the same
 ///    table/SIMD machinery as the encoder.
+/// 6. [`ReedSolomon::decode_errors_and_erasures`] — combined errors-and-
+///    erasures repair for symbols that are *present but corrupted* (not
+///    merely flagged missing), bounded to a caller-specified `max_errors`;
+///    see its own docs for the algorithm and complexity caveats.
 ///
 /// The crate also ships several `#[doc(hidden)]` encode variants
 /// (`encode_with_tables`, `encode_with_tables_chunked`, `encode_simd`,
@@ -231,6 +235,13 @@ pub struct ReedSolomon {
     // (coefficient, row) pair per call; now they are built once alongside
     // `mul_tables` and only indexed on the hot path.
     nibble_tables: Option<Vec<[[u8; 16]; 2]>>,
+    // Companion GFNI affine bit-matrix per coefficient (256 x 8 B = 2 KiB
+    // total), consumed by `gf256_muladd_gfni` when `is_x86_feature_detected!`
+    // reports GFNI at runtime. `gfni_matrices[c]` is `c`'s packed
+    // multiply-by-constant matrix from `simd_avx2::gf2p8_affine_matrix`;
+    // `x86_64`-only, `None` (never built) on other architectures.
+    #[cfg(target_arch = "x86_64")]
+    gfni_matrices: Option<Vec<u64>>,
 }
 
 impl ReedSolomon {
@@ -299,6 +310,18 @@ impl ReedSolomon {
             }
             tables.push(tbl);
             nibbles.push([lo, hi]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Companion GFNI affine matrix per coefficient (see the field
+            // doc on `gfni_matrices`): derived from `tables`, not `tbl`,
+            // since `tables` is the one that survives past this loop.
+            self.gfni_matrices = Some(
+                tables
+                    .iter()
+                    .map(crate::simd_avx2::gf2p8_affine_matrix)
+                    .collect(),
+            );
         }
         self.mul_tables = Some(tables);
         self.nibble_tables = Some(nibbles);
@@ -468,13 +491,17 @@ impl ReedSolomon {
     /// Encode using the fastest SIMD kernel available for the running
     /// architecture, applied to all non-zero coefficients.
     ///
-    /// For each coefficient, decomposes the 256-byte GF multiply table into two
-    /// 16-byte nibble tables and applies them via a native SIMD table lookup:
-    /// AVX2 VPSHUFB (32 bytes/iteration) on x86_64, or NEON `vqtbl1q_u8` (16
-    /// bytes/iteration) on AArch64 (selected by a private per-architecture
-    /// dispatcher). Falls back to the portable chunked-table path (or, if
-    /// `precompute_mul_tables` was never called, a plain scalar encode) when
-    /// no SIMD kernel is available at runtime.
+    /// On x86_64, tries GFNI first: multiplying by a fixed `GF(256)`
+    /// coefficient is $\mathbb{F}\_2$-linear, so `_mm256_gf2p8affine_epi64_epi8`
+    /// applies the coefficient's precomputed $8 \times 8$ bit matrix directly
+    /// (32 bytes/iteration, one instruction). Where GFNI isn't available, or
+    /// on AArch64, falls back to decomposing the 256-byte GF multiply table
+    /// into two 16-byte nibble tables applied via a native SIMD table
+    /// lookup: AVX2 VPSHUFB (32 bytes/iteration) on x86_64, or NEON
+    /// `vqtbl1q_u8` (16 bytes/iteration) on AArch64 (selected by a private
+    /// per-architecture dispatcher). Falls back further to the portable
+    /// chunked-table path (or, if `precompute_mul_tables` was never called,
+    /// a plain scalar encode) when no SIMD kernel is available at runtime.
     ///
     /// # Errors
     ///
@@ -525,6 +552,10 @@ impl ReedSolomon {
     fn encode_simd_dispatch(&self, data: &[&[u8]], parity_out: &mut [u8]) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
+            if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+                self.encode_with_gfni_inner(data, parity_out);
+                return true;
+            }
             if is_x86_feature_detected!("avx2") {
                 self.encode_with_avx2_inner(data, parity_out);
                 return true;
@@ -540,6 +571,41 @@ impl ReedSolomon {
         {
             let _ = (data, parity_out);
             false
+        }
+    }
+
+    /// GFNI-accelerated twin of [`Self::encode_with_avx2_inner`]: same loop
+    /// structure, [`crate::simd_avx2::gf256_muladd_gfni`] instead of
+    /// [`crate::simd_avx2::gf256_muladd_avx2`] as the inner kernel.
+    #[cfg(target_arch = "x86_64")]
+    fn encode_with_gfni_inner(&self, data: &[&[u8]], parity_out: &mut [u8]) {
+        let d = self.data_shards;
+        let p = self.parity_shards;
+        let tables = self.mul_tables.as_ref().unwrap();
+        // Always `Some` when `mul_tables` is (built together in
+        // `precompute_mul_tables`).
+        let matrices = self.gfni_matrices.as_ref().unwrap();
+        let shard_len = data[0].len();
+        for b in parity_out.iter_mut().take(p * shard_len) {
+            *b = 0;
+        }
+
+        for j in 0..d {
+            let dj = data[j];
+            for i in 0..p {
+                let coef = self.coeffs[i * d + j];
+                if coef == 0 {
+                    continue;
+                }
+                let full_table: &[u8; 256] = &tables[coef as usize];
+                let matrix = matrices[coef as usize];
+                let parity_row = &mut parity_out[i * shard_len..i * shard_len + shard_len];
+
+                // SAFETY: GFNI and AVX2 presence were verified above by is_x86_feature_detected.
+                unsafe {
+                    crate::simd_avx2::gf256_muladd_gfni(dj, parity_row, matrix, full_table);
+                }
+            }
         }
     }
 
@@ -634,6 +700,8 @@ impl ReedSolomon {
             tables,
             mul_tables: None,
             nibble_tables: None,
+            #[cfg(target_arch = "x86_64")]
+            gfni_matrices: None,
         }
     }
 
@@ -944,6 +1012,251 @@ impl ReedSolomon {
         Ok(())
     }
 
+    /// Errors-and-erasures decoder: corrects up to `max_errors` symbols that
+    /// are *present but corrupted* (wrong bytes, no erasure flag), combined
+    /// with any number of known erasures (`None` entries already in
+    /// `shards`), whenever $2t + s \le$ `parity_shards` — the standard
+    /// unique-decoding bound for a code with minimum distance
+    /// `parity_shards + 1` (proved in this module's own doc comment via the
+    /// Vandermonde determinant argument). Here `t` is the number of
+    /// unknown-position errors actually present (`t \le` `max_errors`) and
+    /// `s` is the number of `None` entries already in `shards` on entry.
+    ///
+    /// # Why this isn't Berlekamp–Massey / Chien search
+    ///
+    /// This crate's Reed-Solomon code is *not* a classical narrow-sense RS
+    /// code: data positions hold `p`'s coefficients directly, while parity
+    /// positions hold *evaluations* $p(\alpha^i)$ (see the module doc's
+    /// $C_{ij} = \alpha^{ij}$ derivation). A parity-check matrix for this
+    /// mixed coefficient/evaluation layout has parity columns that are
+    /// Kronecker deltas, not powers of a single per-position "locator"
+    /// $\beta_k$, so it does not produce syndromes of the classical form
+    /// $S_i = \sum_k e_k \cdot \beta_k^i$ that Berlekamp–Massey / Chien
+    /// search (as used in [`crate::bch`]) require. Adapting that algorithm
+    /// to this code's structure would be mathematically unsound here, not
+    /// merely harder to implement.
+    ///
+    /// # Algorithm
+    ///
+    /// Syndrome-verified combinatorial search, reusing [`Self::decode`] (the
+    /// already-proven erasure decoder) as the sole reconstruction engine, so
+    /// this function introduces no new field-arithmetic algorithm to get
+    /// subtly wrong:
+    ///
+    /// 1. For `k = 0, 1, \dots,` `max_errors` (smallest first): enumerate
+    ///    every size-`k` subset of the non-erased (`Some`) shard positions
+    ///    as a candidate *additional* erasure set.
+    /// 2. For each candidate, union it with the real erasures and hand the
+    ///    result to [`Self::decode`] to reconstruct every hypothesized
+    ///    and/or truly erased data shard.
+    /// 3. Re-encode the resulting full data set and compare the recomputed
+    ///    parity against every parity symbol that was actually received
+    ///    *and* not part of the candidate erasure set. If every one
+    ///    matches, the candidate is the answer: by the code's minimum
+    ///    distance, at most one codeword can agree with the received word
+    ///    outside a combined erasure/error set of size $\le$
+    ///    `parity_shards`, so the first fully-consistent candidate found is
+    ///    provably *the* unique answer, not merely *a plausible* one.
+    ///    (Surviving, non-hypothesized *data* symbols need no separate
+    ///    check: they are untouched by [`Self::decode`], so they trivially
+    ///    equal themselves; a wrong hypothesis about which symbols are
+    ///    erroneous shows up in the parity check instead, because a single
+    ///    wrong data coefficient perturbs every parity evaluation by a
+    ///    nonzero amount.)
+    /// 4. If no candidate at any `k \le` `max_errors` is fully consistent,
+    ///    decoding fails — [`FecError::DecoderNotConverged`] is returned
+    ///    rather than an unverified guess.
+    ///
+    /// # Performance
+    ///
+    /// $O\!\left(\binom{n}{\text{max\_errors}} \cdot \text{shard\_len}\right)$
+    /// where $n =$ `data_shards + parity_shards`: combinatorial in the
+    /// number of unknown-position errors searched for. This is cheap for
+    /// the small-parity-count configurations this crate targets (e.g.
+    /// RS(10, 4) with `max_errors` of 1 or 2) and is exactly why this method
+    /// takes an explicit `max_errors` bound instead of searching
+    /// unboundedly — it is not intended for large `parity_shards` /
+    /// `max_errors`. This is the documented scope limit of the method: a
+    /// faster algebraic decoder exploiting this code's specific
+    /// coefficient/evaluation structure directly is not implemented here,
+    /// and the combinatorial search is chosen because its correctness
+    /// follows from the minimum-distance argument above rather than from a
+    /// separate derivation.
+    ///
+    /// # Arguments
+    ///
+    /// * `shards` — length must be `data_shards + parity_shards`. Entries
+    ///   already `None` are treated as known erasures; entries that are
+    ///   `Some` but contain wrong bytes are exactly what this function
+    ///   detects and repairs. On success, every data shard is filled with
+    ///   its correct value (in place) and every parity shard is overwritten
+    ///   with its correct, verified value.
+    /// * `max_errors` — upper bound on the number of unknown-position
+    ///   errors to search for (searched from `0` upward). Must satisfy
+    ///   $2 \cdot$ `max_errors` $+ s \le$ `parity_shards`, where `s` is the
+    ///   number of `None` entries already present in `shards`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(t)` — the number of unknown-position errors actually found and
+    /// corrected (`t <= max_errors`; `t == 0` means the input needed only
+    /// ordinary erasure repair, if any).
+    ///
+    /// # Errors
+    ///
+    /// * [`FecError::BufferTooSmall`] if `shards.len() != data_shards +
+    ///   parity_shards`.
+    /// * [`FecError::InvalidParam`] if shard lengths are inconsistent, or if
+    ///   $2 \cdot$ `max_errors` $+ s >$ `parity_shards` (the requested
+    ///   search bound is not achievable for this code's minimum distance).
+    /// * [`FecError::DecoderNotConverged`] if no combination of at most
+    ///   `max_errors` hypothesized errors (together with the existing
+    ///   erasures) produces a fully self-consistent codeword — either more
+    ///   than `max_errors` errors actually occurred, or the error pattern
+    ///   is uncorrectable. `shards` is left untouched in this case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::ReedSolomon;
+    ///
+    /// let rs = ReedSolomon::new(4, 4);
+    /// let data: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 1) as u8; 16]).collect();
+    /// let parity = rs.encode(&data).unwrap();
+    ///
+    /// let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+    /// for p in &parity {
+    ///     shards.push(Some(p.clone()));
+    /// }
+    ///
+    /// // Corrupt one data shard in place (no erasure flag -- `decode()`
+    /// // alone cannot see this) and separately erase one parity shard.
+    /// shards[0].as_mut().unwrap()[0] ^= 0xFF;
+    /// shards[5] = None;
+    ///
+    /// // One unknown-position error (t=1) plus one erasure (s=1):
+    /// // 2*1 + 1 = 3 <= parity_shards (4).
+    /// let corrected = rs.decode_errors_and_erasures(&mut shards, 1).unwrap();
+    /// assert_eq!(corrected, 1);
+    /// for (j, original) in data.iter().enumerate() {
+    ///     assert_eq!(shards[j].as_ref().unwrap(), original);
+    /// }
+    /// ```
+    pub fn decode_errors_and_erasures(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        max_errors: usize,
+    ) -> Result<usize, FecError> {
+        let total = self.data_shards + self.parity_shards;
+        if shards.len() != total {
+            return Err(FecError::BufferTooSmall {
+                required: total,
+                provided: shards.len(),
+            });
+        }
+
+        let shard_len = shards
+            .iter()
+            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        for s in shards.iter().filter_map(|s| s.as_ref()) {
+            if s.len() != shard_len {
+                return Err(FecError::InvalidParam("shard size mismatch"));
+            }
+        }
+
+        let erasures = shards.iter().filter(|s| s.is_none()).count();
+        if 2 * max_errors + erasures > self.parity_shards {
+            return Err(FecError::InvalidParam(
+                "max_errors too large: 2*max_errors + existing erasures must not exceed parity_shards",
+            ));
+        }
+
+        // Snapshot the received codeword once. The search below only reads
+        // from this snapshot; the caller's `shards` buffer is written to
+        // only once, after the unique consistent candidate has been found.
+        let received: Vec<Option<Vec<u8>>> = shards.to_vec();
+        let candidate_positions: Vec<usize> =
+            (0..total).filter(|&i| received[i].is_some()).collect();
+
+        for k in 0..=max_errors {
+            let mut result: Option<CandidateCodeword> = None;
+            let mut current = Vec::with_capacity(k);
+            find_combination(
+                &candidate_positions,
+                k,
+                0,
+                &mut current,
+                &mut |subset: &[usize]| {
+                    // Candidate erasure set: real erasures union the k
+                    // hypothesized unknown-position errors.
+                    let mut scratch = received.clone();
+                    for &pos in subset {
+                        scratch[pos] = None;
+                    }
+
+                    // Reuse the already-proven Vandermonde erasure decoder.
+                    // Given the bound checked above, `erasures + k <=
+                    // parity_shards` always holds here, so this call
+                    // structurally cannot hit `decode`'s own error paths --
+                    // the check is defensive only.
+                    if self.decode(&mut scratch).is_err() {
+                        return false;
+                    }
+
+                    let data_refs: Vec<&[u8]> = (0..self.data_shards)
+                        .map(|j| {
+                            scratch[j]
+                                .as_ref()
+                                .expect("decode() fills every data shard on success")
+                                .as_slice()
+                        })
+                        .collect();
+
+                    let mut recomputed_parity = vec![0u8; self.parity_shards * shard_len];
+                    if self
+                        .encode_into(&data_refs, &mut recomputed_parity)
+                        .is_err()
+                    {
+                        return false;
+                    }
+
+                    // Verify: every parity symbol that was actually
+                    // received *and* not hypothesized as wrong must match
+                    // the recomputed value.
+                    for pi in 0..self.parity_shards {
+                        let i = self.data_shards + pi;
+                        if subset.contains(&i) {
+                            continue;
+                        }
+                        if let Some(orig) = received[i].as_ref() {
+                            let row = &recomputed_parity[pi * shard_len..(pi + 1) * shard_len];
+                            if row != orig.as_slice() {
+                                return false;
+                            }
+                        }
+                    }
+
+                    result = Some((scratch, recomputed_parity));
+                    true
+                },
+            );
+
+            if let Some((scratch, recomputed_parity)) = result {
+                for (j, slot) in scratch.into_iter().take(self.data_shards).enumerate() {
+                    shards[j] = slot;
+                }
+                for pi in 0..self.parity_shards {
+                    shards[self.data_shards + pi] =
+                        Some(recomputed_parity[pi * shard_len..(pi + 1) * shard_len].to_vec());
+                }
+                return Ok(k);
+            }
+        }
+
+        Err(FecError::DecoderNotConverged)
+    }
+
     /// Bulk GF(256) multiply-accumulate: `dst[i] ^= GF_mul(coef, src[i])` for
     /// all `i`, with zero heap allocation.
     ///
@@ -978,6 +1291,20 @@ impl ReedSolomon {
 
         #[cfg(target_arch = "x86_64")]
         {
+            if let Some(tables) = self.mul_tables.as_ref()
+                && is_x86_feature_detected!("gfni")
+                && is_x86_feature_detected!("avx2")
+            {
+                let full_table = &tables[coef as usize];
+                // Always `Some` when `mul_tables` is (built together in
+                // `precompute_mul_tables`).
+                let matrix = self.gfni_matrices.as_ref().unwrap()[coef as usize];
+                // SAFETY: GFNI and AVX2 presence were verified above by is_x86_feature_detected.
+                unsafe {
+                    crate::simd_avx2::gf256_muladd_gfni(src, dst, matrix, full_table);
+                }
+                return;
+            }
             if let Some(tables) = self.mul_tables.as_ref()
                 && is_x86_feature_detected!("avx2")
             {
@@ -1129,6 +1456,48 @@ impl ReedSolomon {
 
         Ok(())
     }
+}
+
+/// A fully-reconstructed candidate codeword found by
+/// [`ReedSolomon::decode_errors_and_erasures`]: the complete shard array
+/// (every data shard filled in, real or hypothesized-erased positions
+/// alike) paired with its freshly recomputed parity bytes.
+type CandidateCodeword = (Vec<Option<Vec<u8>>>, Vec<u8>);
+
+/// Depth-first, backtracking enumeration of every `k`-element combination of
+/// `pool` (in lexicographic order of `pool`'s indices), calling `visit` on
+/// each candidate combination until it returns `true`. Used only by
+/// [`ReedSolomon::decode_errors_and_erasures`] to walk candidate error-
+/// position subsets; stopping as soon as `visit` signals a match avoids
+/// generating the remaining combinations once the (provably unique) answer
+/// has been found.
+///
+/// # Returns
+///
+/// `true` if some combination made `visit` return `true` (search stopped
+/// early); `false` if every `k`-combination was tried and none matched.
+fn find_combination<F: FnMut(&[usize]) -> bool>(
+    pool: &[usize],
+    k: usize,
+    start: usize,
+    current: &mut Vec<usize>,
+    visit: &mut F,
+) -> bool {
+    if current.len() == k {
+        return visit(current);
+    }
+    let remaining_needed = k - current.len();
+    if pool.len().saturating_sub(start) < remaining_needed {
+        return false;
+    }
+    for i in start..pool.len() {
+        current.push(pool[i]);
+        if find_combination(pool, k, i + 1, current, visit) {
+            return true;
+        }
+        current.pop();
+    }
+    false
 }
 
 fn invert_matrix_gf(mat: &[u8], n: usize, tables: &GfTables) -> Option<Vec<u8>> {
@@ -1453,6 +1822,570 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // decode_errors_and_erasures
+    // =========================================================================
+
+    /// Independent GF(256) multiply (Russian-peasant multiplication,
+    /// primitive polynomial `0x11D`), used only by
+    /// [`brute_force_errors_and_erasures`] so that reference decoder shares
+    /// no code -- not even the log/exp table construction -- with the
+    /// `GfTables` the crate itself uses.
+    #[cfg(test)]
+    fn gf_mul_peasant(mut a: u8, mut b: u8) -> u8 {
+        let mut result: u8 = 0;
+        for _ in 0..8 {
+            if b & 1 != 0 {
+                result ^= a;
+            }
+            let hi = a & 0x80 != 0;
+            a <<= 1;
+            if hi {
+                a ^= 0x1D;
+            }
+            b >>= 1;
+        }
+        result
+    }
+
+    /// `base^exp` in GF(256), via repeated [`gf_mul_peasant`]. `exp` is
+    /// always tiny here (a parity row index), so no square-and-multiply is
+    /// needed.
+    #[cfg(test)]
+    fn gf_pow_peasant(base: u8, exp: usize) -> u8 {
+        let mut result: u8 = 1;
+        for _ in 0..exp {
+            result = gf_mul_peasant(result, base);
+        }
+        result
+    }
+
+    /// Evaluate `p(point)` for `p(x) = sum_j data[j][byte] * x^j`, one byte
+    /// offset at a time, via Horner's method. This is a from-scratch
+    /// evaluator -- structurally unrelated to the coefficient-matrix
+    /// multiply-accumulate `ReedSolomon::encode_into` uses (which multiplies
+    /// each data byte by a precomputed `alpha^(i*j)` and XORs the results,
+    /// never evaluating the polynomial via nested multiplication).
+    #[cfg(test)]
+    fn horner_eval_parity(data: &[Vec<u8>], point: u8, shard_len: usize) -> Vec<u8> {
+        let d = data.len();
+        let mut out = vec![0u8; shard_len];
+        for k in 0..shard_len {
+            let mut acc = 0u8;
+            for j in (0..d).rev() {
+                acc = gf_mul_peasant(acc, point) ^ data[j][k];
+            }
+            out[k] = acc;
+        }
+        out
+    }
+
+    /// Increments `bytes` as a big-endian base-256 counter in place.
+    /// Returns `false` (instead of wrapping silently) once every value has
+    /// been produced, i.e. after processing all-`0xFF`.
+    #[cfg(test)]
+    fn increment_bytes(bytes: &mut [u8]) -> bool {
+        for b in bytes.iter_mut().rev() {
+            if *b == 0xFF {
+                *b = 0;
+            } else {
+                *b += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Genuinely brute-force reference decoder for errors-and-erasures, used
+    /// only to cross-check [`ReedSolomon::decode_errors_and_erasures`] on
+    /// tiny cases -- the same "structurally different reference" pattern
+    /// `tests/reference_vectors.rs` documents in its own conformance
+    /// philosophy (schoolbook long division vs. a table-driven LFSR, etc.).
+    /// Instead of searching over *subsets of positions* and reusing
+    /// [`ReedSolomon::decode`] like the real implementation does, this
+    /// exhaustively enumerates every possible *data byte value* combination
+    /// (only tractable for a handful of total data bytes), re-derives each
+    /// candidate's parity from scratch with [`horner_eval_parity`] (which in
+    /// turn uses [`gf_mul_peasant`], not `GfTables`), and accepts whichever
+    /// candidate disagrees with the received word in at most `max_errors`
+    /// non-erased *shard* positions (matching this decoder's per-shard, not
+    /// per-byte, error-counting granularity).
+    ///
+    /// Returns `Some(data)` if exactly one candidate is within the error
+    /// budget -- which the code's minimum distance guarantees is at most
+    /// one whenever `2*max_errors + erasures <= parity_shards` -- or `None`
+    /// if none is.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the search space (`256^(data_shards * shard_len)`) is
+    /// larger than `256^3`, or if it finds more than one candidate within
+    /// budget (which would mean the `2*max_errors + erasures <=
+    /// parity_shards` precondition was violated by the test itself). This
+    /// helper exists for tiny cross-check cases only.
+    #[cfg(test)]
+    fn brute_force_errors_and_erasures(
+        d: usize,
+        p: usize,
+        shards: &[Option<Vec<u8>>],
+        max_errors: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        let shard_len = shards
+            .iter()
+            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        let total_bytes = d * shard_len;
+        assert!(
+            total_bytes <= 3,
+            "brute_force_errors_and_erasures: search space too large for an exhaustive test ({total_bytes} data bytes)"
+        );
+
+        let mut found: Option<Vec<Vec<u8>>> = None;
+        let mut candidate = vec![0u8; total_bytes];
+        loop {
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|j| candidate[j * shard_len..(j + 1) * shard_len].to_vec())
+                .collect();
+
+            let mut error_count = 0usize;
+            for (j, dj) in data.iter().enumerate() {
+                if let Some(recv) = shards[j].as_ref()
+                    && recv.as_slice() != dj.as_slice()
+                {
+                    error_count += 1;
+                }
+            }
+            if error_count <= max_errors {
+                for pi in 0..p {
+                    let point = gf_pow_peasant(2, pi);
+                    let parity_row = horner_eval_parity(&data, point, shard_len);
+                    if let Some(recv) = shards[d + pi].as_ref()
+                        && recv.as_slice() != parity_row.as_slice()
+                    {
+                        error_count += 1;
+                    }
+                }
+            }
+
+            if error_count <= max_errors {
+                assert!(
+                    found.is_none(),
+                    "brute_force_errors_and_erasures: found multiple candidates within the error budget -- ambiguous input (2*max_errors + erasures > parity_shards?)"
+                );
+                found = Some(data);
+            }
+
+            if !increment_bytes(&mut candidate) {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Cross-checks [`ReedSolomon::decode_errors_and_erasures`] against
+    /// [`brute_force_errors_and_erasures`] -- a from-scratch, exhaustive,
+    /// structurally unrelated reference -- across a handful of tiny
+    /// (data_shards, parity_shards, shard_len) shapes, covering: no
+    /// corruption, a single data-symbol error, a single parity-symbol
+    /// error, an erasure alone, and an error combined with an erasure.
+    #[test]
+    fn decode_errors_and_erasures_matches_brute_force_reference() {
+        struct Scenario {
+            d: usize,
+            p: usize,
+            shard_len: usize,
+            max_errors: usize,
+            true_data: Vec<Vec<u8>>,
+            corrupt: Vec<(usize, usize, u8)>, // (shard index, byte index, xor delta)
+            erase: Vec<usize>,
+        }
+
+        let scenarios = vec![
+            // No corruption, no erasures.
+            Scenario {
+                d: 2,
+                p: 2,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![7], vec![200]],
+                corrupt: vec![],
+                erase: vec![],
+            },
+            // Single data-symbol error.
+            Scenario {
+                d: 2,
+                p: 2,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![7], vec![200]],
+                corrupt: vec![(0, 0, 0x55)],
+                erase: vec![],
+            },
+            // Single parity-symbol error.
+            Scenario {
+                d: 2,
+                p: 2,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![7], vec![200]],
+                corrupt: vec![(3, 0, 0xAA)],
+                erase: vec![],
+            },
+            // Erasure only, no error.
+            Scenario {
+                d: 2,
+                p: 3,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![7], vec![200]],
+                corrupt: vec![],
+                erase: vec![2], // first parity shard
+            },
+            // One error plus one erasure: 2*1 + 1 = 3 <= parity_shards (3).
+            Scenario {
+                d: 2,
+                p: 3,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![7], vec![200]],
+                corrupt: vec![(0, 0, 0x11)],
+                erase: vec![3], // second parity shard
+            },
+            // Multi-byte shard.
+            Scenario {
+                d: 1,
+                p: 2,
+                shard_len: 2,
+                max_errors: 1,
+                true_data: vec![vec![9, 250]],
+                corrupt: vec![(0, 1, 0x03)],
+                erase: vec![],
+            },
+            // Error in the last of several tiny data shards.
+            Scenario {
+                d: 3,
+                p: 2,
+                shard_len: 1,
+                max_errors: 1,
+                true_data: vec![vec![1], vec![2], vec![3]],
+                corrupt: vec![(2, 0, 0x80)],
+                erase: vec![],
+            },
+        ];
+
+        for sc in scenarios {
+            assert_eq!(
+                sc.true_data.len(),
+                sc.d,
+                "scenario authoring error: true_data.len() must equal d"
+            );
+            assert!(
+                sc.true_data.iter().all(|s| s.len() == sc.shard_len),
+                "scenario authoring error: every true_data shard must have length shard_len"
+            );
+
+            let rs = ReedSolomon::new(sc.d, sc.p);
+            let parity = rs.encode(&sc.true_data).unwrap();
+            let mut shards: Vec<Option<Vec<u8>>> = sc.true_data.iter().cloned().map(Some).collect();
+            for pp in &parity {
+                shards.push(Some(pp.clone()));
+            }
+            for &(pos, byte_idx, delta) in &sc.corrupt {
+                shards[pos].as_mut().unwrap()[byte_idx] ^= delta;
+            }
+            for &pos in &sc.erase {
+                shards[pos] = None;
+            }
+
+            let brute = brute_force_errors_and_erasures(sc.d, sc.p, &shards, sc.max_errors);
+            let mut via_real = shards.clone();
+            let real_result = rs.decode_errors_and_erasures(&mut via_real, sc.max_errors);
+
+            match brute {
+                Some(expected_data) => {
+                    let corrected = real_result.unwrap_or_else(|e| {
+                        panic!(
+                            "real decoder failed but the brute-force reference found a unique answer: {e:?} (d={} p={} corrupt={:?} erase={:?})",
+                            sc.d, sc.p, sc.corrupt, sc.erase
+                        )
+                    });
+                    for j in 0..sc.d {
+                        assert_eq!(
+                            via_real[j].as_ref().unwrap(),
+                            &expected_data[j],
+                            "data mismatch vs brute-force reference: d={} p={} corrupt={:?} erase={:?}",
+                            sc.d,
+                            sc.p,
+                            sc.corrupt,
+                            sc.erase
+                        );
+                    }
+                    assert_eq!(
+                        corrected,
+                        sc.corrupt.len(),
+                        "reported error count should equal the number of actually-corrupted symbols"
+                    );
+                }
+                None => {
+                    assert!(
+                        real_result.is_err(),
+                        "real decoder returned Ok but the brute-force reference found no unique answer within budget (d={} p={} corrupt={:?} erase={:?})",
+                        sc.d,
+                        sc.p,
+                        sc.corrupt,
+                        sc.erase
+                    );
+                }
+            }
+        }
+    }
+
+    /// Seeded-random round-trip tests: encode random data, inject exactly
+    /// `k` corrupted symbols and `s` real erasures at deterministic
+    /// pseudo-random positions, for several `(data_shards, parity_shards,
+    /// k, s)` combinations satisfying `2k+s <= parity_shards`, and confirm
+    /// exact recovery -- including when `max_errors` is called looser than
+    /// the actual `k` (still finds the unique answer, and reports the
+    /// *actual* `k`, not the looser bound).
+    #[test]
+    fn decode_errors_and_erasures_random_round_trip() {
+        let combos: &[(usize, usize, usize, usize, usize)] = &[
+            // (data_shards, parity_shards, shard_len, k errors, s erasures)
+            (10, 4, 512, 0, 0),
+            (10, 4, 512, 1, 0),
+            (10, 4, 512, 1, 1),
+            (10, 4, 512, 1, 2),
+            (10, 4, 512, 2, 0),
+            (10, 4, 512, 0, 4),
+            (6, 6, 128, 3, 0),
+            (6, 6, 128, 2, 2),
+            (6, 6, 128, 1, 4),
+            (4, 2, 64, 1, 0),
+            (5, 5, 256, 2, 1),
+        ];
+
+        let mut seed = 0xC0DE_1234_5678_9ABCu64;
+
+        for &(d, p, shard_len, k, s) in combos {
+            assert!(
+                2 * k + s <= p,
+                "test combo itself violates 2k+s<=p: d={d} p={p} k={k} s={s}"
+            );
+
+            let rs = ReedSolomon::new(d, p);
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|j| {
+                    seed = seed.wrapping_add(j as u64 * 7 + 1);
+                    xorshift_bytes(shard_len, seed)
+                })
+                .collect();
+            let parity = rs.encode(&data).unwrap();
+
+            let total = d + p;
+            let mut order: Vec<usize> = (0..total).collect();
+            // Deterministic Fisher-Yates shuffle driven by the same
+            // xorshift stream, so position selection is reproducible.
+            for i in (1..order.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let j = (seed as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let corrupt_positions: Vec<usize> = order[0..k].to_vec();
+            let erase_positions: Vec<usize> = order[k..k + s].to_vec();
+
+            let build_base = || -> Vec<Option<Vec<u8>>> {
+                let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+                for pp in &parity {
+                    shards.push(Some(pp.clone()));
+                }
+                shards
+            };
+
+            let mut base_shards = build_base();
+            for &pos in &corrupt_positions {
+                let shard = base_shards[pos].as_mut().unwrap();
+                seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                let byte_idx = (seed as usize) % shard_len;
+                let mut delta = (seed >> 32) as u8;
+                if delta == 0 {
+                    delta = 1; // guarantee an actual change
+                }
+                shard[byte_idx] ^= delta;
+            }
+            for &pos in &erase_positions {
+                base_shards[pos] = None;
+            }
+
+            // Try both the tight bound (max_errors == k) and, when the code
+            // distance allows it, a looser bound (max_errors == k+1) -- both
+            // must find the exact same unique, correct answer.
+            let mut max_errors_variants = vec![k];
+            if 2 * (k + 1) + s <= p {
+                max_errors_variants.push(k + 1);
+            }
+
+            for max_errors in max_errors_variants {
+                let mut shards = base_shards.clone();
+                let result = rs.decode_errors_and_erasures(&mut shards, max_errors);
+                assert_eq!(
+                    result,
+                    Ok(k),
+                    "combo d={d} p={p} shard_len={shard_len} k={k} s={s} max_errors={max_errors} \
+                     corrupt={corrupt_positions:?} erase={erase_positions:?}"
+                );
+
+                for j in 0..d {
+                    assert_eq!(
+                        shards[j].as_ref().unwrap(),
+                        &data[j],
+                        "data mismatch: d={d} p={p} k={k} s={s} max_errors={max_errors}"
+                    );
+                }
+                for pi in 0..p {
+                    assert_eq!(
+                        shards[d + pi].as_ref().unwrap(),
+                        &parity[pi],
+                        "parity mismatch: d={d} p={p} k={k} s={s} max_errors={max_errors}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Most important test in the set: inject more errors than `2t+s <=
+    /// parity_shards` allows (well beyond even the largest `max_errors`
+    /// value the precondition check accepts) and confirm
+    /// `decode_errors_and_erasures` returns a typed
+    /// [`FecError::DecoderNotConverged`] rather than silently returning
+    /// wrong data. Uses a large shard length so that "the corrupted data
+    /// coincidentally reconstructs to something that passes verification by
+    /// chance" is not just unproven but astronomically improbable.
+    #[test]
+    fn decode_errors_and_erasures_too_many_errors_returns_typed_error() {
+        let d = 10;
+        let p = 4;
+        let shard_len = 256;
+        let rs = ReedSolomon::new(d, p);
+
+        let mut seed = 0xBADC_0FFE_1234_5678u64;
+        let data: Vec<Vec<u8>> = (0..d)
+            .map(|j| {
+                seed = seed.wrapping_add(j as u64 * 13 + 1);
+                xorshift_bytes(shard_len, seed)
+            })
+            .collect();
+        let parity = rs.encode(&data).unwrap();
+
+        let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        for pp in &parity {
+            shards.push(Some(pp.clone()));
+        }
+
+        // 3 corrupted symbols (2 data + 1 parity): 2*3 = 6 > parity_shards
+        // (4), uncorrectable even with the largest max_errors the
+        // precondition check allows with zero erasures (max_errors=2, since
+        // 2*2+0=4<=4).
+        let corrupted_positions = [0usize, 5, 11];
+        for &pos in &corrupted_positions {
+            let shard = shards[pos].as_mut().unwrap();
+            shard[0] ^= 0xFF;
+            shard[1] ^= 0x01;
+        }
+
+        let result = rs.decode_errors_and_erasures(&mut shards, 2);
+        assert_eq!(
+            result,
+            Err(FecError::DecoderNotConverged),
+            "expected a typed decode failure, not a silently wrong answer, for uncorrectable corruption"
+        );
+
+        // On failure, `shards` must be left completely untouched -- no
+        // partial or silently-wrong overwrite.
+        for j in 0..d {
+            if corrupted_positions.contains(&j) {
+                assert_ne!(
+                    shards[j].as_ref().unwrap(),
+                    &data[j],
+                    "sanity: this shard should still be corrupted (untouched) after the failed decode"
+                );
+            } else {
+                assert_eq!(shards[j].as_ref().unwrap(), &data[j]);
+            }
+        }
+        for pi in 0..p {
+            let i = d + pi;
+            if corrupted_positions.contains(&i) {
+                assert_ne!(shards[i].as_ref().unwrap(), &parity[pi]);
+            } else {
+                assert_eq!(shards[i].as_ref().unwrap(), &parity[pi]);
+            }
+        }
+    }
+
+    /// `decode_errors_and_erasures` must itself reject an infeasible
+    /// `max_errors` (violating `2*max_errors + erasures <= parity_shards`)
+    /// with a typed [`FecError::InvalidParam`] rather than attempting (and
+    /// potentially mis-searching) an uncorrectable bound.
+    #[test]
+    fn decode_errors_and_erasures_rejects_infeasible_max_errors() {
+        let rs = ReedSolomon::new(4, 4);
+        let data: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 1) as u8; 8]).collect();
+        let parity = rs.encode(&data).unwrap();
+        let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        for pp in &parity {
+            shards.push(Some(pp.clone()));
+        }
+        shards[0] = None; // one erasure, s=1
+
+        // 2*max_errors + s <= parity_shards => 2*max_errors <= 3 => max_errors <= 1.
+        assert_eq!(
+            rs.decode_errors_and_erasures(&mut shards, 2),
+            Err(FecError::InvalidParam(
+                "max_errors too large: 2*max_errors + existing erasures must not exceed parity_shards"
+            ))
+        );
+        // shards must be untouched by the rejected call.
+        assert!(shards[0].is_none());
+
+        // max_errors=1 satisfies the bound, even though there is nothing to
+        // correct beyond the one erasure.
+        let corrected = rs.decode_errors_and_erasures(&mut shards, 1).unwrap();
+        assert_eq!(corrected, 0);
+        assert_eq!(shards[0].as_ref().unwrap(), &data[0]);
+    }
+
+    /// With `max_errors = 0`, `decode_errors_and_erasures` must reconstruct
+    /// exactly the same data as the pure-erasure [`ReedSolomon::decode`] --
+    /// confirming the new combinatorial search collapses to ordinary
+    /// erasure recovery (plus a parity self-check) when no unknown-position
+    /// errors are being searched for, and that `decode` itself needed no
+    /// changes to support this.
+    #[test]
+    fn decode_errors_and_erasures_matches_decode_for_pure_erasures() {
+        let rs = ReedSolomon::new(4, 3);
+        let data: Vec<Vec<u8>> = (0..4).map(|j| vec![(j + 9) as u8; 20]).collect();
+        let parity = rs.encode(&data).unwrap();
+
+        let build = || -> Vec<Option<Vec<u8>>> {
+            let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+            for pp in &parity {
+                shards.push(Some(pp.clone()));
+            }
+            shards[1] = None;
+            shards[3] = None;
+            shards
+        };
+        let mut via_decode = build();
+        let mut via_ee = build();
+        rs.decode(&mut via_decode).unwrap();
+        let corrected = rs.decode_errors_and_erasures(&mut via_ee, 0).unwrap();
+        assert_eq!(corrected, 0);
+        assert_eq!(via_decode, via_ee);
+    }
+
     /// Task-4 equivalence guard: `encode_with_avx2` (which consumes the
     /// precomputed `nibble_tables` on AVX2 hosts, or the NEON `vqtbl1q_u8`
     /// kernel on AArch64 hosts) must produce parity byte-identical to the
@@ -1493,6 +2426,210 @@ mod tests {
             assert_eq!(
                 parity_avx2, parity_scalar,
                 "AVX2 (precomputed nibble tables) vs scalar parity mismatch: d={d} p={p} shard_len={shard_len}"
+            );
+        }
+    }
+
+    /// Informational, not a correctness check: times
+    /// `encode_with_avx2_inner` (nibble-table VPSHUFB) against
+    /// `encode_with_gfni_inner` (`GF2P8AFFINEQB`) back-to-back, interleaved,
+    /// in the same process, across several shard lengths. Interleaving
+    /// (rather than two separate `bench_export` runs) cancels out
+    /// cross-process turbo/thermal drift, which a single run of each isn't
+    /// robust to. `#[ignore]`d so it doesn't run as part of the normal test
+    /// gate; run explicitly with `cargo test --release
+    /// reed_solomon::tests::bench_gfni_vs_avx2_nibble -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn bench_gfni_vs_avx2_nibble() {
+        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no GFNI/AVX2");
+            return;
+        }
+        use std::time::Instant;
+
+        let d = 10;
+        let p = 4;
+        const ROUNDS: usize = 21;
+        const ITERS_PER_ROUND: usize = 200;
+
+        for shard_len in [256usize, 1024, 4096, 16384] {
+            let mut rs = ReedSolomon::new(d, p);
+            rs.precompute_mul_tables();
+            let data: Vec<Vec<u8>> = (0..d).map(|i| vec![i as u8; shard_len]).collect();
+            let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+            let mut parity = vec![0u8; p * shard_len];
+
+            let mut avx2_ns = Vec::with_capacity(ROUNDS);
+            let mut gfni_ns = Vec::with_capacity(ROUNDS);
+            // Warm-up both kernels before timing.
+            for _ in 0..10 {
+                rs.encode_with_avx2_inner(&refs, &mut parity);
+                rs.encode_with_gfni_inner(&refs, &mut parity);
+            }
+            for _ in 0..ROUNDS {
+                let t0 = Instant::now();
+                for _ in 0..ITERS_PER_ROUND {
+                    rs.encode_with_avx2_inner(&refs, &mut parity);
+                }
+                avx2_ns.push(t0.elapsed().as_nanos() as f64 / ITERS_PER_ROUND as f64);
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS_PER_ROUND {
+                    rs.encode_with_gfni_inner(&refs, &mut parity);
+                }
+                gfni_ns.push(t0.elapsed().as_nanos() as f64 / ITERS_PER_ROUND as f64);
+            }
+            avx2_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            gfni_ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = |v: &[f64]| v[v.len() / 2];
+            let payload = d * shard_len;
+            let mib = |ns: f64| (payload as f64 / ns) * 1e9 / (1024.0 * 1024.0);
+            eprintln!(
+                "shard_len={shard_len:>6}  avx2_nibble median={:>8.1} ns ({:>8.1} MiB/s)  gfni median={:>8.1} ns ({:>8.1} MiB/s)  speedup={:.3}x",
+                med(&avx2_ns),
+                mib(med(&avx2_ns)),
+                med(&gfni_ns),
+                mib(med(&gfni_ns)),
+                med(&avx2_ns) / med(&gfni_ns)
+            );
+        }
+    }
+
+    /// Exhaustive guard on [`crate::simd_avx2::gf2p8_affine_matrix`]: for
+    /// *every* one of the 256 possible `GF(256)` coefficients (not a random
+    /// sample -- the space is small enough to cover completely), the
+    /// derived affine matrix must reproduce `full_table[v]` for every one of
+    /// the 256 possible input bytes `v`, run through the real
+    /// `_mm256_gf2p8affine_epi64_epi8` instruction. This is what pins the
+    /// row/bit packing convention documented on `gf2p8_affine_matrix`, not
+    /// just a reading of the manual.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn gfni_matrix_reproduces_every_coefficient_table() {
+        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no GFNI/AVX2");
+            return;
+        }
+        let mut rs = ReedSolomon::new(1, 1);
+        rs.precompute_mul_tables();
+        let tables = rs.mul_tables.as_ref().unwrap();
+        let matrices = rs.gfni_matrices.as_ref().unwrap();
+
+        for coef in 0u16..256 {
+            let full_table = &tables[coef as usize];
+            let matrix = matrices[coef as usize];
+            let data: Vec<u8> = (0u16..256).map(|v| v as u8).collect();
+            let mut out = vec![0u8; 256];
+            // SAFETY: GFNI and AVX2 presence were verified above.
+            unsafe {
+                crate::simd_avx2::gf256_muladd_gfni(&data, &mut out, matrix, full_table);
+            }
+            for v in 0u16..256 {
+                assert_eq!(
+                    out[v as usize], full_table[v as usize],
+                    "coef={coef:#04x} v={v:#04x}: GFNI matrix disagrees with scalar table"
+                );
+            }
+        }
+    }
+
+    /// GFNI-specific equivalence guard, mirroring
+    /// `encode_avx2_nibble_tables_match_scalar` above:
+    /// [`ReedSolomon::encode_with_avx2`] (which dispatches to GFNI
+    /// first when available) must produce parity byte-identical to
+    /// the scalar `encode_into` reference across varied shapes, including
+    /// lengths that are not multiples of 32 (SIMD tail handling). Skips (not
+    /// fails) on hosts without GFNI, same as the AVX2 test does implicitly
+    /// by falling back to the table-chunked path.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn encode_gfni_matches_scalar() {
+        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no GFNI/AVX2");
+            return;
+        }
+        let combos: &[(usize, usize, usize)] = &[
+            (4, 2, 1),
+            (4, 2, 31),
+            (2, 1, 32),
+            (3, 3, 33),
+            (6, 3, 1000),
+            (10, 4, 4097), // not a multiple of 32: exercises the GFNI SIMD tail
+            (5, 5, 64),
+        ];
+        let mut seed = 0xC0FF_EE00_DEAD_BEEFu64;
+
+        for &(d, p, shard_len) in combos {
+            let mut rs = ReedSolomon::new(d, p);
+            rs.precompute_mul_tables();
+
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|_| {
+                    seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    xorshift_bytes(shard_len, seed)
+                })
+                .collect();
+            let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+
+            let mut parity_gfni = vec![0u8; p * shard_len];
+            let mut parity_scalar = vec![0u8; p * shard_len];
+            rs.encode_with_avx2(&refs, &mut parity_gfni).unwrap();
+            rs.encode_into(&refs, &mut parity_scalar).unwrap();
+
+            assert_eq!(
+                parity_gfni, parity_scalar,
+                "GFNI-dispatched encode vs scalar parity mismatch: d={d} p={p} shard_len={shard_len}"
+            );
+        }
+    }
+
+    /// Erasure-decode equivalence guard: with GFNI available,
+    /// [`ReedSolomon::decode`]'s internal `gf_muladd_bulk` dispatches to
+    /// `gf256_muladd_gfni` -- reconstruction must recover the exact
+    /// original data, matching `decode_matches_scalar_reference_and_original_data`
+    /// above but forcing the code path through the GFNI kernel.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn decode_gfni_matches_original_data() {
+        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no GFNI/AVX2");
+            return;
+        }
+        let d = 8;
+        let p = 4;
+        let shard_len = 777; // not a multiple of 32: exercises the GFNI SIMD tail
+        let mut seed = 0x1357_9BDF_2468_ACE0u64;
+
+        let mut rs = ReedSolomon::new(d, p);
+        rs.precompute_mul_tables();
+
+        let data: Vec<Vec<u8>> = (0..d)
+            .map(|_| {
+                seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                xorshift_bytes(shard_len, seed)
+            })
+            .collect();
+        let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let mut parity = vec![0u8; p * shard_len];
+        rs.encode_with_avx2(&refs, &mut parity).unwrap();
+
+        let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        for i in 0..p {
+            shards.push(Some(parity[i * shard_len..(i + 1) * shard_len].to_vec()));
+        }
+        // Erase up to `p` shards (the maximum recoverable).
+        for erase_idx in [0usize, 3, d, d + 1] {
+            shards[erase_idx] = None;
+        }
+
+        rs.decode(&mut shards).unwrap();
+        for j in 0..d {
+            assert_eq!(
+                shards[j].as_ref().unwrap(),
+                &data[j],
+                "recovered data shard {j} does not match original"
             );
         }
     }

@@ -491,6 +491,15 @@ impl QcLdpcDecoder {
     ///
     /// * `base_graph`   - [`BaseGraph::Bg1`] or [`BaseGraph::Bg2`].
     /// * `offset_beta`  - Offset correction $\beta$ for the min-sum update.
+    ///   $\beta$ is a real tuning parameter, not a formality: it compensates
+    ///   for min-sum overestimating check-node reliability, and both too
+    ///   little and too much correction cost error-rate performance.
+    ///   `tests/ldpc_offset_beta_sweep.rs` measures block error rate against
+    ///   $\beta$ with confidence intervals; on that measurement `0.5` is the
+    ///   best value for BG1 at production lifting sizes and is within noise
+    ///   of the best for BG2, while $\beta = 0$ (plain min-sum) is far
+    ///   worse. Re-run that sweep for your own $(Z, \text{rate},
+    ///   \text{iterations})$ rather than assuming one constant transfers.
     pub fn new(base_graph: BaseGraph, offset_beta: f32) -> Self {
         let default_z = match base_graph {
             BaseGraph::Bg1 => 384,
@@ -925,10 +934,28 @@ impl QcLdpcDecoder {
         // Z_MAX = 384 is the largest valid 3GPP lifting size; all slices are
         // taken as &mut [..z] so only the first z elements are live.
         // Stack cost: 384 * (4+4+4) = 4.5 KiB — well within thread-stack limits.
+        //
+        // `#[repr(align(64))]`-wrapped (CLAUDE.md's SIMD-alignment rule):
+        // these are always sliced from index 0 (`&mut min1_buf.0[..z]`), so
+        // wrapping the backing array guarantees every slice handed to the
+        // AVX2 kernel starts on a cache-line boundary -- unlike `edge_r`,
+        // whose per-layer offset is data-dependent (layer row-degree × z, a
+        // running sum) and so cannot be given the same unconditional
+        // guarantee without padding every layer's region, a bigger layout
+        // change not attempted here. `decode_layer_passes_avx2` relies on
+        // this: it uses the aligned load/store form for min1/min2/sxor
+        // specifically, which is UB if this invariant is ever violated.
         const Z_MAX: usize = 384;
-        let mut min1_buf = [f32::MAX; Z_MAX];
-        let mut min2_buf = [f32::MAX; Z_MAX];
-        let mut sxor_buf = [0u32; Z_MAX];
+        #[repr(align(64))]
+        struct Align64F32([f32; Z_MAX]);
+        #[repr(align(64))]
+        struct Align64U32([u32; Z_MAX]);
+        let mut min1_buf = Align64F32([f32::MAX; Z_MAX]);
+        let mut min2_buf = Align64F32([f32::MAX; Z_MAX]);
+        let mut sxor_buf = Align64U32([0u32; Z_MAX]);
+        let min1_buf = &mut min1_buf.0;
+        let min2_buf = &mut min2_buf.0;
+        let sxor_buf = &mut sxor_buf.0;
 
         // Detect SIMD capability once per call (is_x86_feature_detected! is a
         // single cached atomic read — negligible overhead per call). Only

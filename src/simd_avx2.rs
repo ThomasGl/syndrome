@@ -20,7 +20,12 @@ use std::arch::x86_64::*;
 /// Caller must verify AVX2 support at runtime, e.g. with
 /// `is_x86_feature_detected!("avx2")`. `min1`, `min2`, and `sxor` must each
 /// have length `≥ z`. `q_row` must have length `≥ row_degree * z`. `edge_r`
-/// must cover `(layer_begin + row_degree - 1) * z + z` elements.
+/// must cover `(layer_begin + row_degree - 1) * z + z` elements. `min1`,
+/// `min2`, and `sxor` are additionally accessed with **aligned** AVX2
+/// loads/stores (`_mm256_load_ps`/`_mm256_load_si256`), so their backing
+/// allocations must start on a 32-byte boundary -- the only caller,
+/// `QcLdpcDecoder::decode_layered_offset_min_sum_dispatch`, guarantees this
+/// via `#[repr(align(64))]`-wrapped locals, always sliced from index 0.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn decode_layer_passes_avx2(
     z: usize,
@@ -84,10 +89,12 @@ unsafe fn decode_layer_passes_avx2_body(
         let full = z & !7;
 
         // ── Pass 1: init scratch, then accumulate min1 / min2 / sign-XOR ───────
+        // Aligned stores: min1/min2/sxor are guaranteed 32-byte-aligned by
+        // the caller (see this fn's SAFETY doc).
         for i in (0..full).step_by(8) {
-            _mm256_storeu_ps(min1.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
-            _mm256_storeu_ps(min2.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
-            _mm256_storeu_si256(
+            _mm256_store_ps(min1.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
+            _mm256_store_ps(min2.as_mut_ptr().add(i), _mm256_set1_ps(f32::MAX));
+            _mm256_store_si256(
                 sxor[i..].as_mut_ptr() as *mut __m256i,
                 _mm256_setzero_si256(),
             );
@@ -110,17 +117,19 @@ unsafe fn decode_layer_passes_avx2_body(
                 let sign_v = _mm256_and_si256(_mm256_castps_si256(q_v), sign_mask);
 
                 // XOR each lane's sign bit into the running accumulator.
+                // Aligned load+store: sxor is guaranteed 32-byte-aligned.
                 let sx_ptr = sxor[chunk..].as_mut_ptr() as *mut __m256i;
-                _mm256_storeu_si256(
+                _mm256_store_si256(
                     sx_ptr,
-                    _mm256_xor_si256(_mm256_loadu_si256(sx_ptr as *const __m256i), sign_v),
+                    _mm256_xor_si256(_mm256_load_si256(sx_ptr as *const __m256i), sign_v),
                 );
 
                 // Branchless min1 / min2 update using blendv:
                 //   case 1 (abs ≤ m1): push m1→m2, set m1=abs
                 //   case 2 (m1 < abs < m2): set m2=abs
-                let m1_v = _mm256_loadu_ps(m1_ptr.add(chunk));
-                let m2_v = _mm256_loadu_ps(m2_ptr.add(chunk));
+                // Aligned loads: min1/min2 are guaranteed 32-byte-aligned.
+                let m1_v = _mm256_load_ps(m1_ptr.add(chunk));
+                let m2_v = _mm256_load_ps(m2_ptr.add(chunk));
 
                 let le = _mm256_cmp_ps(abs_v, m1_v, _CMP_LE_OQ);
                 let new_m2 = _mm256_blendv_ps(m2_v, m1_v, le); // case 1: m2 ← old m1
@@ -130,8 +139,8 @@ unsafe fn decode_layer_passes_avx2_body(
                 let lt2_only = _mm256_andnot_ps(le, _mm256_cmp_ps(abs_v, m2_v, _CMP_LT_OQ));
                 let new_m2 = _mm256_blendv_ps(new_m2, abs_v, lt2_only);
 
-                _mm256_storeu_ps(m1_ptr.add(chunk), new_m1);
-                _mm256_storeu_ps(m2_ptr.add(chunk), new_m2);
+                _mm256_store_ps(m1_ptr.add(chunk), new_m1);
+                _mm256_store_ps(m2_ptr.add(chunk), new_m2);
             }
             // Scalar tail (at most 7 elements).
             for i in full..z {
@@ -175,14 +184,15 @@ unsafe fn decode_layer_passes_avx2_body(
                 let abs_v = _mm256_and_ps(q_v, abs_mask);
 
                 // Exclusive sign: XOR of all edges' signs, with this edge removed.
-                let sx_v = _mm256_loadu_si256(sxor[chunk..].as_ptr() as *const __m256i);
+                // Aligned loads: sxor/min1/min2 are guaranteed 32-byte-aligned.
+                let sx_v = _mm256_load_si256(sxor[chunk..].as_ptr() as *const __m256i);
                 let excl_sign =
                     _mm256_castsi256_ps(_mm256_xor_si256(sx_v, _mm256_and_si256(q_int, sign_mask)));
 
                 // Exclusive min: use min2 where abs equals min1 (float equality is
                 // exact — value was stored directly from this q_row slot in pass 1).
-                let m1_v = _mm256_loadu_ps(m1_ptr.add(chunk));
-                let m2_v = _mm256_loadu_ps(m2_ptr.add(chunk));
+                let m1_v = _mm256_load_ps(m1_ptr.add(chunk));
+                let m2_v = _mm256_load_ps(m2_ptr.add(chunk));
                 let eq_m1 = _mm256_cmp_ps(abs_v, m1_v, _CMP_EQ_OQ);
                 let min_excl = _mm256_blendv_ps(m1_v, m2_v, eq_m1);
 
@@ -278,6 +288,99 @@ pub(crate) unsafe fn gf256_muladd_avx2(
             let lo_val = _mm256_shuffle_epi8(lo_tbl_v, lo_idx);
             let hi_val = _mm256_shuffle_epi8(hi_tbl_v, hi_idx);
             let prod = _mm256_xor_si256(lo_val, hi_val);
+
+            let par_v = _mm256_loadu_si256(parity.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(
+                parity.as_mut_ptr().add(i) as *mut __m256i,
+                _mm256_xor_si256(par_v, prod),
+            );
+            i += 32;
+        }
+
+        // Scalar tail.
+        for j in i..len {
+            parity[j] ^= full_table[data[j] as usize];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GF(256) multiply-XOR using GFNI — one instruction per 32 bytes
+// ---------------------------------------------------------------------------
+
+/// Build the packed $8 \times 8$ $\mathbb{F}\_2$ bit matrix that
+/// `_mm256_gf2p8affine_epi64_epi8` expects, for the linear map "multiply by
+/// a fixed `GF(256)` constant `c`", from `c`'s 256-entry multiplication
+/// table (`table[v] = GF_mul(c, v)`, as already built by
+/// [`crate::reed_solomon::ReedSolomon::precompute_mul_tables`]).
+///
+/// # Why this table already determines the matrix
+///
+/// Multiplication by a fixed field element is $\mathbb{F}\_2$-linear in the
+/// byte's bit representation: $c \cdot (x \oplus y) = c \cdot x \oplus c
+/// \cdot y$. A linear map on $\mathbb{F}\_2^8$ is fully determined by its
+/// action on the 8 standard basis vectors, so column $i$ of the matrix is
+/// exactly `table[1 << i]` (`c` times the byte with only bit `i` set).
+///
+/// # Bit packing convention
+///
+/// `GF2P8AFFINEQB` reads its matrix operand as 8 row-bytes packed into a
+/// `u64`; row `j`'s bit `i` selects whether column `i` contributes to output
+/// bit `j`. Row 0 is the matrix's most significant byte (bits 56..64), row 7
+/// its least significant (bits 0..8) — pinned by
+/// `gfni_matrix_reproduces_every_coefficient_table` below, which checks all
+/// 256 coefficients against the plain scalar table, not just derived by
+/// reading the manual.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn gf2p8_affine_matrix(table: &[u8; 256]) -> u64 {
+    let mut rows = [0u8; 8];
+    for i in 0..8usize {
+        let col = table[1usize << i];
+        for j in 0..8usize {
+            rows[j] |= ((col >> j) & 1) << i;
+        }
+    }
+    u64::from_be_bytes(rows)
+}
+
+/// GF(256) multiply-accumulate via GFNI: `parity[i] ^= GF_mul(coef, data[i])`.
+///
+/// Applies the $\mathbb{F}\_2$-linear "multiply by `coef`" bit matrix
+/// directly with `_mm256_gf2p8affine_epi64_epi8` — one instruction per 32
+/// bytes, versus the shuffle-mask-shuffle-blend sequence
+/// [`gf256_muladd_avx2`] needs for the same 32 bytes. `matrix` must be
+/// `coef`'s packed matrix from [`gf2p8_affine_matrix`]; `full_table` is used
+/// for the scalar tail exactly as in the AVX2 kernel.
+///
+/// # Arguments
+///
+/// * `data`       — input bytes.
+/// * `parity`     — accumulator (XOR'd in-place); must have the same length as `data`.
+/// * `matrix`     — packed affine matrix for `coef`, from [`gf2p8_affine_matrix`].
+/// * `full_table` — 256-byte table for the scalar tail: `full_table[v] = GF_mul(coef, v)`.
+///
+/// # Safety
+///
+/// Caller must have verified GFNI and AVX2 availability with
+/// `is_x86_feature_detected!("gfni")` and `is_x86_feature_detected!("avx2")`.
+#[target_feature(enable = "gfni,avx2")]
+pub(crate) unsafe fn gf256_muladd_gfni(
+    data: &[u8],
+    parity: &mut [u8],
+    matrix: u64,
+    full_table: &[u8; 256],
+) {
+    unsafe {
+        let len = data.len().min(parity.len());
+        let full = len & !31; // floor to multiple of 32
+
+        let matrix_v = _mm256_set1_epi64x(matrix as i64);
+
+        let mut i = 0usize;
+        while i < full {
+            let data_v = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
+            // imm8 = 0: no additive constant, this is pure linear multiply.
+            let prod = _mm256_gf2p8affine_epi64_epi8(data_v, matrix_v, 0);
 
             let par_v = _mm256_loadu_si256(parity.as_ptr().add(i) as *const __m256i);
             _mm256_storeu_si256(
