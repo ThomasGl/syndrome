@@ -14,8 +14,20 @@
 //! range for the expected LLR distribution.  The value $-128$ is reserved as
 //! a sentinel (unused) so that `i8::abs()` never overflows.
 //!
-//! Typical scale: $s = 8.0$ for 5G BPSK channels at operating SNR.  The
-//! quantisation loss is < 0.1 dB at the working point.
+//! Typical scale: $s = 8.0$ for 5G BPSK channels at operating SNR, chosen to
+//! keep the dynamic range of a working-point LLR distribution inside the
+//! `[-127, 127]` clamp without wasting precision on values that never occur.
+//!
+//! This crate has not yet measured its own quantization loss, because the
+//! vectorized i8 LOMS kernel this module exists to feed is not implemented
+//! (see above) — there is no decode path here to measure. For general
+//! min-sum LDPC decoders, published results report well under 0.1 dB loss
+//! at typical operating error rates for well-tuned 6-8 bit quantization
+//! (e.g. the NSF-hosted survey "Modified Min-Sum Algorithm for Quantized
+//! LDPC Decoders", <https://par.nsf.gov/servlets/purl/10156560>), but that
+//! figure describes other implementations, not this one, until this crate
+//! has a kernel and a BER/BLER sweep (via `bin/ber_sim.rs`) to back its own
+//! number.
 //!
 //! # Examples
 //!
