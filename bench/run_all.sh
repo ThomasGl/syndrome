@@ -168,6 +168,42 @@ else
     fail "ldpc_bench_export failed"
 fi
 
+# ── 6b. LDPC correctness gate ────────────────────────────────────────────────
+#
+# The RS gate above compares parity bytes for exact equality, which is
+# meaningful because GF(256) encoding is integer arithmetic. LOMS is floating
+# point and the two binaries are built by different compilers with different
+# vectorization and FMA-contraction choices, so identical f32 LLRs are not
+# something either toolchain guarantees. The comparable quantity is the
+# decoder's hard decisions — which codeword it settled on — hashed with
+# FNV-1a on both sides. That is integer, it is what a downstream stage
+# actually consumes, and it is invariant to last-ulp float differences.
+echo ""
+echo "── LDPC checksum gate (decoder output correctness) ──────────────────────"
+
+LDPC_RUST_CS=""
+LDPC_CPP_CS=""
+[ -f "$RESULTS_DIR/ldpc_rust.checksum" ] && LDPC_RUST_CS="$(cat "$RESULTS_DIR/ldpc_rust.checksum")"
+[ -f "$RESULTS_DIR/ldpc_cpp.checksum"  ] && LDPC_CPP_CS="$(cat "$RESULTS_DIR/ldpc_cpp.checksum")"
+
+if [ -z "$LDPC_RUST_CS" ]; then
+    fail "ldpc_rust.checksum missing — ldpc_bench_export did not run successfully"
+elif [ -z "$LDPC_CPP_CS" ]; then
+    warn "Only Rust LDPC checksum available (C++ LDPC benchmark may have been skipped)"
+elif [ "$LDPC_RUST_CS" = "$LDPC_CPP_CS" ]; then
+    ok "Rust == C++ LOMS hard decisions (all 26112 identical ✓)"
+else
+    fail "CHECKSUM MISMATCH: Rust != C++ LOMS hard decisions"
+    echo "  Rust:  $LDPC_RUST_CS"
+    echo "  C++:   $LDPC_CPP_CS"
+    echo ""
+    echo -e "${RED}STOP: LDPC decoder divergence detected.${NC}"
+    echo "The two implementations settled on different codewords from identical input."
+    echo "That is an algorithm difference, not a rounding difference — fix it before"
+    echo "plotting any numbers."
+    exit 2
+fi
+
 # ── 7. Summary table ────────────────────────────────────────────────────────
 echo ""
 echo "── Throughput summary (MiB/s) ──────────────────────────────────────────"

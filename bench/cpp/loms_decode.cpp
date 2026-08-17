@@ -331,6 +331,31 @@ static void init_llr(float* llr) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-language correctness checksum
+//
+// FNV-1a over the decoder's hard decisions (llr < 0 -> 1), matching
+// `hard_decision_checksum` in src/bin/ldpc_bench_export.rs bit for bit.
+//
+// Hard decisions rather than raw LLRs: the RS gate can demand byte-identical
+// parity because GF(256) encoding is integer arithmetic, but LOMS is
+// floating point and this file is built with -O3 -march=native, so the
+// compiler may contract multiply-adds into FMAs, reassociate, and vectorize
+// differently from rustc. Identical f32 values are therefore not something
+// either toolchain promises. Which codeword the decoder settles on *is*
+// integer, is what every downstream stage consumes, and is invariant to
+// those last-ulp differences.
+// ---------------------------------------------------------------------------
+
+static uint64_t hard_decision_checksum(const float* llr, int n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < n; ++i) {
+        h ^= (uint64_t)(llr[i] < 0.0f ? 1u : 0u);
+        h *= 0x00000100000001b3ULL;
+    }
+    return h;
+}
+
+// ---------------------------------------------------------------------------
 // Timing helpers
 // ---------------------------------------------------------------------------
 
@@ -441,6 +466,31 @@ int main(int argc, char** argv) {
         N_VAR, median_ns, melem_per_s, N_VAR, DECODE_ITERS);
     fclose(jf);
     printf("Wrote %s\n", out_path.c_str());
+
+    // ── Correctness checksum ────────────────────────────────────────────
+    // One fresh decode from the canonical init, then hash the hard
+    // decisions. Compared against ldpc_rust.checksum by bench/run_all.sh.
+    init_llr(llr.data());
+    std::fill(edge_r.begin(), edge_r.end(), 0.0f);
+    decode_loms(llr.data(), edge_r.data(), q_row.data(), L);
+
+    uint64_t checksum = hard_decision_checksum(llr.data(), N_VAR);
+    int ones = 0;
+    for (int i = 0; i < N_VAR; ++i) {
+        if (llr[i] < 0.0f) ++ones;
+    }
+    printf("Hard-decision checksum: %016llx (%d ones of %d)\n",
+           (unsigned long long)checksum, ones, N_VAR);
+
+    std::string cs_path = out_dir + "/ldpc_cpp.checksum";
+    FILE* cf = fopen(cs_path.c_str(), "w");
+    if (!cf) {
+        fprintf(stderr, "ERROR: cannot write %s\n", cs_path.c_str());
+        return 1;
+    }
+    fprintf(cf, "%016llx\n", (unsigned long long)checksum);
+    fclose(cf);
+    printf("Wrote %s\n", cs_path.c_str());
 
     return 0;
 }

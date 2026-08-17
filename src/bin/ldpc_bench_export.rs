@@ -27,6 +27,30 @@ fn init_llr(llr: &mut [f32]) {
     }
 }
 
+/// FNV-1a over the decoder's hard-decision output, for the cross-language
+/// correctness gate.
+///
+/// The Reed-Solomon gate compares parity bytes for exact equality because
+/// GF(256) encoding is integer arithmetic: any two correct implementations
+/// must agree bit for bit. LOMS is floating point, and `g++ -O3
+/// -march=native` and `rustc` are free to contract multiply-adds into FMAs,
+/// reassociate, and vectorize differently — so identical `f32` LLRs are not
+/// a property either compiler guarantees, and demanding them would produce a
+/// gate that fails for reasons unrelated to correctness.
+///
+/// Hashing the *hard decisions* instead compares the thing that actually has
+/// to match: which codeword the decoder settled on. That is an integer
+/// quantity, it is what every downstream stage consumes, and it is invariant
+/// to the last-ulp differences the compilers are entitled to introduce.
+fn hard_decision_checksum(hard: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in hard {
+        h ^= u64::from(b & 1);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Time `BENCH_REPS` decode calls (resetting the LLR buffer before each rep)
 /// and return the median nanoseconds/call, using `decode` to run either the
 /// runtime-dispatched or forced-scalar kernel.
@@ -111,4 +135,27 @@ fn main() {
     let json_path = format!("{out_dir}/ldpc_rust.json");
     std::fs::write(&json_path, &json).expect("cannot write ldpc_rust.json");
     println!("Wrote {json_path}");
+
+    // ── Correctness checksum ─────────────────────────────────────────────
+    // Run one fresh decode with the *scalar* kernel: the C++ reference is
+    // scalar, so this compares like with like. The SIMD kernels already have
+    // their own scalar-equivalence tests inside the crate.
+    init_llr(&mut llr);
+    edge_r.fill(0.0);
+    decoder
+        .decode_layered_offset_min_sum_scalar(
+            &mut llr,
+            &mut edge_r,
+            &mut scratch,
+            &mut hard,
+            DECODE_ITERS,
+        )
+        .expect("checksum decode failed");
+    let checksum = hard_decision_checksum(&hard);
+    let ones = hard.iter().filter(|&&b| b == 1).count();
+    let checksum_path = format!("{out_dir}/ldpc_rust.checksum");
+    std::fs::write(&checksum_path, format!("{checksum:016x}\n"))
+        .expect("cannot write ldpc_rust.checksum");
+    println!("Hard-decision checksum: {checksum:016x} ({ones} ones of {n})");
+    println!("Wrote {checksum_path}");
 }
