@@ -28,10 +28,17 @@
      backslashes verbatim, so those files use ordinary LaTeX (`\,`, `\{`,
      `_`). Do not copy either convention into the other.
 
-     To check: render every math span through KaTeX after any doc edit rather
-     than eyeballing it -- `throwOnError: false` below means a malformed
-     expression shows up as red raw source on the page instead of failing
-     loudly. -->
+     To check, run the harness rather than eyeballing the rendered pages:
+
+         cd tools && npm ci && npm run check
+
+     `tools/check_doc_math.mjs` extracts every math span from the crate's
+     doc comments, applies CommonMark's escape rule, and parses the result
+     with KaTeX. Eyeballing does not work, for two reasons: `throwOnError:
+     false` below means a malformed expression shows up as red raw source on
+     the page instead of failing loudly, and a row break that lost a
+     backslash renders cleanly with every row collapsed into one. The CI job
+     `doc-math` runs the same check on every push. -->
 <link
   rel="stylesheet"
   href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css"

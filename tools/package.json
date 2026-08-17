@@ -1,0 +1,13 @@
+{
+  "name": "syndrome-doc-math-check",
+  "private": true,
+  "version": "0.0.0",
+  "description": "KaTeX parse check for the crate's rustdoc math. See check_doc_math.mjs.",
+  "type": "module",
+  "scripts": {
+    "check": "node check_doc_math.mjs ../src"
+  },
+  "dependencies": {
+    "katex": "0.18.1"
+  }
+}

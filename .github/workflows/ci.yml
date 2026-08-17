@@ -170,6 +170,34 @@ jobs:
             exit 1
           fi
 
+  doc-math:
+    name: Rustdoc Math
+    runs-on: ubuntu-latest
+    # rustdoc renders doc comments as CommonMark *before* KaTeX sees them, and
+    # CommonMark strips a backslash that precedes ASCII punctuation. The result
+    # is a class of bug that cannot be caught by reading the generated pages:
+    # `katex-header.html` sets `throwOnError: false`, so a malformed expression
+    # renders as red raw source rather than failing the build, and a row break
+    # that lost a backslash renders cleanly with every row collapsed into one.
+    # This job re-runs the pipeline and parses each span, so the convention
+    # documented in katex-header.html is enforced instead of remembered.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/package-lock.json
+
+      - name: Install KaTeX
+        working-directory: tools
+        run: npm ci
+
+      - name: Check every math span in the rustdoc comments
+        working-directory: tools
+        run: npm run check
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

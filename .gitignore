@@ -25,6 +25,10 @@ Thumbs.db
 # from the copyrighted 3GPP specification, so they stay local.
 /data/*.csv
 
+# KaTeX install for tools/check_doc_math.mjs (package.json + lockfile are
+# committed; the tree itself is not).
+/tools/node_modules/
+
 # Compiled C++ benchmark binaries (built by bench/cpp/Makefile)
 /bench/cpp/loms_decode
 /bench/cpp/rs_encode

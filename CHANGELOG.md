@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted a published figure for other decoders. That paragraph is replaced by
   this measurement.
 
+- **Rustdoc math CI gate** (`tools/check_doc_math.mjs`, `tools/package.json`,
+  CI job `doc-math`): extracts every LaTeX span from the crate's doc
+  comments, applies CommonMark's backslash-escape rule, and parses the result
+  with the same KaTeX version `katex-header.html` loads. rustdoc renders doc
+  comments as CommonMark before KaTeX sees them, and `throwOnError: false`
+  means a malformed expression appears as red raw source on the rendered page
+  rather than failing the build — so this class of bug survives review of the
+  generated pages. The gate also checks the source for row breaks written
+  with two backslashes instead of four, which is the failure that *does*
+  parse: it reaches KaTeX as a control space and silently collapses a `cases`
+  or `bmatrix` block to a single row.
+
 ### Changed
 
 - `src/bin/ldpc_bench_export.rs` additionally times the fixed-point kernels
