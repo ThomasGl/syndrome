@@ -71,7 +71,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **Exhaustive model check of the SPSC ring's memory ordering**
+  (`tests/loom_spsc.rs`, `src/sync_shim.rs`, CI job `loom`): five
+  [loom](https://docs.rs/loom) models covering the single-item entry points,
+  the batched ones, the mixed pairing, and the over-capacity case where the
+  producer must wait for the consumer to free a slot.
+
+  The ring's `Acquire`/`Release` contract was documented but not checkable.
+  The existing two-thread stress tests sample whichever interleavings the
+  machine produces, and on x86-64 the hardware will not reorder a store past
+  a store — so weakening either `Release` to `Relaxed` leaves them passing
+  indefinitely there while introducing a bug that surfaces on AArch64, the
+  architecture the crate's other CI job runs on. loom instead models the C11
+  ordering rules and enumerates the executions a small program admits, and
+  its instrumented cells flag a slot touched by both threads without an
+  intervening happens-before edge even when the values come out right.
+
+  Eight deliberately injected defects — each `Release` and `Acquire` weakened
+  in turn, and each occupancy count moved by one — are all caught. Two of
+  them were not, in the first draft: sending exactly `CAP` items never makes
+  the batched producer wait for space, so `push_slice` never had to shorten a
+  batch from the consumer's counter. The over-capacity model exists because
+  those controls said it had to.
+
+  Only the model check pays for any of this. `loom` is a
+  `[target.'cfg(loom)'.dependencies]` entry, so it is absent from an ordinary
+  build, from `cargo test`, and from anything a downstream user resolves;
+  `src/sync_shim.rs` re-exports `core::sync::atomic` and a zero-cost
+  `UnsafeCell` wrapper unless `--cfg loom` is set.
+
 ### Changed
+
+- **`SpscRing` now holds one `UnsafeCell` per slot** rather than one around
+  the whole buffer array (`src/spsc_queue.rs`). With a single cell the
+  producer's write has to form a mutable reference spanning every slot while
+  the consumer holds a shared reference over the same range — an aliasing
+  violation under Rust's reference rules even though the two touch disjoint
+  elements and no byte is ever both read and written. The loom models report
+  it as a causality violation, which is how it was found; nothing else in the
+  suite could see it. Per-slot cells make the disjointness structural: each
+  access borrows exactly the slot it touches. No API or behaviour change.
 
 - `src/bin/ldpc_bench_export.rs` additionally times the fixed-point kernels
   (`loms_i8_runtime_simd`, `loms_i8_scalar`) over the same decode workload,

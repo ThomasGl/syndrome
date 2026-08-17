@@ -398,11 +398,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (450 tests total on x86-64; 448 on AArch64)
+### 4.1 Component coverage (455 tests total on x86-64; 453 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 239 (x86-64) / 237 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 244 (x86-64) / 242 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
 | int8 LDPC kernel equivalence (scalar vs AVX2, bit-for-bit) | 8 | `tests/ldpc_int8_kernel_equivalence.rs` |
@@ -412,6 +412,7 @@ loop {
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
+| SPSC memory-ordering model check (loom, exhaustive) | 5 — not counted above; needs `--cfg loom` | `tests/loom_spsc.rs` |
 | Doctests | 128 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
@@ -447,11 +448,20 @@ Highlights of what the tests actually *prove* (not just exercise):
   and every table-driven rewrite (CRC, BCH) is tested against its retained
   scalar reference implementation on hundreds of seeded random inputs —
   bit-for-bit where the arithmetic permits, which it does in all cases here.
+- **SPSC memory ordering**: the ring's `Acquire`/`Release` contract is
+  model-checked with [loom](https://docs.rs/loom), which enumerates the
+  executions the C11 ordering rules permit instead of sampling the ones this
+  CPU happens to produce. That distinction is the point: x86-64 will not
+  reorder a store past a store, so a queue with a genuinely wrong ordering
+  passes a two-thread stress test here indefinitely while failing on AArch64.
+  Eight injected defects — every `Release`/`Acquire` weakened in turn, every
+  occupancy count moved by one — are each caught.
 
 Run all:
 ```bash
 cargo test          # unit + integration + doctests
 cargo test --test media_reconstruction -- --nocapture   # BER waterfall output
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_spsc   # SPSC model check
 ```
 
 ### 4.2 End-to-end media reconstruction

@@ -84,12 +84,46 @@
 //! `head_and_tail_do_not_share_a_cache_line` test below for a
 //! `size_of`/`align_of` + address-distance proof.
 //!
+//! # How that ordering claim is checked
+//!
+//! The paragraphs above are a claim, and the two-thread stress tests further
+//! down cannot establish it. A stress test samples whichever interleavings
+//! the machine happens to produce, and on x86-64 the hardware will not
+//! reorder a store past a store at all — so downgrading either `Release`
+//! above to `Relaxed` leaves those tests passing indefinitely on this
+//! architecture while introducing a bug that appears on AArch64.
+//!
+//! `tests/loom_spsc.rs` answers it properly. [loom](https://docs.rs/loom)
+//! models the C11 memory-ordering rules and exhaustively explores the
+//! interleavings and reorderings a small program admits, and its instrumented
+//! cells report a slot touched by both threads without an intervening
+//! happens-before edge as a data race even when the values come out right.
+//! Five models cover the single-item and batched entry points, the mixed
+//! pairing, and the over-capacity case where the producer must wait; eight
+//! deliberately injected defects — every `Release`/`Acquire` weakened in turn,
+//! and every occupancy count moved by one — are each caught by at least one
+//! of them. Run it with:
+//!
+//! ```text
+//! RUSTFLAGS="--cfg loom" cargo test --release --test loom_spsc
+//! ```
+//!
+//! That check is also what determined the buffer's layout: the ring holds one
+//! `UnsafeCell` per slot rather than one around the whole array, because a
+//! single cell forces the producer to form a mutable reference spanning every
+//! slot while the consumer holds a shared one over the same range — an
+//! aliasing violation even though the two touch disjoint elements. loom
+//! reports it; nothing else in the suite did.
+//!
 //! This queue is fully preallocated at construction time. The hot path uses
 //! no heap allocations and relies only on atomic pointer arithmetic.
 
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+// `std` in an ordinary build, `loom`'s instrumented equivalents under
+// `--cfg loom`. See `crate::sync_shim` for why, and `tests/loom_spsc.rs` for
+// what that buys.
+use crate::sync_shim::{AtomicUsize, Ordering, UnsafeCell};
 
 /// A single [`AtomicUsize`] padded out to occupy an entire 64-byte cache
 /// line by itself.
@@ -135,7 +169,17 @@ impl CachePadded {
 /// each padded onto their own cache line.
 #[repr(align(64))]
 pub struct SpscRing<T: Copy, const N: usize> {
-    buffer: UnsafeCell<[MaybeUninit<T>; N]>,
+    /// One `UnsafeCell` per slot, not one around the whole array.
+    ///
+    /// The distinction is not cosmetic. With a single cell over the array,
+    /// the producer's write has to form `&mut [MaybeUninit<T>; N]` covering
+    /// every slot while the consumer holds a shared reference over the same
+    /// range — an aliasing violation under Rust's reference rules even though
+    /// the two touch disjoint elements and no byte is ever both read and
+    /// written. `tests/loom_spsc.rs` reports it as a causality violation,
+    /// which is how it was found. Per-slot cells make the disjointness
+    /// structural: each access borrows exactly the slot it touches.
+    buffer: [UnsafeCell<MaybeUninit<T>>; N],
     head: CachePadded,
     tail: CachePadded,
     mask: usize,
@@ -154,9 +198,8 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
     /// Creates a new ring with capacity `N`. `N` must be a power of two.
     pub fn new() -> Self {
         assert!(N.is_power_of_two(), "capacity must be a power of two");
-        let buffer = unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() };
         SpscRing {
-            buffer: UnsafeCell::new(buffer),
+            buffer: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             head: CachePadded::new(0),
             tail: CachePadded::new(0),
             mask: N - 1,
@@ -186,7 +229,11 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         }
 
         let idx = head & self.mask;
-        unsafe { (*self.buffer.get())[idx].write(item) };
+        // SAFETY: as the sole producer this thread owns slot `head & mask`;
+        // the consumer only reads slots below `tail`, and the check above
+        // established `head - tail < N`. The `Release` store afterwards is
+        // what publishes the write.
+        self.buffer[idx].with_mut(|slot| unsafe { (*slot).write(item) });
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
@@ -200,7 +247,11 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         }
 
         let idx = tail & self.mask;
-        let item = unsafe { (*self.buffer.get())[idx].assume_init_read() };
+        // SAFETY: `head != tail`, so slot `tail & mask` was published by the
+        // producer's `Release` store to `head` that the `Acquire` load above
+        // observed. As the sole consumer, nothing else reads or reclaims it
+        // before the store to `tail` below.
+        let item = self.buffer[idx].with(|slot| unsafe { (*slot).assume_init_read() });
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(item)
     }
@@ -260,14 +311,11 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         // inside that range and cannot race the consumer, which only reads
         // slots below `tail`. The `Release` store afterwards is what
         // publishes them.
-        unsafe {
-            let buf = &mut *self.buffer.get();
-            for i in 0..first {
-                buf[start + i].write(items[i]);
-            }
-            for i in 0..count - first {
-                buf[i].write(items[first + i]);
-            }
+        for i in 0..first {
+            self.buffer[start + i].with_mut(|slot| unsafe { (*slot).write(items[i]) });
+        }
+        for i in 0..count - first {
+            self.buffer[i].with_mut(|slot| unsafe { (*slot).write(items[first + i]) });
         }
         self.head.store(head.wrapping_add(count), Ordering::Release);
         count
@@ -316,14 +364,11 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
         // published by the producer's `Release` store to `head` that this
         // thread's `Acquire` load above observed. As the sole consumer, no
         // other thread reads or reclaims them before the store to `tail`.
-        unsafe {
-            let buf = &*self.buffer.get();
-            for i in 0..first {
-                out[i] = buf[start + i].assume_init_read();
-            }
-            for i in 0..count - first {
-                out[first + i] = buf[i].assume_init_read();
-            }
+        for i in 0..first {
+            out[i] = self.buffer[start + i].with(|slot| unsafe { (*slot).assume_init_read() });
+        }
+        for i in 0..count - first {
+            out[first + i] = self.buffer[i].with(|slot| unsafe { (*slot).assume_init_read() });
         }
         self.tail.store(tail.wrapping_add(count), Ordering::Release);
         count

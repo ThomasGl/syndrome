@@ -78,6 +78,14 @@ proptest = "1.4"
 once_cell = "1.20"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# loom is only ever compiled under `--cfg loom`, which nothing but the model
+# check sets — so it is absent from an ordinary build, from `cargo test`, and
+# from anything a downstream user resolves. It has to be a *normal* dependency
+# rather than a dev-dependency because `src/sync_shim.rs` lives in the library
+# itself: dev-dependencies are not visible to the lib target, only to tests.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "fec_bench"
 harness = false
@@ -85,6 +93,15 @@ harness = false
 # Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`. Only two
 # lints are allowed, each for a concrete reason; everything else is fixed in
 # the source rather than suppressed.
+[lints.rust]
+# `--cfg loom` swaps `src/sync_shim.rs` onto loom's instrumented atomics and
+# cells so `tests/loom_spsc.rs` can model-check the SPSC ring's memory
+# ordering. It is set through RUSTFLAGS rather than declared as a Cargo
+# feature, because loom must replace the primitives across the whole
+# dependency graph and a feature only reaches this crate. Declaring it here is
+# what keeps `unexpected_cfgs` accurate instead of blanket-allowing the lint.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [lints.clippy]
 # Performance-intentional. CLAUDE.md mandates index-based, branch-free hot loops
 # (SoA + SIMD friendliness) in the LDPC/RS/Viterbi kernels. Rewriting these into

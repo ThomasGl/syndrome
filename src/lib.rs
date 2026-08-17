@@ -46,6 +46,7 @@ pub mod reed_solomon;
 pub mod segmentation;
 pub mod sixg;
 pub mod spsc_queue;
+pub(crate) mod sync_shim;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transport_block;
