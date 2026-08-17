@@ -98,11 +98,18 @@ pub struct DlSchConfig {
 }
 
 impl DlSchConfig {
-    /// The decoder-side defaults (`iterations: 20`, `offset_beta: 0.25`)
+    /// The decoder-side defaults (`iterations: 20`, `offset_beta: 0.5`)
     /// with zeroed link parameters, intended for struct-update syntax as in
     /// the [`DlSchConfig`] example. There is no `Default` impl because a
     /// zero `tb_size`/`g` is not a usable configuration, only a base to
     /// spread real values over.
+    ///
+    /// `offset_beta: 0.5` is the value measured best for BG1 at production
+    /// lifting sizes by `tests/ldpc_offset_beta_sweep.rs`, which sweeps
+    /// $\beta$ against block error rate with confidence intervals; on BG2
+    /// it is statistically indistinguishable from the sweep's best point.
+    /// See that file to re-run the measurement rather than taking the
+    /// constant on trust.
     ///
     /// # Returns
     ///
@@ -116,7 +123,7 @@ impl DlSchConfig {
             qm: 0,
             g: 0,
             iterations: 20,
-            offset_beta: 0.25,
+            offset_beta: 0.5,
         }
     }
 }
@@ -430,7 +437,10 @@ impl DlSchDecoder {
     /// * `qm`           - Modulation order.
     /// * `g`            - Total coded bits available.
     /// * `iterations`   - LDPC iterations per CB per call.
-    /// * `offset_beta`  - LOMS offset correction $\beta$ (typically 0.25).
+    /// * `offset_beta`  - LOMS offset correction $\beta$. Use `0.5` unless
+    ///   you have measured otherwise for your configuration; see
+    ///   [`DlSchConfig::default_decode_params`] for where that value comes
+    ///   from.
     ///
     /// # Errors
     ///
