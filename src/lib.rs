@@ -2,8 +2,9 @@
 //!
 //! A protocol-aware FEC library implementing the 3GPP TS 38.212 transport block
 //! processing chain: CRC attachment, code block segmentation, QC-LDPC encode/decode
-//! (BG1/BG2, LOMS), rate matching, HARQ soft combining, Reed-Solomon erasure coding,
-//! Viterbi convolutional decoding, Polar codes, LTE Turbo codes, BCH codes, the
+//! (BG1/BG2, LOMS), rate matching, HARQ soft combining, Reed-Solomon erasure and
+//! errors-and-erasures coding, Viterbi convolutional decoding (zero-terminated and
+//! tail-biting), Polar codes, LTE Turbo codes, BCH codes, the
 //! extended binary Golay code, IEEE 802.11 Wi-Fi LDPC with shortening and
 //! puncturing, and the Bluetooth FEC profiles (LE Coded PHY, BR/EDR).
 //!
@@ -29,6 +30,7 @@ pub mod golay;
 pub mod hamming;
 pub mod harq;
 pub mod ldpc_pipeline;
+pub mod montecarlo;
 pub mod polar;
 pub mod qc_ldpc;
 pub mod quantize;
