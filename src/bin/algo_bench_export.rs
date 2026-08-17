@@ -20,16 +20,60 @@ use syndrome::{
     TurboEncoder,
 };
 
-/// Timing harness: warm-up then averaged wall-clock ns per call.
-fn time_ns<F: FnMut()>(mut f: F, warmup: u32, iters: u32) -> f64 {
-    for _ in 0..warmup {
+/// Median of `ROUNDS` round-means, after a time-based warm-up.
+///
+/// The obvious estimator — one mean over a fixed block of calls, after a
+/// fixed *count* of warm-up calls — is wrong in two independent ways on a
+/// shared, virtualized host, and both were measured on this one rather than
+/// assumed:
+///
+/// * **Warm-up must be measured in time, not calls.** A fixed call count
+///   warms a slow kernel for milliseconds and a fast one for microseconds.
+///   The AVX2/GFNI Reed-Solomon kernel needs the long end: a 300-call block
+///   reports roughly 78 Gbit/s after 20 warm-up calls and roughly 165 Gbit/s
+///   once fully warmed, so a count tuned for the scalar codecs understates
+///   the vector ones by about half, and *which* of those two regimes a given
+///   run lands in varies with host state. Running the identical measurement
+///   against the scalar `encode_into` kernel on the same buffers shows no
+///   such ramp, which is what rules out cache residency and points at the
+///   vector units.
+///
+/// * **The estimator must be a median, not a mean.** Per-call times here are
+///   heavily right-tailed — the 99.9th percentile is around 8x the median
+///   and the worst case around 50x — because the process gets preempted. A
+///   mean folds every preemption straight into the result: 100 independent
+///   300-call blocks timing the same RS encode spanned 90 to 160 Gbit/s.
+///   A median across rounds discards the interrupted rounds instead of
+///   averaging them in.
+///
+/// # Arguments
+///
+/// * `f` — the operation to time; called many times.
+/// * `iters` — calls per timed round. Choose so a round lasts long enough to
+///   dwarf timer granularity but stays short enough that a preemption spoils
+///   only that round.
+fn time_ns<F: FnMut()>(mut f: F, iters: u32) -> f64 {
+    /// Warm-up duration. Long enough for the AVX2/GFNI kernels to reach a
+    /// steady frequency, which is the slowest thing here to settle.
+    const WARMUP_MS: u128 = 120;
+    /// Odd, so the median is an observed round rather than an interpolation.
+    const ROUNDS: usize = 51;
+
+    let w0 = Instant::now();
+    while w0.elapsed().as_millis() < WARMUP_MS {
         f();
     }
-    let t0 = Instant::now();
-    for _ in 0..iters {
-        f();
+
+    let mut rounds: Vec<f64> = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        rounds.push(t0.elapsed().as_nanos() as f64 / iters as f64);
     }
-    t0.elapsed().as_nanos() as f64 / iters as f64
+    rounds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    rounds[ROUNDS / 2]
 }
 
 struct Record {
@@ -86,7 +130,6 @@ fn main() {
                     *c = encode_hamming_7_4(nib);
                 }
             },
-            20,
             200,
         );
         records.push(Record {
@@ -104,7 +147,6 @@ fn main() {
                     *o = syndrome::decode_hamming_7_4(c).unwrap();
                 }
             },
-            20,
             200,
         );
         records.push(Record {
@@ -124,7 +166,6 @@ fn main() {
             || {
                 std::hint::black_box(crc.compute(&bits));
             },
-            20,
             500,
         );
         records.push(Record {
@@ -146,7 +187,7 @@ fn main() {
         let mut parity = vec![0u8; p * shard_len];
         let info_bits = d * shard_len * 8;
 
-        let ns_enc = time_ns(|| rs.encode_with_avx2(&refs, &mut parity).unwrap(), 20, 300);
+        let ns_enc = time_ns(|| rs.encode_with_avx2(&refs, &mut parity).unwrap(), 300);
         records.push(Record {
             algo: "reed_solomon",
             label: "Reed-Solomon RS(10,4) GF(256)".into(),
@@ -174,7 +215,6 @@ fn main() {
             || {
                 std::hint::black_box(make_shards());
             },
-            10,
             100,
         );
         let ns_total = time_ns(
@@ -183,7 +223,6 @@ fn main() {
                 rs.decode(&mut shards).unwrap();
                 std::hint::black_box(&shards);
             },
-            10,
             100,
         );
         records.push(Record {
@@ -210,7 +249,6 @@ fn main() {
             || {
                 std::hint::black_box(dec.encode(&info));
             },
-            10,
             100,
         );
         records.push(Record {
@@ -224,7 +262,6 @@ fn main() {
             || {
                 std::hint::black_box(dec.decode_soft(&llr));
             },
-            5,
             50,
         );
         records.push(Record {
@@ -250,7 +287,7 @@ fn main() {
             .collect();
         let mut out = vec![0u8; k];
 
-        let ns_enc = time_ns(|| enc.encode(&info, &mut cw).unwrap(), 10, 200);
+        let ns_enc = time_ns(|| enc.encode(&info, &mut cw).unwrap(), 200);
         records.push(Record {
             algo: "polar",
             label: "Polar (1024,512) SC".into(),
@@ -258,7 +295,7 @@ fn main() {
             info_bits: k,
             ns_per_iter: ns_enc,
         });
-        let ns_dec = time_ns(|| dec.decode_sc(&llr, &mut out).unwrap(), 5, 100);
+        let ns_dec = time_ns(|| dec.decode_sc(&llr, &mut out).unwrap(), 100);
         records.push(Record {
             algo: "polar",
             label: "Polar (1024,512) SC".into(),
@@ -277,7 +314,7 @@ fn main() {
         let mut coded = vec![0u8; enc.output_len()];
         enc.encode(&info, &mut coded).unwrap();
 
-        let ns_enc = time_ns(|| enc.encode(&info, &mut coded).unwrap(), 10, 200);
+        let ns_enc = time_ns(|| enc.encode(&info, &mut coded).unwrap(), 200);
         records.push(Record {
             algo: "turbo",
             label: "Turbo LTE K=1024 R=1/3".into(),
@@ -294,7 +331,6 @@ fn main() {
             || {
                 dec.decode(&llr, &mut out, 8).unwrap();
             },
-            3,
             30,
         );
         records.push(Record {
@@ -314,7 +350,7 @@ fn main() {
         let mut cw = vec![0u8; n];
         bch.encode(&info, &mut cw).unwrap();
 
-        let ns_enc = time_ns(|| bch.encode(&info, &mut cw).unwrap(), 10, 300);
+        let ns_enc = time_ns(|| bch.encode(&info, &mut cw).unwrap(), 300);
         records.push(Record {
             algo: "bch",
             label: format!("BCH(255,{k},t=4)"),
@@ -335,7 +371,6 @@ fn main() {
                 scratch.copy_from_slice(&noisy);
                 bch.decode(&mut scratch).unwrap();
             },
-            10,
             200,
         );
         records.push(Record {
@@ -367,7 +402,6 @@ fn main() {
                         .unwrap();
                 }
             },
-            10,
             200,
         );
         records.push(Record {
@@ -393,7 +427,6 @@ fn main() {
                         .unwrap();
                 }
             },
-            10,
             200,
         );
         records.push(Record {
@@ -416,7 +449,7 @@ fn main() {
         let mut cw = vec![0u8; n];
         enc.encode(&info, &mut cw).unwrap();
 
-        let ns_enc = time_ns(|| enc.encode(&info, &mut cw).unwrap(), 5, 50);
+        let ns_enc = time_ns(|| enc.encode(&info, &mut cw).unwrap(), 50);
         records.push(Record {
             algo: "qc_ldpc",
             label: "QC-LDPC BG1 Z=384 LOMS".into(),
@@ -440,7 +473,6 @@ fn main() {
                 dec.decode_layered_offset_min_sum(&mut llr, &mut edge, &mut scratch, &mut hard, 10)
                     .unwrap();
             },
-            3,
             30,
         );
         records.push(Record {

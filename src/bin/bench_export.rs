@@ -11,10 +11,10 @@ use syndrome::ReedSolomon;
 const DATA_SHARDS: usize = 10;
 const PARITY_SHARDS: usize = 4;
 const SHARD_LENS: &[usize] = &[256, 1024, 4096, 16384];
-/// Number of timing iterations; enough to get stable mean on a warm CPU.
+/// Calls per timed round. Long enough to dwarf timer granularity, short
+/// enough that a scheduler preemption spoils only the round it lands in
+/// rather than the whole measurement.
 const ITERS: u32 = 500;
-/// Warm-up iterations discarded before timing.
-const WARMUP: u32 = 50;
 
 /// Build deterministic seed-filled data shards for the checksum.
 /// Shard `j` has every byte set to `(j as u8).wrapping_mul(3).wrapping_add(1)`.
@@ -28,15 +28,36 @@ fn time_encode<F>(mut f: F) -> f64
 where
     F: FnMut(),
 {
-    // warm-up
-    for _ in 0..WARMUP {
+    // Time-based warm-up, then the median of several timed rounds.
+    //
+    // A fixed `WARMUP` call count and a single averaged block are both
+    // unreliable here, and measurably so on this host. `WARMUP` calls of the
+    // AVX2/GFNI kernel do not reach a steady frequency — the same 300-call
+    // block reports roughly 78 Gbit/s after 20 warm-up calls against roughly
+    // 165 Gbit/s once fully warmed — and a mean has no way to reject a
+    // timed block that was preempted, which on this host happens often
+    // enough that 100 independent blocks of the identical encode spanned
+    // 90 to 160 Gbit/s. The scalar kernel on the same buffers shows no such
+    // ramp, which is what rules out cache residency as the explanation.
+    // See `src/bin/algo_bench_export.rs`'s `time_ns` for the full write-up.
+    const WARMUP_MS: u128 = 120;
+    const ROUNDS: usize = 51;
+
+    let w0 = Instant::now();
+    while w0.elapsed().as_millis() < WARMUP_MS {
         f();
     }
-    let t0 = Instant::now();
-    for _ in 0..ITERS {
-        f();
+
+    let mut rounds: Vec<f64> = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            f();
+        }
+        rounds.push(t0.elapsed().as_nanos() as f64 / ITERS as f64);
     }
-    t0.elapsed().as_nanos() as f64 / ITERS as f64
+    rounds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    rounds[ROUNDS / 2]
 }
 
 fn mib_per_s(payload_bytes: usize, ns_per_iter: f64) -> f64 {
