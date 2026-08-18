@@ -180,7 +180,7 @@ pub const MAX_CONSTRAINT_LENGTH: usize = 16;
 /// state and both output bits.  Indexed as `table[state * 2 + input_bit]`.
 struct TrellisTable {
     n_states: usize,
-    next_state: Vec<u8>,
+    next_state: Vec<u16>,
     out0: Vec<u8>,
     out1: Vec<u8>,
     /// Butterfly-reorganised branch tables used by the AVX2 ACS kernel.
@@ -286,7 +286,7 @@ impl TrellisTable {
         // n_states = 2^(K-1); state stores the last K-1 input bits.
         let n_states = if k >= 1 { 1usize << (k - 1) } else { 1 };
         let mask = if k < 32 { (1u32 << k) - 1 } else { u32::MAX };
-        let mut next_state = vec![0u8; n_states * 2];
+        let mut next_state = vec![0u16; n_states * 2];
         let mut out0 = vec![0u8; n_states * 2];
         let mut out1 = vec![0u8; n_states * 2];
 
@@ -295,7 +295,7 @@ impl TrellisTable {
                 // full shift register: new bit `b` enters the MSB.
                 let full = (((b << (k - 1)) | s) as u32) & mask;
                 // Next state drops the oldest bit (LSB of full after shift).
-                let ns = (full >> 1) as u8;
+                let ns = (full >> 1) as u16;
                 let o0 = ((full & g0).count_ones() & 1) as u8;
                 let o1 = ((full & g1).count_ones() & 1) as u8;
                 next_state[s * 2 + b] = ns;
@@ -410,7 +410,7 @@ mod avx2_acs {
     pub(super) unsafe fn acs_step_soft(
         cur_met: &[f32],
         nxt_met: &mut [f32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         sign0_even: &[f32],
         sign1_even: &[f32],
@@ -461,7 +461,7 @@ mod avx2_acs {
                     let mut tmp = [0i32; 8];
                     _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
                     for i in 0..8 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -482,7 +482,7 @@ mod avx2_acs {
     pub(super) unsafe fn acs_step_hard(
         cur_met: &[i32],
         nxt_met: &mut [i32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         r0: i32,
         r1: i32,
@@ -529,7 +529,7 @@ mod avx2_acs {
                     let mut tmp = [0i32; 8];
                     _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
                     for i in 0..8 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -577,7 +577,7 @@ mod neon_acs {
     pub(super) unsafe fn acs_step_soft(
         cur_met: &[f32],
         nxt_met: &mut [f32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         sign0_even: &[f32],
         sign1_even: &[f32],
@@ -632,7 +632,7 @@ mod neon_acs {
                     let mut tmp = [0i32; 4];
                     vst1q_s32(tmp.as_mut_ptr(), pred_state);
                     for i in 0..4 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -651,7 +651,7 @@ mod neon_acs {
     pub(super) unsafe fn acs_step_hard(
         cur_met: &[i32],
         nxt_met: &mut [i32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         r0: i32,
         r1: i32,
@@ -701,7 +701,7 @@ mod neon_acs {
                     let mut tmp = [0i32; 4];
                     vst1q_s32(tmp.as_mut_ptr(), pred_state);
                     for i in 0..4 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -764,7 +764,7 @@ fn acs_step_hard_scalar(
     trellis: &TrellisTable,
     cur_met: &[u32],
     nxt_met: &mut [u32],
-    traceback_row: &mut [u8],
+    traceback_row: &mut [u16],
     r0: u8,
     r1: u8,
 ) {
@@ -782,7 +782,7 @@ fn acs_step_hard_scalar(
             let new = cur_met[s].saturating_add(bm);
             if new < nxt_met[ns] {
                 nxt_met[ns] = new;
-                traceback_row[ns] = s as u8;
+                traceback_row[ns] = s as u16;
             }
         }
     }
@@ -798,7 +798,7 @@ fn acs_step_soft_scalar(
     trellis: &TrellisTable,
     cur_met: &[f32],
     nxt_met: &mut [f32],
-    traceback_row: &mut [u8],
+    traceback_row: &mut [u16],
     l0: f32,
     l1: f32,
 ) {
@@ -815,7 +815,7 @@ fn acs_step_soft_scalar(
             let new = cur_met[s] + bm;
             if new > nxt_met[ns] {
                 nxt_met[ns] = new;
-                traceback_row[ns] = s as u8;
+                traceback_row[ns] = s as u16;
             }
         }
     }
@@ -850,9 +850,11 @@ fn acs_step_soft_scalar(
 /// distance is unsigned/`u32` in the scalar kernel and `i32` in the AVX2
 /// kernel -- see [`ViterbiDecoder::decode_hard_avx2`]'s doc comment for why
 /// they differ; soft-decision max-log-MAP is `f32` in both). `traceback` is
-/// `u8` in all four paths and is safe to share: only one decode call runs
-/// at a time (no concurrent aliasing) and each call fully overwrites every
-/// position it later reads before reading it.
+/// `u16` in all four paths (state indices need up to 15 bits at
+/// `MAX_CONSTRAINT_LENGTH`, so `u8` is not wide enough) and is safe to
+/// share: only one decode call runs at a time (no concurrent aliasing) and
+/// each call fully overwrites every position it later reads before reading
+/// it.
 struct ViterbiScratch {
     cur_met_u32: Vec<u32>,
     nxt_met_u32: Vec<u32>,
@@ -870,7 +872,7 @@ struct ViterbiScratch {
     nxt_met_i32: Vec<i32>,
     cur_met_f32: Vec<f32>,
     nxt_met_f32: Vec<f32>,
-    traceback: Vec<u8>,
+    traceback: Vec<u16>,
 }
 
 impl ViterbiScratch {
@@ -893,7 +895,7 @@ impl ViterbiScratch {
     #[inline]
     fn ensure_traceback(&mut self, needed: usize) {
         if self.traceback.len() < needed {
-            self.traceback.resize(needed, 0u8);
+            self.traceback.resize(needed, 0u16);
         }
     }
 }
@@ -2075,7 +2077,7 @@ impl ViterbiDecoder {
     ///
     /// `t_max` trellis steps; `n_info` is how many decoded bits to keep
     /// (steps 0..n_info); tail steps (n_info..t_max) are discarded.
-    fn traceback_from_zero(&self, t_max: usize, n_info: usize, traceback: &[u8]) -> Vec<u8> {
+    fn traceback_from_zero(&self, t_max: usize, n_info: usize, traceback: &[u16]) -> Vec<u8> {
         let n_states = self.trellis.n_states;
         let mut decoded = vec![0u8; n_info];
         let mut s = 0usize; // zero-terminated: start traceback at state 0
@@ -2116,7 +2118,7 @@ impl ViterbiDecoder {
         &self,
         t_max: usize,
         start_state: usize,
-        traceback: &[u8],
+        traceback: &[u16],
     ) -> (Vec<u8>, usize) {
         let n_states = self.trellis.n_states;
         let mut decoded = vec![0u8; t_max];
@@ -2153,7 +2155,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn decode_empty_returns_empty(k in 1usize..10usize) {
+        fn decode_empty_returns_empty(k in 1usize..=MAX_CONSTRAINT_LENGTH) {
             let d = ViterbiDecoder::new(k).unwrap();
             let out = d.decode(&[]);
             prop_assert!(out.is_empty());
@@ -2169,6 +2171,23 @@ mod tests {
         assert_eq!(coded.len(), 2 * (info.len() + 6));
         let decoded = dec.decode_hard(&coded);
         assert_eq!(decoded, info, "hard decode must exactly recover info bits");
+    }
+
+    #[test]
+    fn encode_decode_hard_roundtrip_large_k() {
+        // n_states = 2^(k-1) exceeds u8::MAX (256) once k >= 10, which used
+        // to truncate `TrellisTable::next_state` and the traceback buffer
+        // to u8 and silently corrupt every next-state above 255. Covers the
+        // full advertised range up to MAX_CONSTRAINT_LENGTH so this gap
+        // (previously untested: the proptest above stopped at k=9) cannot
+        // regress silently again.
+        for k in 10..=MAX_CONSTRAINT_LENGTH {
+            let dec = ViterbiDecoder::new(k).unwrap();
+            let info: Vec<u8> = (0..40).map(|i| ((i * 7) % 3 == 0) as u8).collect();
+            let coded = dec.encode(&info);
+            let decoded = dec.decode_hard(&coded);
+            assert_eq!(decoded, info, "hard decode round-trip failed for k={k}");
+        }
     }
 
     #[test]
