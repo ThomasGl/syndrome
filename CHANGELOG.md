@@ -5,6 +5,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-08-18
+
+### Fixed
+
+- **LaTeX math in README.md, CHANGELOG.md and system_architecture.md never
+  rendered anywhere, on any platform, and never could.** All three files used
+  `$`-delimited LaTeX on the assumption that GitHub's math extension would
+  render it, following the same convention rustdoc/KaTeX uses on docs.rs. That
+  assumption was never tested against the platform that actually matters most
+  for a first impression: crates.io. Fetching a published crate's rendered
+  README directly from crates.io's own CDN
+  (`static.crates.io/readmes/<crate>/<crate>-<version>.html`) shows it is served
+  as a bare HTML fragment with **zero `<script>` or `<link>` tags** — crates.io
+  has no math renderer and, for the same reason it cannot execute arbitrary
+  crate-supplied JavaScript on its own domain, never can. Every `$E_b/N_0$`,
+  every `\beta`, every `\times` reached a visitor to the crate's own crates.io
+  page as the literal source characters, backslashes and braces included —
+  regardless of which escaping convention was used, because the problem was
+  never escaping. The rustdoc/KaTeX pipeline this crate built and tested in
+  0.5.0 (`tests/doc_math.rs`, the `doc-math` CI job) is real and correct for
+  docs.rs; it was simply the wrong fix for a different platform.
+
+  All LaTeX in the three affected files is replaced with plain text and
+  Unicode: `\beta` → β, `\times` → ×, `\cdot` → ·, subscripts written `Eb/N0`
+  rather than `$E_b/N_0$`, `\mathbb{F}_2` → `GF(2)` (matching the crate's own
+  voice elsewhere), binomial coefficients as `C(n,k)`, and the handful of
+  standalone display equations (Shannon capacity, the three-equation LOMS
+  recursion) as ` ```text ` fenced blocks, which render as literal monospace
+  everywhere with no rendering step required at all. ~230 spans converted
+  across the three files by exact-match substitution against every span
+  extracted from the source, so nothing was silently skipped; five
+  backtick-protected examples in CHANGELOG.md that deliberately show broken
+  LaTeX syntax as illustrations (documenting the `tests/doc_math.rs` gate
+  itself) are correctly left untouched, since those render as intended code
+  spans on every platform already.
+
+  `CLAUDE.md`'s Math Formatting rule, `katex-header.html`'s header comment,
+  and `tools/check_doc_math.mjs`'s scope comment are all updated to state the
+  rule precisely: LaTeX `$`-math is rustdoc-only, verified by fetching
+  crates.io's own rendered output rather than assumed from GitHub's
+  documented (but here irrelevant) math support.
+
+  A new test, `plain_text_docs_contain_no_latex_math`, asserts these three
+  files contain no non-backtick-protected `$` character, so this specific
+  regression cannot silently return; verified to fail on an injected `$E_b/N_0$`
+  before being added.
+
 ## [0.5.0] — 2026-08-18
 
 > **Compatibility: this release is a minor bump, not a patch.** Two changes
@@ -43,16 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scalar reference, and only the `f32` path is vectorized there.
 
 - **Measured quantization loss** (`tests/ldpc_int8_quantization_loss.rs`):
-  the extra $E_b/N_0$ the fixed-point decoder needs to reach the same block
+  the extra Eb/N0 the fixed-point decoder needs to reach the same block
   error rate as the `f32` one, over the crate's BPSK AWGN channel with
-  $s = 8$, $\beta = 0.5$ and 10 iterations.
+  s = 8, β = 0.5 and 10 iterations.
 
-  | Code | $E_b/N_0$ | Shift | 95% CI |
+  | Code | Eb/N0 | Shift | 95% CI |
   |---|---|---|---|
-  | BG1, $Z = 128$ | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
-  | BG1, $Z = 384$ | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
-  | BG2, $Z = 128$ | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
-  | BG2, $Z = 384$ | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
+  | BG1, Z = 128 | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
+  | BG1, Z = 384 | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
+  | BG2, Z = 128 | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
+  | BG2, Z = 384 | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
 
   Every interval excludes zero, so the loss is real; it is between 0.003 and
   0.010 dB, with every upper bound below 0.013 dB. Resolving a hundredth of a
@@ -64,7 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format decisions: the posterior width (clamping it to the message range
   roughly doubles the block error rate and raises the bit error rate about
   eightyfold, an error floor rather than an offset) and the scale (a broad
-  plateau from $s = 8$ to $s = 24$, with $s = 2$ and $s = 32$
+  plateau from s = 8 to s = 24, with s = 2 and s = 32
   resolvably worse).
 
   Until now `src/quantize.rs` documented its own loss as unmeasured and
@@ -111,49 +158,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`\\\\` row breaks, `\thinspace`, `\lbrace`, `\\&`, `\\_`) are not flagged.
 
 - **Chase-II soft-decision BCH decoding** (`BchCode::decode_chase2`,
-  `Chase2Report`): corrects error patterns beyond the algebraic limit $t$ by
+  `Chase2Report`): corrects error patterns beyond the algebraic limit t by
   using the demodulator's reliabilities, which the hard decoder throws away.
 
-  It hard-decides from the LLR signs, takes the $p$ positions with the
-  smallest $\lvert \mathrm{LLR} \rvert$, runs the existing
-  Berlekamp–Massey/Chien/Forney decoder on each of the $2^p$ ways of flipping
-  a subset of them, and keeps the surviving codeword of least **analog
-  weight** — the total reliability that has to be disbelieved to accept it,
-  $\sum_{i \thinspace : \thinspace c_i \ne \hat b_i} \lvert \mathrm{LLR}_i
-  \rvert$. That metric is maximum-likelihood among the candidates found,
-  because on an AWGN channel a codeword's log-likelihood is affine in exactly
-  that sum.
+  It hard-decides from the LLR signs, takes the p positions with the
+  smallest |LLR|, runs the existing Berlekamp–Massey/Chien/Forney decoder on
+  each of the 2^p ways of flipping a subset of them, and keeps the surviving
+  codeword of least **analog weight** — the total reliability that has to be
+  disbelieved to accept it, Σ (i where c_i ≠ hard-decision_i) |LLR_i|. That
+  metric is maximum-likelihood among the candidates found, because on an AWGN
+  channel a codeword's log-likelihood is affine in exactly that sum.
 
-  A codeword carrying $t + 1$ errors is uncorrectable algebraically no matter
+  A codeword carrying t + 1 errors is uncorrectable algebraically no matter
   how obvious the answer looks; Chase-II recovers it whenever the surplus
   errors sit among the positions the demodulator already doubted, which is the
-  usual case because errors concentrate where the LLR was small. Cost is $2^p$
-  algebraic decodes, so $p$ belongs in single digits.
+  usual case because errors concentrate where the LLR was small. Cost is 2^p
+  algebraic decodes, so p belongs in single digits.
 
   Tested against what it could get wrong rather than for coverage: that it
-  corrects $t + 1$ errors *and* that the algebraic decoder genuinely fails on
+  corrects t + 1 errors *and* that the algebraic decoder genuinely fails on
   the same pattern (a Chase-II that silently reduced to `decode` would pass a
   test asserting only the first); that it never disagrees with a successful
   algebraic decode; that a clean codeword comes back untouched with zero
-  analog weight; and that $p = 0$ degenerates to exactly one hard decode.
+  analog weight; and that p = 0 degenerates to exactly one hard decode.
   Five injected defects — keeping the worst candidate, searching the *most*
   reliable positions, searching none, inverting the hard decision, and scoring
   the metric over agreeing instead of disagreeing positions — each fail at
   least one.
 
 - **Adaptive CA-SCL list size** (`PolarDecoder::decode_scl_adaptive`,
-  `AdaptiveDecodeReport`): decodes at $L = 1$ first, and escalates to 2, 4, …
+  `AdaptiveDecodeReport`): decodes at L = 1 first, and escalates to 2, 4, …
   up to the configured list size only when the CRC rejects the result.
 
   The error-rate performance is that of the *largest* list, because the ladder
   stops early only when the CRC — a check the decoder cannot satisfy by
   guessing — has confirmed the answer. The cost is where it pays: escalating
-  all the way runs $1 + 2 + \dots + L < 2L$ list-units, so the worst case is
+  all the way runs 1 + 2 + ... + L < 2L list-units, so the worst case is
   under twice a single full-size decode, and that case only arises on blocks
-  the channel damaged badly. At a working SNR most blocks pass at $L = 1$, so
+  the channel damaged badly. At a working SNR most blocks pass at L = 1, so
   the average cost falls toward plain successive cancellation while the error
-  rate stays at $L$. Measured here at 6 dB on $N = 256$, $K = 128$: one
-  list-unit per block against a fixed $L = 8$ decoder's eight.
+  rate stays at L. Measured here at 6 dB on N = 256, K = 128: one
+  list-unit per block against a fixed L = 8 decoder's eight.
 
   Requires a CRC, and says so with an error rather than silently escalating to
   the maximum on every block — without one there is no signal that a decode
@@ -172,10 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   |---|---|
   | `HarqBuffer::combine`: `n_filler_override > 0` | The override branch had no test at all — every caller in the suite passed `0`, so deleting the parameter would not have failed anything. |
   | `HarqBuffer::copy_llr_into`: `dst.len() < acc.len()` → `<=` | The existing test passed a 1-element destination, which both forms reject. An exactly-`ncb` buffer — the one a caller who read `ncb()` would allocate — was never tried. |
-  | `compute_segmentation`: all four BG2 $K_b$ thresholds | The TS 38.212 §5.2.2 ladder could be loosened from `>` to `>=` unnoticed, because $K_b$ is not among the fields `SegmentationParams` reports and no test used a transport block sitting *at* a threshold. |
+  | `compute_segmentation`: all four BG2 Kb thresholds | The TS 38.212 §5.2.2 ladder could be loosened from `>` to `>=` unnoticed, because Kb is not among the fields `SegmentationParams` reports and no test used a transport block sitting *at* a threshold. |
 
-  The $K_b$ finding is the one worth dwelling on: it is a transcribed spec
-  table feeding a value that shifts $Z$, $K$ and the filler count for a *band*
+  The Kb finding is the one worth dwelling on: it is a transcribed spec
+  table feeding a value that shifts Z, K and the filler count for a *band*
   of transport block sizes while leaving every size outside that band correct
   — the exact shape of a transcription slip, and invisible to round-trip tests
   that sample sizes at random. The ladder is now `lifting_selection_k_b`, a
@@ -254,7 +299,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the decoder's lifetime, which is right for a receiver processing a stream of
   large transport blocks and wrong for a short-lived decoder or a transport
   block that fits in one code block — so `DlSchDecoder::new` remains
-  thread-free, and `decode` takes the sequential path whenever $C = 1$ even
+  thread-free, and `decode` takes the sequential path whenever C = 1 even
   with a pipeline installed.
 
   Nothing observable changes. Both paths run the same LOMS decoder over the
@@ -349,30 +394,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Reed-Solomon could not recover every erasure pattern within its stated
   capability.** The generator matrix is now Cauchy,
-  $C_{ij} = (x_i \oplus y_j)^{-1}$ with $x_i = i$ and $y_j = m + j$, replacing
-  $C_{ij} = \alpha^{ij}$.
+  C_ij = (x_i ⊕ y_j)^−1 with x_i = i and y_j = m + j, replacing
+  C_ij = α^(ij).
 
   **This changes parity bytes on the wire.** Data encoded by syndrome 0.4.0 or
   earlier must be decoded with
   `ReedSolomon::with_matrix(k, m, MatrixKind::PowerVandermonde)`, which builds
   the old matrix and is retained for exactly that purpose.
 
-  Recovery inverts the submatrix of $C$ on the missing data columns and on as
-  many surviving parity rows as are needed. Writing $x_c = \alpha^{j_c}$, that
-  submatrix is $\left[x_c^{\thinspace i_r}\right]$. While the surviving parity
-  rows are $0, 1, \dots$ consecutively — which is what happens when no parity
+  Recovery inverts the submatrix of C on the missing data columns and on as
+  many surviving parity rows as are needed. Writing x_c = α^(j_c), that
+  submatrix is [x_c^(i_r)]. While the surviving parity
+  rows are 0, 1, ... consecutively — which is what happens when no parity
   shard is lost — it is a true Vandermonde and nonsingular. Lose a parity
-  shard and the row exponents skip: rows $\lbrace 0, 1, 3 \rbrace$ give
-  $\left[1, x, x^3\right]$, a *generalized* Vandermonde whose determinant
+  shard and the row exponents skip: rows {0, 1, 3} give
+  [1, x, x^3], a *generalized* Vandermonde whose determinant
   carries an extra symmetric factor, and over GF(256) that factor sometimes
   vanishes. The decoder then reported
   `FecError::InvalidParam("matrix not invertible")` for a shard set that
   should have been recoverable.
 
   It is not a corner case, and it is not confined to exotic geometries: at
-  $k = 12$, $m = 5$ — an ordinary RS(17, 12) — 18 of the 6,187 patterns inside
-  the code's capability failed; at $k = 16$, $m = 6$, 254 of 74,612; at
-  $k = 20$, $m = 6$, 684 of 230,229. The patterns that break it are exactly
+  k = 12, m = 5 — an ordinary RS(17, 12) — 18 of the 6,187 patterns inside
+  the code's capability failed; at k = 16, m = 6, 254 of 74,612; at
+  k = 20, m = 6, 684 of 230,229. The patterns that break it are exactly
   those losing *both* data and parity shards, which is why an erasure test
   dropping only data shards finds nothing wrong — and why the module's own
   documentation asserted the opposite in good faith.
@@ -451,12 +496,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Monte Carlo estimation harness** (`src/montecarlo.rs`): runs trials until
   a target number of *error events* has accumulated rather than a fixed
   trial count, because the relative precision of an error-rate estimate
-  depends on the event count ($\approx 1/\sqrt{k}$) and not on how many
+  depends on the event count (≈ 1/√k) and not on how many
   trials produced them — a fixed budget over-runs at low SNR and returns no
   information at high SNR. Every result carries a Wilson score confidence
-  interval, which stays inside $[0, 1]$ and gives a usable one-sided bound
+  interval, which stays inside [0, 1] and gives a usable one-sided bound
   when zero errors were seen, where the textbook normal approximation
-  collapses to $[0, 0]$ and asserts certainty from no evidence. The module
+  collapses to [0, 0] and asserts certainty from no evidence. The module
   documents what the interval does not cover: it is a statement about
   sampling noise only, and it is exact for block-level events but optimistic
   for bit-level ones, whose errors are correlated within a failed block.
@@ -466,8 +511,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Rayleigh block-fading channel** (`src/channel_sim.rs`):
   `RayleighBlockChannel` models multipath fading with a per-block amplitude
-  $h$ drawn from a Rayleigh distribution normalized to $E[h^2] = 1$, so a
-  given $E_b/N_0$ means the same average received energy as on the AWGN
+  h drawn from a Rayleigh distribution normalized to E[h^2] = 1, so a
+  given Eb/N0 means the same average received energy as on the AWGN
   channel and the two are directly comparable. Perfect receiver CSI is
   assumed and the LLR is scaled by the realized gain; channel estimation
   error is not modelled, and the docs say so — results from this channel are
@@ -480,18 +525,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape — defects that would silently shift every error-rate curve the crate
   produces while leaving the suite green. Added tests that recover the
   realized noise from the LLRs and check its mean and variance against the
-  $E_b/N_0$ calibration, invert the calibration to confirm the measured SNR
-  matches the requested one, run a $\chi^2$ goodness-of-fit test against the
+  Eb/N0 calibration, invert the calibration to confirm the measured SNR
+  matches the requested one, run a χ² goodness-of-fit test against the
   normal distribution, and bound the lag-1 autocorrelation. Both channels
   are additionally checked against the closed-form uncoded-BPSK error
-  probabilities ($Q(1/\sigma)$ for AWGN, the standard
-  $\tfrac{1}{2}(1-\sqrt{\bar\gamma_b/(1+\bar\gamma_b)})$ for Rayleigh), and
-  the fading amplitudes against the Rayleigh moments $E[h] = \sqrt\pi/2$,
-  $E[h^2] = 1$, $E[h^4] = 2$.
+  probabilities (Q(1/σ) for AWGN, the standard
+  ½(1 − √(γ̄b/(1+γ̄b))) for Rayleigh), and
+  the fading amplitudes against the Rayleigh moments E[h] = √π/2,
+  E[h^2] = 1, E[h^4] = 2.
 
 - **Exact log-MAP for the Turbo decoder** (`src/turbo.rs`): `MapAlgorithm`
   selects between `MaxLog` (the default, unchanged) and `LogMap`, which
-  evaluates the full Jacobian correction $\ln(1 + e^{-|a-b|})$ at every BCJR
+  evaluates the full Jacobian correction ln(1 + e^−|a−b|) at every BCJR
   combining step instead of dropping it. Both rules share one generic scalar
   kernel parameterized by a const flag, so they cannot drift apart and the
   max-log path monomorphizes back to exactly the branch-free `max` loop it
@@ -511,7 +556,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reed-Solomon errors-and-erasures decoding** (`src/reed_solomon.rs`):
   `ReedSolomon::decode_errors_and_erasures` corrects symbols that are
   *present but corrupted* — wrong bytes carrying no erasure flag — alongside
-  any number of flagged erasures, whenever $2t + s \le$ `parity_shards`.
+  any number of flagged erasures, whenever 2t + s ≤ `parity_shards`.
   It returns the number of unknown-position errors it actually found.
   The algorithm is a syndrome-verified combinatorial search over candidate
   error positions that reuses the existing Vandermonde erasure decoder as
@@ -519,23 +564,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Berlekamp–Massey and Chien search (as used in `src/bch.rs`) are
   deliberately *not* used here and would be mathematically unsound for this
   code: data positions hold the message polynomial's coefficients while
-  parity positions hold its evaluations $p(\alpha^i)$, so the parity-check
+  parity positions hold its evaluations p(α^i), so the parity-check
   matrix has Kronecker-delta columns at parity positions and the syndromes
-  never take the classical $S_i = \sum_k e_k \beta_k^i$ form those algorithms
-  require. Cost is $O\!\big(\binom{n}{\text{max\_errors}} \cdot
-  \text{shard\_len}\big)$ — cheap for the small parity counts this crate
-  targets, and the reason the method takes an explicit `max_errors` bound
+  never take the classical S_i = Σ_k e_k·β_k^i form those algorithms require.
+  Cost is O(C(n, max_errors) · shard_len) — cheap for the small parity counts
+  this crate targets, and the reason the method takes an explicit `max_errors`
+  bound
   rather than searching unboundedly. Verified against a from-scratch
   exhaustive reference decoder that shares no code with the crate (its own
   Russian-peasant `GF(256)` multiply and Horner evaluator), plus seeded
-  random round-trips across 11 $(d, p, t, s)$ shapes, and a case with more
+  random round-trips across 11 (d, p, t, s) shapes, and a case with more
   errors than the distance bound allows that must return
   `FecError::DecoderNotConverged` rather than a silently wrong answer.
 
 - **Tail-biting convolutional codes** (`src/viterbi.rs`):
   `encode_tail_biting`, `decode_hard_tail_biting`, and
   `decode_soft_tail_biting` implement tail-biting termination, where the
-  encoder's shift register is preloaded with the message's own final $K-1$
+  encoder's shift register is preloaded with the message's own final K−1
   bits so the trellis starts and ends in the same (unknown) state — no
   zero-tail flush bits, and therefore no rate loss on short blocks. Decoding
   uses the Wrap-Around Viterbi Algorithm: metrics are initialised uniformly
@@ -549,21 +594,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **LDPC offset correction $\beta$ raised from `0.25` to `0.5`** where the
+- **LDPC offset correction β raised from `0.25` to `0.5`** where the
   crate picks it on the caller's behalf
   (`DlSchConfig::default_decode_params`). `0.25` is measurably the wrong
-  value: `tests/ldpc_offset_beta_sweep.rs` sweeps $\beta$ against block
+  value: `tests/ldpc_offset_beta_sweep.rs` sweeps β against block
   error rate over the crate's AWGN channel using the new
   `montecarlo` harness, and on BG1 at production lifting sizes the gap is
-  large and grows with $Z$ — at $Z = 384$, $E_b/N_0 = 1$ dB, 10 iterations,
-  BLER is $0.133$ at $\beta = 0.25$ against $3.3 \times 10^{-4}$ at
-  $\beta = 0.5$, with disjoint 95% confidence intervals. On BG2 the two
-  best points ($0.35$ and $0.5$) are statistically indistinguishable from
-  each other and both beat $0.25$. $\beta$ remains a caller-supplied
+  large and grows with Z — at Z = 384, Eb/N0 = 1 dB, 10 iterations,
+  BLER is 0.133 at β = 0.25 against 3.3 × 10⁻⁴ at
+  β = 0.5, with disjoint 95% confidence intervals. On BG2 the two
+  best points (0.35 and 0.5) are statistically indistinguishable from
+  each other and both beat 0.25. β remains a caller-supplied
   parameter everywhere else in the public API; only the value the crate
   selects by itself changed. The sweep is checked in, so the choice can be
   re-measured rather than trusted, and `tests/` now carries fast regression
-  tests that fail if $\beta$'s advantage over both $0$ and an over-large
+  tests that fail if β's advantage over both 0 and an over-large
   offset stops being resolvable.
 
 - **`src/viterbi.rs` module documentation** now states the precise limits of
@@ -572,7 +617,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minimizes the probability that the whole sequence is wrong and produces no
   per-bit reliability, which is the distinction from the BCJR decoder in
   `src/turbo.rs`. Optimality also holds only under each branch metric's own
-  channel model — Hamming distance is ML for a BSC with $p < 1/2$,
+  channel model — Hamming distance is ML for a BSC with p < 1/2,
   correlation is ML for BPSK over AWGN. And it does not extend to the
   tail-biting decoder at all: WAVA is an approximation to ML decoding of a
   circular trellis, returning a certified tail-biting codeword when its
@@ -666,8 +711,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_mm256_gf2p8affine_epi64_epi8`) and prefer it over the existing AVX2
   VPSHUFB nibble-table kernel when available, falling back to VPSHUFB where
   GFNI isn't present. Multiplying by a fixed `GF(256)` coefficient is
-  $\mathbb{F}_2$-linear, so GFNI applies the coefficient's precomputed
-  $8 \times 8$ bit matrix directly in one instruction per 32 bytes, instead
+  GF(2)-linear, so GFNI applies the coefficient's precomputed
+  8 × 8 bit matrix directly in one instruction per 32 bytes, instead
   of VPSHUFB's four-instruction shuffle/mask/blend sequence for the same 32
   bytes. Measured by `reed_solomon::tests::bench_gfni_vs_avx2_nibble`, which
   alternates the two kernels inside a single process (21 rounds × 200
@@ -688,39 +733,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Wi-Fi 802.11 LDPC shortening and puncturing** (`src/wifi_rate_matching.rs`):
   `encode_shortened`/`decode_shortened` accept a payload smaller than a
-  codeword's $K$ (padded with known-zero bits that are never transmitted)
+  codeword's K (padded with known-zero bits that are never transmitted)
   and a transmitted length smaller than the post-shortening budget (parity
-  bits dropped from the tail), for any of the 12 real 802.11 $(Z, R)$
+  bits dropped from the tail), for any of the 12 real 802.11 (Z, R)
   matrices. The decoder reconstructs the full-length LLR buffer before
   decoding: shortened positions get a high-confidence known-zero LLR,
-  punctured positions get an erasure ($LLR = 0$). Previously only a full,
-  unshortened, unpunctured codeword ($K$ info bits exactly filling $N$
+  punctured positions get an erasure (LLR = 0). Previously only a full,
+  unshortened, unpunctured codeword (K info bits exactly filling N
   coded bits) could be encoded or decoded.
   `tests/wifi_shortening_puncturing_integration.rs` verifies the encode →
   AWGN → decode round-trip, with genuine shortening and puncturing applied,
   across all 12 combinations. Still not implemented, and now the documented
   scope boundary: multi-codeword segmentation (a payload larger than one
-  codeword's $K$), and the 802.11 PPDU-level formula (§19.5.3.2) that
+  codeword's K), and the 802.11 PPDU-level formula (§19.5.3.2) that
   derives the available coded-bit count from an MCS, bandwidth, and PSDU
   length — callers supply that length directly instead.
 - **Bluetooth FEC profiles** (`src/bluetooth.rs`): the complete set of FEC
   schemes in the Bluetooth Core Specification (unchanged since 5.0; verified
-  against 5.0 through 6.2) — the LE Coded PHY convolutional code ($K=4$,
-  rate 1/2, $G_0 = 1+x+x^2+x^3$, $G_1 = 1+x^2+x^3$) built on the existing
-  Viterbi engine with hard and soft decoding, the $S=8$ pattern
+  against 5.0 through 6.2) — the LE Coded PHY convolutional code (K=4,
+  rate 1/2, G0 = 1+x+x^2+x^3, G1 = 1+x^2+x^3) built on the existing
+  Viterbi engine with hard and soft decoding, the S=8 pattern
   mapper/soft-demapper, BR/EDR FEC 1/3 (3× repetition, majority decode),
   and BR/EDR FEC 2/3 (the (15,10) shortened Hamming code,
-  $g(D)=D^5+D^4+D^2+1$, single-error correction with double-error
+  g(D) = D^5+D^4+D^2+1, single-error correction with double-error
   detection). Unit tests reproduce the specification's own sample data
   bit-exactly: the Vol 6 Part C reference packet (every FEC output bit for
-  both CI values and the $S=8$ symbol stream) and all ten (15,10)
+  both CI values and the S=8 symbol stream) and all ten (15,10)
   generator rows from the Vol 2 FEC sample data, cross-checked against
   libbtbb's independent table. Out of scope, documented: packet assembly,
   whitening, and the Bluetooth CRC/HEC family.
 - **Public `bits` module** (`src/bits.rs`): MSB-first `bytes_to_bits` /
   `bits_to_bytes` (caller-buffer and `_vec` forms, validating that every
   element is 0/1) and `hard_decision`, the crate-wide LLR sign rule
-  ($L < 0 \Rightarrow 1$). Nearly every API in the crate speaks
+  (L < 0 ⇒ 1). Nearly every API in the crate speaks
   one-bit-per-byte, and until now every user had to write these conversions
   themselves.
 - **`LdpcWorkspace`** (`src/qc_ldpc.rs`): an owning bundle of all four LDPC
@@ -863,7 +908,7 @@ First public release.
   BG2, rate matching with redundancy versions, HARQ soft combining, and the
   `DlSchEncoder` / `DlSchDecoder` end-to-end pair.
 - **IEEE 802.11 Wi-Fi 6/7 LDPC**: all twelve 802.11 Annex R/F parity-check
-  shift matrices ($Z \in \{27, 54, 81\}$, $R \in \{1/2, 2/3, 3/4, 5/6\}$),
+  shift matrices (Z ∈ {27, 54, 81}, R ∈ {1/2, 2/3, 3/4, 5/6}),
   decoded through the same LOMS kernel as 5G NR. Shortening and
   puncturing/rate-matching are out of scope for this release and documented as
   such in the module docs.

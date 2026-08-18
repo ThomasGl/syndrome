@@ -24,9 +24,16 @@
          turns it into `_`, which is what you wanted.
 
      This applies to rustdoc ONLY. README.md, CHANGELOG.md and
-     system_architecture.md are rendered by GitHub, whose math extension keeps
-     backslashes verbatim, so those files use ordinary LaTeX (`\,`, `\{`,
-     `_`). Do not copy either convention into the other.
+     system_architecture.md use NO LaTeX at all -- plain text / Unicode
+     (beta, x, subscripts written Eb/N0, standalone equations as a ```text
+     fenced block) -- because crates.io renders the README as a bare HTML
+     fragment with no script or stylesheet injection possible, so $...$
+     syntax can never render there: it shows up as literal backslashes and
+     braces on the crate's own crates.io page, to every visitor, regardless
+     of escaping convention. Verified by fetching
+     https://static.crates.io/readmes/<crate>/<crate>-<version>.html, which
+     contains zero <script>/<link> tags. Do not copy the rustdoc convention
+     into those three files, or LaTeX into them at all.
 
      To check, run the harness rather than eyeballing the rendered pages:
 

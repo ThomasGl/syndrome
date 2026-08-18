@@ -1,9 +1,11 @@
 # syndrome
 
 [![CI](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasGl/syndrome/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/syndrome.svg)](https://crates.io/crates/syndrome)
+[![docs.rs](https://img.shields.io/docsrs/syndrome)](https://docs.rs/syndrome)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-425%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-486%20passing-brightgreen)](tests/)
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
@@ -19,7 +21,7 @@ bits corrupted), and decoded by the layered offset min-sum kernel in
 [`src/qc_ldpc.rs`](src/qc_ldpc.rs). Every frame is a hard-decision snapshot
 taken after one real decode iteration — the bit-error count is the actual
 Hamming distance to the codeword this program transmitted, not a synthetic
-curve. The $(E_b/N_0, \text{seed})$ pair is chosen by sweeping real trials
+curve. The (Eb/N0, seed) pair is chosen by sweeping real trials
 until one is legible enough to animate, so this is a representative decode
 rather than an average one; the trial itself is recorded exactly as it ran,
 including the non-monotonic step where the error count rises before falling.
@@ -49,15 +51,15 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 
 | Code | Introduced | Decoder here | Decode complexity | Where industry uses it | Key paper |
 |---|---|---|---|---|---|
-| **Hamming(7,4)** | 1950 | Syndrome lookup | $O(1)$ / nibble | ECC teaching, SECDED DRAM ancestor | Hamming 1950 |
-| **Golay(24,12,8)** | 1949 | Syndrome table (2 325 cosets) | $O(1)$ / block | Voyager imaging, CCSDS telecommand, MIL-STD-188-141 ALE | Golay 1949 |
-| **BCH(255,k,t≤10)** | 1959–60 | Berlekamp–Massey + Chien | $O(nt)$ | DVB-S2 outer code, NAND-flash controllers | Bose–Chaudhuri 1960; Hocquenghem 1959 |
-| **Reed-Solomon GF(256)** | 1960 | Erasure (Cauchy matrix); errors-and-erasures (syndrome-verified search) | $O(n \cdot p)$ erasure; $O\!\big(\binom{n}{t} \cdot \text{len}\big)$ for $t$ unknown-position errors | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
-| **Convolutional (Viterbi)** | 1967 | Hard ACS + soft max-log-MAP; zero-terminated and tail-biting (WAVA) | $O(2^{K-1} L)$, $\times$ laps for tail-biting | GSM/2G, DAB radio, legacy 802.11, deep space | Viterbi 1967; Shao–Lin–Fossorier 2003 (WAVA) |
-| **Turbo (LTE PCCC)** | 1993 | Iterative max-log-MAP (BCJR) | $O(8 K \cdot \text{iters})$ | 3G UMTS, 4G LTE data channels | Berrou et al. 1993 |
-| **QC-LDPC (BG1/BG2)** | 1963 / 2004 | Layered Offset Min-Sum, SIMD | $O(E Z \cdot \text{iters})$ | 5G NR data, Wi-Fi 6/7, DVB-S2X, 10GBASE-T | Gallager 1963; Fossorier 2004 |
-| **Polar (SC / CA-SCL)** | 2009 | Successive cancellation + list | $O(N \log N)$, list $\times L$ | 5G NR control channels (PDCCH/PBCH) | Arıkan 2009; Tal & Vardy 2015 |
-| **CRC-24A/B/C, 16/11/6** | 1961 | Detection only | $O(n)$ | Every 3GPP standard, Ethernet, ZIP | Peterson & Brown 1961 |
+| **Hamming(7,4)** | 1950 | Syndrome lookup | O(1) / nibble | ECC teaching, SECDED DRAM ancestor | Hamming 1950 |
+| **Golay(24,12,8)** | 1949 | Syndrome table (2 325 cosets) | O(1) / block | Voyager imaging, CCSDS telecommand, MIL-STD-188-141 ALE | Golay 1949 |
+| **BCH(255,k,t≤10)** | 1959–60 | Berlekamp–Massey + Chien | O(n·t) | DVB-S2 outer code, NAND-flash controllers | Bose–Chaudhuri 1960; Hocquenghem 1959 |
+| **Reed-Solomon GF(256)** | 1960 | Erasure (Cauchy matrix); errors-and-erasures (syndrome-verified search) | O(n·p) erasure; O(C(n,t) · len) for t unknown-position errors | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
+| **Convolutional (Viterbi)** | 1967 | Hard ACS + soft max-log-MAP; zero-terminated and tail-biting (WAVA) | O(2^(K−1) · L), × laps for tail-biting | GSM/2G, DAB radio, legacy 802.11, deep space | Viterbi 1967; Shao–Lin–Fossorier 2003 (WAVA) |
+| **Turbo (LTE PCCC)** | 1993 | Iterative max-log-MAP (BCJR) | O(8K · iters) | 3G UMTS, 4G LTE data channels | Berrou et al. 1993 |
+| **QC-LDPC (BG1/BG2)** | 1963 / 2004 | Layered Offset Min-Sum, SIMD | O(E·Z · iters) | 5G NR data, Wi-Fi 6/7, DVB-S2X, 10GBASE-T | Gallager 1963; Fossorier 2004 |
+| **Polar (SC / CA-SCL)** | 2009 | Successive cancellation + list | O(N log N), list × L | 5G NR control channels (PDCCH/PBCH) | Arıkan 2009; Tal & Vardy 2015 |
+| **CRC-24A/B/C, 16/11/6** | 1961 | Detection only | O(n) | Every 3GPP standard, Ethernet, ZIP | Peterson & Brown 1961 |
 
 Reading the table top-to-bottom is a history of coding theory: from hand-decodable classics, through the algebraic era, to the capacity-approaching iterative codes that power 4G/5G. This library implements all of them behind one consistent, allocation-disciplined API — the same progression a communications curriculum follows.
 
@@ -66,11 +68,11 @@ FEC. Wi-Fi 7 (802.11be) reuses the 802.11ax LDPC codes and the K=7 BCC —
 i.e. the QC-LDPC and Viterbi rows above; [`wifi.rs`](src/wifi.rs) supplies
 its MCS 0–13 tables (up to 4096-QAM) and LDPC parameter selection, and
 [`wifi_ldpc_tables.rs`](src/wifi_ldpc_tables.rs) carries the real
-802.11 Annex R/F shift matrices for all 12 $(Z, R)$ combinations
-($Z \in \{27, 54, 81\}$, $R \in \{1/2, 2/3, 3/4, 5/6\}$), cross-validated
+802.11 Annex R/F shift matrices for all 12 (Z, R) combinations
+(Z ∈ {27, 54, 81}, R ∈ {1/2, 2/3, 3/4, 5/6}), cross-validated
 against the IEEE 802.11n-2009 standard text itself — so an 802.11 codeword
 genuinely encodes and decodes through the same LOMS kernel as 5G NR, with
-real shortening (a payload smaller than $K$) and puncturing (a transmitted
+real shortening (a payload smaller than K) and puncturing (a transmitted
 length smaller than the post-shortening budget) via
 [`wifi_rate_matching.rs`](src/wifi_rate_matching.rs)
 (`tests/wifi_ldpc_integration.rs`,
@@ -440,10 +442,10 @@ Highlights of what the tests actually *prove* (not just exercise):
   (SC and list decoding), plus seeded random sweeps at N ∈ {64, 256, 1024}
   and a measured 20/20 AWGN recovery at 3 dB.
 - **Golay**: the computed generator reproduces the textbook weight enumerator
-  $1 + 759x^8 + 2576x^{12} + 759x^{16} + x^{24}$ over all 4 096 codewords, and
-  all $\binom{24}{\le 3}$ error patterns are corrected exhaustively.
-- **BCH**: the derived $(t, n, k)$ table matches the standard BCH(255,·)
-  reference table for all $t \le 10$; $g(x)$ provably divides $x^{255}+1$.
+  1 + 759x^8 + 2576x^12 + 759x^16 + x^24 over all 4 096 codewords, and
+  all C(24, ≤3) error patterns are corrected exhaustively.
+- **BCH**: the derived (t, n, k) table matches the standard BCH(255,·)
+  reference table for all t ≤ 10; g(x) provably divides x^255 + 1.
 - **Turbo**: every QPP interleaver is asserted to be a valid permutation;
   both constituent encoders provably terminate in state zero.
 - **SIMD equivalence**: every AVX2 path (Viterbi ACS, Turbo BCJR, RS decode)
@@ -508,12 +510,12 @@ Uniform metric: **information-bit throughput** (payload bits per second — pari
 |---|---|---|---|---|
 | Reed-Solomon | RS(10,4), 4 KiB shards | **161.7 Gbit/s** | **89.5 Gbit/s** | Reconstruction runs through the same GFNI/AVX2 kernel as encode; allocation-free per call |
 | CRC-24A | 6144-bit block | **3.89 Gbit/s** | — (detection) | 256-entry byte table (nibble table for CRC-6) |
-| Golay | (24,12), syndrome table | 1.80 Gbit/s | 653 Mbit/s | $O(1)$ syndrome-table lookup |
+| Golay | (24,12), syndrome table | 1.80 Gbit/s | 653 Mbit/s | O(1) syndrome-table lookup |
 | Hamming | (7,4), table | 2.36 Gbit/s | 1.05 Gbit/s | Table lookup |
-| BCH | (255,223,t=4) | **1.22 Gbit/s** | **262 Mbit/s** | Weight-proportional syndrome tables + per-$\beta$ Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
+| BCH | (255,223,t=4) | **1.22 Gbit/s** | **262 Mbit/s** | Weight-proportional syndrome tables + per-β Chien multiply tables + byte-wise LFSR (~70 KiB tables) |
 | Viterbi | K=7, R=1/2, soft | 572 Mbit/s | **30.8 Mbit/s** | AVX2 ACS: all 64 trellis states per step in 8-wide lanes, shuffle-deinterleaved butterflies |
-| Polar | (1024,512), SC | 130 Mbit/s | **36.8 Mbit/s** | Allocation-free recursion; partial sums in $O(N \log N)$ via GF(2) linearity; branch-free $f$/$g$ kernels |
-| Turbo | LTE K=1024, 8 iter | 327 Mbit/s | **20.1 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact $\pm 1$ arithmetic, no FMA) |
+| Polar | (1024,512), SC | 130 Mbit/s | **36.8 Mbit/s** | Allocation-free recursion; partial sums in O(N log N) via GF(2) linearity; branch-free f/g kernels |
+| Turbo | LTE K=1024, 8 iter | 327 Mbit/s | **20.1 Mbit/s** | AVX2 BCJR: 8 states per register, bit-identical to scalar (sign-exact ±1 arithmetic, no FMA) |
 | QC-LDPC | BG1 Z=384, 10 iter | **1.93 Gbit/s** | 11.6 Mbit/s | AVX2/NEON layered offset min-sum (§5.2). Encode uses the sparse double-diagonal solve, derived programmatically from the 3GPP tables |
 
 The pattern is the story of modern FEC: **the stronger the code, the more the decoder costs.** Table-driven classics decode at line rate but correct little; the capacity-approaching iterative codes (Turbo, LDPC, Polar) pay orders of magnitude more per bit — which is exactly why production basebands parallelise them across cores and SIMD lanes (see §5.2 and the pipeline in §3).
@@ -569,7 +571,7 @@ process, which removes even the between-run component.
 | Python same-algorithm | ~2.7 MiB/s | ~2.4 | ~2.3 | ~2.3 |
 | Python `reedsolo` library | ~2.0 MiB/s | ~2.2 | ~2.1 | ~2.2 |
 
-`encode_with_avx2` runtime-detects GFNI first: multiplying by a fixed `GF(256)` coefficient is $\mathbb{F}_2$-linear in the byte's bit representation, so it reduces to one `_mm256_gf2p8affine_epi64_epi8` per 32 bytes against a per-coefficient $8\times8$ bit matrix derived once in `precompute_mul_tables`. Where GFNI isn't available it falls back to VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, also 32 bytes/iteration but four shuffle/blend instructions instead of one affine instruction. Both kernels are proven byte-identical to the scalar reference — the GFNI matrix additionally exhaustively, over all 256 coefficients. Rust and C++ produce **byte-identical parity output** (checksum-gated).
+`encode_with_avx2` runtime-detects GFNI first: multiplying by a fixed `GF(256)` coefficient is GF(2)-linear in the byte's bit representation, so it reduces to one `_mm256_gf2p8affine_epi64_epi8` per 32 bytes against a per-coefficient 8×8 bit matrix derived once in `precompute_mul_tables`. Where GFNI isn't available it falls back to VPSHUFB nibble-decomposition: `GF_mul(c, x) = lo_tbl[x & 0xF] ^ hi_tbl[x >> 4]`, also 32 bytes/iteration but four shuffle/blend instructions instead of one affine instruction. Both kernels are proven byte-identical to the scalar reference — the GFNI matrix additionally exhaustively, over all 256 coefficients. Rust and C++ produce **byte-identical parity output** (checksum-gated).
 
 Which of the two is faster cannot be settled by the table above: separate
 benchmark runs on this host drift by more than the gap between the kernels
@@ -610,8 +612,8 @@ regenerate.
 
 ![QC-LDPC decode comparison](bench/dashboard/exports/ldpc_comparison.png)
 
-BG1, Z=384 ($N = 26{,}112$ variable nodes), 10 iterations, median of 200 reps.
-Metric: $N \times \text{iters} / t_{\text{call}}$ (variable-node-iterations/s).
+BG1, Z=384 (N = 26,112 variable nodes), 10 iterations, median of 200 reps.
+Metric: N × iters / t_call (variable-node-iterations/s).
 
 | Implementation | Throughput | Wall-clock / call |
 |---|---|---|
@@ -760,18 +762,18 @@ measurement taken under an unrelated multi-core workload on this host
 returned 88–161 Melem/s for the `f32` row.
 
 Quantization is lossy, so the question that decides whether the fixed-point
-path is usable is how much extra $E_b/N_0$ it needs to reach the same block
+path is usable is how much extra Eb/N0 it needs to reach the same block
 error rate. `tests/ldpc_int8_quantization_loss.rs` measures exactly that, on
 this crate's own decoders, over the BPSK AWGN channel of
-[`channel_sim`](src/channel_sim.rs) with $s = 8$, $\beta = 0.5$ and 10
+[`channel_sim`](src/channel_sim.rs) with s = 8, β = 0.5 and 10
 iterations:
 
-| Code | $E_b/N_0$ | SNR shift vs. `f32` | 95% CI |
+| Code | Eb/N0 | SNR shift vs. `f32` | 95% CI |
 |---|---|---|---|
-| BG1, $Z = 128$ | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
-| BG1, $Z = 384$ | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
-| BG2, $Z = 128$ | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
-| BG2, $Z = 384$ | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
+| BG1, Z = 128 | 0.80 dB | +0.0031 dB | [+0.0005, +0.0057] |
+| BG1, Z = 384 | 0.75 dB | +0.0052 dB | [+0.0035, +0.0070] |
+| BG2, Z = 128 | 0.60 dB | +0.0096 dB | [+0.0066, +0.0126] |
+| BG2, Z = 384 | 0.60 dB | +0.0067 dB | [+0.0044, +0.0089] |
 
 Every interval excludes zero, so the loss is real rather than lost in noise —
 and it is between 0.003 and 0.010 dB, with every upper bound below 0.013 dB.
@@ -787,23 +789,23 @@ by the waterfall's locally measured slope; the test module states that
 assumption and the interval arithmetic behind it.
 
 Two format decisions in that file are measurements rather than assertions,
-the same standard §5.3's $\beta$ is held to:
+the same standard §5.3's β is held to:
 
 - **The posterior is wider than the messages.** A message magnitude is
   bounded by the smallest incoming magnitude in its layer, so 8 bits is a
   real ceiling. A posterior is a *sum* — the channel LLR plus one message per
   incident edge, up to 31 terms for BG1 column 0 — and clamping it to the
   message range does not cost a constant factor, it produces an error floor:
-  on BG1 $Z = 128$ at 0.8 dB it roughly doubles the block error rate (0.165
+  on BG1 Z = 128 at 0.8 dB it roughly doubles the block error rate (0.165
   to 0.312) and raises the bit error rate about eightyfold. The same sweep
   shows how little width is needed — every clamp from 255 upward is
   bit-identical to unclamped — so the 16-bit accumulator is the natural type
   for a nine-bit quantity, not a hedge.
 - **The scale.** Too small and the LLR distribution is coarsely resolved, too
   large and its tails clip. The sweep finds a broad plateau: on both base
-  graphs every $s$ from 8 to 24 is indistinguishable, while $s = 2$ and
-  $s = 32$ are resolvably worse. The default sits at the plateau's lower edge
-  because the optimum falls as the operating $E_b/N_0$ rises.
+  graphs every s from 8 to 24 is indistinguishable, while s = 2 and
+  s = 32 are resolvably worse. The default sits at the plateau's lower edge
+  because the optimum falls as the operating Eb/N0 rises.
 
 Scope, stated rather than implied: the shift is measured on BPSK AWGN in the
 waterfall at the operating points above, and a different rate, modulation or
@@ -822,9 +824,9 @@ cargo test --release --test ldpc_int8_quantization_loss -- --ignored --nocapture
 
 ![BER/BLER waterfall](bench/dashboard/exports/ber_waterfall.png)
 
-Simulation: BPSK AWGN, BG1 Z=384, $R \approx 0.324$, $\beta = 0.25$, 10 LOMS iterations.
+Simulation: BPSK AWGN, BG1 Z=384, R ≈ 0.324, β = 0.25, 10 LOMS iterations.
 Shannon limit for this rate on the real AWGN channel,
-$E_b/N_0 \ge (2^{2R}-1)/(2R) \approx -0.6\ \text{dB}$.
+Eb/N0 ≥ (2^2R − 1)/(2R) ≈ −0.6 dB.
 
 | Eb/No (dB) | BER | BLER | Frames simulated |
 |---|---|---|---|
@@ -861,33 +863,37 @@ cargo bench --bench fec_bench                # Criterion HTML report
 
 ### 6.1 Channel Capacity and the Role of FEC
 
-Shannon's noisy-channel coding theorem (1948) [1] establishes that, for a channel with capacity $C$ bits per channel use, there exist codes of rate $R < C$ that achieve arbitrarily small error probability as block length grows.
+Shannon's noisy-channel coding theorem (1948) [1] establishes that, for a channel with capacity C bits per channel use, there exist codes of rate R < C that achieve arbitrarily small error probability as block length grows.
 
-For the AWGN channel with bandwidth $W$ and signal-to-noise ratio $E_b/N_0$:
+For the AWGN channel with bandwidth W and signal-to-noise ratio Eb/N0:
 
-$$C = W \log_2\!\left(1 + \frac{E_b}{N_0} \cdot R\right)$$
+```text
+C = W · log2(1 + (Eb/N0) · R)
+```
 
 Modern FEC codes (LDPC, Turbo, Polar) operate within a fraction of a dB of the Shannon limit.  5G NR mandates LDPC for all data channels because it offers the highest throughput at practical block lengths and parallelises naturally across SIMD units.
 
 ### 6.2 QC-LDPC and the 5G NR Base Graphs
 
-An LDPC code is defined by a sparse parity-check matrix $H \in \{0,1\}^{M \times N}$.  The code $\mathcal{C}$ consists of all binary vectors $\mathbf{c}$ satisfying $H \mathbf{c} = \mathbf{0} \pmod{2}$.
+An LDPC code is defined by a sparse parity-check matrix H ∈ {0,1}^(M×N).  This code consists of all binary vectors c satisfying H·c = 0 (mod 2).
 
-5G NR uses **Quasi-Cyclic LDPC** [5] in which $H$ is built from $Z \times Z$ circulant sub-matrices — cyclic shifts $\mathbf{I}^{(p)}$ of the identity by $p$ positions.  The full matrix expands from a small **base graph** $H_b$:
+5G NR uses **Quasi-Cyclic LDPC** [5] in which H is built from Z×Z circulant sub-matrices — cyclic shifts I^(p) of the identity by p positions.  The full matrix expands from a small **base graph** Hb:
 
-$$H = \text{expand}(H_b,\, Z) \in \{0,1\}^{m_b Z \times n_b Z}$$
+```text
+H = expand(Hb, Z) ∈ {0,1}^(mb·Z × nb·Z)
+```
 
 3GPP TS 38.212 specifies two base graphs [11]:
 
 | Parameter | BG1 | BG2 |
 |---|---|---|
-| Base rows $m_b$ | 46 | 42 |
-| Base columns $n_b$ | 68 | 52 |
+| Base rows mb | 46 | 42 |
+| Base columns nb | 68 | 52 |
 | Non-null entries | 316 | 197 |
-| Info columns $k_b$ | 22 | 10 |
+| Info columns kb | 22 | 10 |
 | Max code rate | 8/9 | 2/3 |
-| Lifted $N$ at $Z=384$ | 26 112 | — |
-| Lifted $N$ at $Z=128$ | — | 6 656 |
+| Lifted N at Z=384 | 26 112 | — |
+| Lifted N at Z=128 | — | 6 656 |
 
 BG1 is used for large, high-rate transport blocks; BG2 for smaller or lower-rate blocks.
 
@@ -897,29 +903,30 @@ Layered (turbo-scheduled) decoding [9] processes one row-block at a time, immedi
 
 Per-layer update equations:
 
-$$Q_{mn}^{(t)} = L_n^{(t-1)} - R_{mn}^{(t-1)}$$
+```text
+Qmn(t)  = Ln(t-1) - Rmn(t-1)
+Rmn(t)  = ( product over n' of sign(Qmn'(t)) )
+          · max( min over n' of |Qmn'(t)| - β, 0 )
+Ln(t)   = Qmn(t) + Rmn(t)
+```
 
-$$R_{mn}^{(t)} = \left(\prod_{n'} \text{sign}\,Q_{mn'}^{(t)}\right) \cdot \max\!\left(\min_{n'} \left|Q_{mn'}^{(t)}\right| - \beta,\; 0\right)$$
-
-$$L_n^{(t)} = Q_{mn}^{(t)} + R_{mn}^{(t)}$$
-
-This implementation uses $\beta = 0.25$, a standard operating point for 5G NR BG1 [8].  After each layer iteration, a **syndrome check** ($H \mathbf{c} = \mathbf{0}$) enables early termination without exhausting all iterations.
+This implementation uses β = 0.25, a standard operating point for 5G NR BG1 [8].  After each layer iteration, a **syndrome check** (H·c = 0) enables early termination without exhausting all iterations.
 
 ### 6.4 Algorithm-to-code mapping
 
 | Mathematical object | Rust symbol | Notes |
 |---|---|---|
-| $H_b$ BG1 entries | `BG1_ENTRIES` (build-time const) | `[(u8,u8,[i16;8]); 316]` |
-| $p_{ij}(Z)$ cyclic shift | `entry_col_shift()` | `v[iLS] % Z` |
-| $L_n$ channel LLR buffer | `llr: &mut [f32]` | Flat, len $= n_b \cdot Z$ |
-| $R_{mn}$ extrinsic buffer | `edge_r: &mut [f32]` | Flat, len $= E \cdot Z$ |
-| Per-layer $Q_{mn}$ scratch | `layer_scratch: &mut [f32]` | Len $= d_m^{\max} \cdot Z$, reused per layer |
-| LOMS offset $\beta$ | `offset_beta: f32` | 0.25 default |
+| Hb BG1 entries | `BG1_ENTRIES` (build-time const) | `[(u8,u8,[i16;8]); 316]` |
+| p_ij(Z) cyclic shift | `entry_col_shift()` | `v[iLS] % Z` |
+| Ln channel LLR buffer | `llr: &mut [f32]` | Flat, len = nb · Z |
+| Rmn extrinsic buffer | `edge_r: &mut [f32]` | Flat, len = E · Z |
+| Per-layer Qmn scratch | `layer_scratch: &mut [f32]` | Len = dm^max · Z, reused per layer |
+| LOMS offset β | `offset_beta: f32` | 0.25 default |
 | LOMS inner loop | `process_layer_all_z()` | Z-inner; vectorised by LLVM |
 
 ### 6.5 Wi-Fi 6 / 7 (802.11ax/be) LDPC parameters and real codeword encode/decode
 
-802.11ax/be use the same LOMS algorithm with lifting sizes $Z \in \{27, 54, 81\}$ and $N = 24Z$ always. The `wifi` module provides the full MCS parameter table:
+802.11ax/be use the same LOMS algorithm with lifting sizes Z ∈ {27, 54, 81} and N = 24Z always. The `wifi` module provides the full MCS parameter table:
 
 | Standard | MCS range | Modulation | Max rate |
 |---|---|---|---|
@@ -927,7 +934,7 @@ This implementation uses $\beta = 0.25$, a standard operating point for 5G NR BG
 | Wi-Fi 7 (802.11be) | MCS 0–13 | BPSK → **4096-QAM** | 5/6 |
 
 `wifi_ldpc_tables` supplies the real IEEE 802.11 Annex R/F shift matrices for
-all 12 $(Z, R)$ combinations, obtained from the IEEE 802.11n-2009 standard
+all 12 (Z, R) combinations, obtained from the IEEE 802.11n-2009 standard
 text (Annex R, Tables R.1–R.3) and cross-validated against two independent
 open-source transcriptions — see that module's doc comment for the full
 sourcing note. `wifi_ldpc_encoder(z, rate_num, rate_den)` /
@@ -935,12 +942,12 @@ sourcing note. `wifi_ldpc_encoder(z, rate_num, rate_den)` /
 `WifiLdpcParams::build_encoder`/`build_decoder`) build a real
 `QcLdpcEncoder`/`QcLdpcDecoder` — a genuine 802.11 codeword now encodes,
 survives an AWGN channel, and decodes bit-exact through the identical LOMS
-kernel used for 5G NR, including a payload smaller than $K$ (shortening) and
+kernel used for 5G NR, including a payload smaller than K (shortening) and
 a transmitted length smaller than the post-shortening budget (puncturing)
 via `wifi_rate_matching::{encode_shortened, decode_shortened}` — see
 `tests/wifi_shortening_puncturing_integration.rs` for the encode → AWGN →
 decode round-trip across all 12 combinations. Multi-codeword segmentation
-(a payload larger than one codeword's $K$) and the 802.11 PPDU-level formula
+(a payload larger than one codeword's K) and the 802.11 PPDU-level formula
 that derives the available coded-bit count for a given MCS are not
 implemented — see the `wifi_rate_matching` module doc.
 
@@ -959,9 +966,9 @@ The `sixg` module captures confirmed 3GPP / ITU-R research directions for IMT-20
 
 ### 6.7 Practical motivation: coding gain and media delivery
 
-**LDPC vs repetition code (rate 1/3, $P_b = 10^{-5}$ target):**
+**LDPC vs repetition code (rate 1/3, Pb = 10⁻⁵ target):**
 
-| Code | $E_b/N_0$ required | Gap to Shannon limit |
+| Code | Eb/N0 required | Gap to Shannon limit |
 |---|---|---|
 | Uncoded BPSK | ≈ 9.6 dB | — |
 | Repetition(3) — trivial | ≈ 9.0 dB | ≈ 9.6 dB |
@@ -972,8 +979,8 @@ The **~8.3 dB coding gain** over the repetition code corresponds to 6.7× less t
 
 **RS packet-loss recovery (RS(10, 4) on a 2 Mbps video stream at 1% independent packet loss, 1500-byte packets, iid loss model):**
 
-- No FEC: mean packets between losses is $1/p = 100$, i.e. a glitch roughly every **0.6 s** at ~167 packets/s.
-- With RS(10, 4): a 14-packet stripe survives unless more than 4 of its 14 packets are lost. $P(\text{stripe failure}) = \sum_{x=5}^{14} \binom{14}{x} p^x (1-p)^{14-x} \approx 1.86 \times 10^{-7}$ at $p=0.01$, against $\approx 11.9$ stripes/s — an expected failure once every **≈126 hours**, at 40% bandwidth overhead.
+- No FEC: mean packets between losses is 1/p = 100, i.e. a glitch roughly every **0.6 s** at ~167 packets/s.
+- With RS(10, 4): a 14-packet stripe survives unless more than 4 of its 14 packets are lost. P(stripe failure) = Σ (x=5..14) C(14,x)·p^x·(1−p)^(14−x) ≈ 1.86 × 10⁻⁷ at p=0.01, against ≈ 11.9 stripes/s — an expected failure once every **≈126 hours**, at 40% bandwidth overhead.
 
 (Recompute with `math.comb` and the formula above for any other packet size, bitrate, or loss rate — the number moves with those assumptions, so treat it as illustrative of the *shape* of the reliability gain, not a fixed constant.)
 
@@ -983,7 +990,7 @@ The **~8.3 dB coding gain** over the repetition code corresponds to 6.7× less t
 
 **Zero-allocation hot path.** The decode inner loops make no heap allocations.  All buffers (`llr`, `edge_r`, `layer_scratch`) are owned by the caller and reused across calls.  The 4.5 KiB per-layer scratch (`min1`, `min2`, `sign_xor`) is stack-allocated inside `decode_layered_offset_min_sum`.
 
-**Flat memory layout.** The extrinsic buffer is indexed as `edge_r[global_edge * Z + z_pos]` — shape `(E, Z)`, row-major.  This keeps all $Z$ z-positions for one edge contiguous, which is what lets the AVX2 kernel below load them as a single SIMD register.
+**Flat memory layout.** The extrinsic buffer is indexed as `edge_r[global_edge * Z + z_pos]` — shape `(E, Z)`, row-major.  This keeps all Z z-positions for one edge contiguous, which is what lets the AVX2 kernel below load them as a single SIMD register.
 
 **Syndrome-check early termination.** After each full layer sweep, `check_syndrome_f32` XORs hard decisions across all parity equations.  A clean syndrome exits before `max_iters`; `decode_layered_offset_min_sum` returns the number of iterations actually used.
 

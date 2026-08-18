@@ -27,9 +27,13 @@
 //
 // Rust doc comments only (`///`, `//!`) under the directories given on the
 // command line, defaulting to `src`. README.md, CHANGELOG.md and
-// system_architecture.md are rendered by GitHub, whose math extension keeps
-// backslashes verbatim, so they use the opposite convention and are
-// deliberately not checked here.
+// system_architecture.md use no LaTeX at all -- plain text / Unicode
+// notation instead, because crates.io renders the README as a bare HTML
+// fragment with no script/stylesheet injection possible, so $...$ syntax
+// can never render there regardless of escaping convention (verified via
+// static.crates.io's readme HTML, which has zero <script>/<link> tags).
+// Nothing to check in those three files against KaTeX; they are
+// deliberately not scanned here.
 //
 // USAGE
 //

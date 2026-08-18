@@ -553,3 +553,111 @@ fn katex_parses_every_span() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+/// README.md, CHANGELOG.md and system_architecture.md must contain no LaTeX
+/// `$...$` math syntax at all.
+///
+/// This is a different platform from rustdoc, with a different failure mode
+/// that CommonMark-escaping cannot fix. crates.io renders the crate's README
+/// as a bare HTML fragment with no `<script>`/`<link>` tag ever injected —
+/// verified by fetching `static.crates.io/readmes/<crate>/<crate>-<version>.html`
+/// and finding zero of either — so there is no way to load a math renderer
+/// there under *any* escaping convention. `$E_b/N_0$` reaches every visitor
+/// to the crate's crates.io page as the literal seven characters between the
+/// dollar signs, backslashes and braces included. The fix used throughout
+/// these three files is not an escaping convention but the absence of one:
+/// plain text and Unicode (`β`, `×`, `Eb/N0`) instead of LaTeX, with
+/// standalone equations as a ` ```text ` fenced block. See the *Math
+/// Formatting* rule in `CLAUDE.md` and the comment at the top of
+/// `katex-header.html` for the full rationale.
+///
+/// A bare `$` in running prose (a literal dollar amount) would false-positive
+/// here, but none of these three files has occasion to discuss money, and a
+/// real one should just be spelled `USD` or escaped as `\$` rather than
+/// silently exempted — the cost of a false positive on this check is a
+/// two-second look, and the cost of a silent exemption is this bug shipping
+/// again unnoticed.
+#[test]
+fn plain_text_docs_contain_no_latex_math() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "CHANGELOG.md", "system_architecture.md"] {
+        let path = root.join(name);
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {name}: {e}"));
+        // A $ inside a single-backtick code span is a deliberate illustration
+        // of the old broken syntax (this file documents the bug this very
+        // test file fixes) and renders as literal monospace text everywhere,
+        // crates.io included — it is not a live math span. Strip those before
+        // counting, the same distinction `tools/check_doc_math.mjs` draws.
+        let stripped = strip_backtick_spans(&text);
+        let count = stripped.chars().filter(|&c| c == '$').count();
+        assert_eq!(
+            count, 0,
+            "{name} contains {count} literal, non-backtick-protected '$' character(s), \
+             which will render as raw text (backslashes, braces and all) on the crate's \
+             crates.io page — that platform has no math renderer and none can be \
+             injected. Use plain text / Unicode instead of LaTeX in this file; see the \
+             Math Formatting rule in CLAUDE.md."
+        );
+    }
+}
+
+/// Remove every code span from `text` -- fenced (```) blocks and inline
+/// single-backtick spans alike -- so a $ deliberately shown as a literal code
+/// example does not count as a live, unrendered math span.
+///
+/// Handled as two separate constructs rather than one character-toggle,
+/// because a naive per-backtick toggle gets the parity wrong the moment a
+/// fenced block (three backticks, an odd count) appears anywhere before an
+/// inline span: the toggle is left in the wrong state for everything after
+/// it, including every newline, which silently deletes the rest of the file
+/// from the stripped text instead of raising an error. Caught by running
+/// this function against the crate's own CHANGELOG, which mixes both kinds.
+fn strip_backtick_spans(text: &str) -> String {
+    // Fenced blocks first: from a line that (after trimming) starts with
+    // ``` through the next such line, inclusive. Markdown fences don't nest
+    // and don't cross into inline spans, so line-based matching is exact
+    // here even though it would not be for inline code.
+    let mut out_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            out_lines.push(line);
+        }
+    }
+    let defenced = out_lines.join("\n");
+
+    // Inline spans second, strictly within one line: CommonMark inline code
+    // does not cross a blank-line paragraph break, and every inline span in
+    // this crate's docs is written on a single line, so per-line matching
+    // cannot straddle an unrelated odd backtick the way a whole-file toggle
+    // can.
+    defenced
+        .lines()
+        .map(|line| {
+            let mut result = String::with_capacity(line.len());
+            let mut rest = line;
+            while let Some(start) = rest.find('`') {
+                result.push_str(&rest[..start]);
+                let after_open = &rest[start + 1..];
+                match after_open.find('`') {
+                    Some(end) => rest = &after_open[end + 1..],
+                    // Unpaired backtick on this line: drop it and keep the
+                    // rest of the line as ordinary text rather than eating
+                    // the remainder of the file.
+                    None => {
+                        rest = after_open;
+                        break;
+                    }
+                }
+            }
+            result.push_str(rest);
+            result
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
