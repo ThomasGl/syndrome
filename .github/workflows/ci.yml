@@ -203,6 +203,48 @@ jobs:
       - name: Model-check the SPSC ring
         run: RUSTFLAGS="--cfg loom" cargo test --release --test loom_spsc
 
+  miri:
+    name: Miri (non-SIMD unsafe)
+    runs-on: ubuntu-latest
+    # Miri interprets Rust at the level of its aliasing and memory model, so it
+    # sees the things a test suite cannot: a raw pointer outliving its
+    # allocation, a `&mut` overlapping a `&`, an out-of-bounds slot index that
+    # happens to land inside another live object.
+    #
+    # Scope is deliberate. Every remaining `unsafe` in the crate is a call into
+    # `simd_avx2`/`simd_neon`, and Miri cannot execute those intrinsics — so
+    # the module list below is not a sample of the unsafe code, it *is* the
+    # non-SIMD unsafe code: the SPSC ring's cells and the LDPC pipeline's
+    # frame-pool protocol. The SIMD kernels are held to a different standard
+    # instead, being proven equal to a retained scalar reference.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-miri-
+
+      # The cross-thread stress tests scale themselves down under `cfg(miri)`
+      # (see `STRESS_COUNT` in src/spsc_queue.rs); Miri costs about a thousand
+      # times native speed, and what it checks is structural rather than
+      # statistical.
+      - name: Miri — SPSC ring
+        run: cargo +nightly miri test --lib spsc_queue
+
+      - name: Miri — LDPC pipeline frame pool
+        run: cargo +nightly miri test --lib ldpc_pipeline
+
   doc-math:
     name: Rustdoc Math
     runs-on: ubuntu-latest

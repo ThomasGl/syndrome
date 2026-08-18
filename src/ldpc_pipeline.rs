@@ -113,6 +113,35 @@ struct FrameSlot {
     tag: usize,
 }
 
+/// A pointer to a pool slot that is allowed to cross a thread boundary.
+///
+/// # Why this is a newtype and not a `usize`
+///
+/// The workers need the slot addresses, and a raw pointer is not `Send`, so an
+/// earlier version collected them as `Vec<usize>` and cast back with
+/// `ptr as *mut FrameSlot` inside the worker. That compiles, runs, and is
+/// **undefined behaviour**: an integer-to-pointer round trip discards the
+/// pointer's provenance, and the reborrow in the worker then has no claim to
+/// the allocation it names. Miri rejects it outright — "trying to retag from
+/// `<wildcard>` for Unique permission ... no exposed tags have suitable
+/// permission in the borrow stack" — and it is exactly the kind of defect no
+/// amount of testing finds, because the generated code is what the author
+/// intended and the program behaves correctly under every compiler that exists
+/// today.
+///
+/// Wrapping the pointer instead keeps its provenance intact, and moves the
+/// `Send` assertion to where it can be justified in one place.
+#[derive(Clone, Copy)]
+struct SlotPtr(*mut FrameSlot);
+
+// SAFETY: the pointer targets a `Box<FrameSlot>` in `LdpcPipeline::pool`,
+// which is allocated before any worker starts and dropped only after every
+// worker has joined (see `Drop`), so it is valid for the whole of a worker's
+// life. The frame protocol gives at most one thread access to any given slot
+// at a time: a slot index reaches a worker only through that worker's work
+// ring, and returns only through its done ring.
+unsafe impl Send for SlotPtr {}
+
 /// A borrowed decode slot.  Obtained via [`LdpcPipeline::acquire`].
 ///
 /// Fill [`LdpcFrame::llr_mut`] with channel LLR values, then hand ownership to the
@@ -207,8 +236,21 @@ pub struct LdpcPipeline {
     /// were ever resized — the workers hold raw `*mut FrameSlot` into these
     /// allocations, so per-element address stability is a safety requirement
     /// (hence `clippy::vec_box` is intentional here, not a missed simplification).
-    #[allow(clippy::vec_box)]
+    #[allow(clippy::vec_box, dead_code)]
     pool: Vec<Box<FrameSlot>>,
+    /// The single set of pointers into `pool`, derived once at construction
+    /// and shared verbatim with the workers.
+    ///
+    /// Both sides of the protocol must reach a slot through *this* vector and
+    /// never by re-borrowing `pool`. Taking a fresh `&mut` from
+    /// `pool[idx]` — which `acquire` and `try_recv` used to do — creates a new
+    /// borrow that invalidates the pointer the workers are holding, even
+    /// though nothing reads through it at that instant. Miri catches it as a
+    /// retag against a tag that is no longer in the borrow stack; the
+    /// generated code is unaffected today, which is precisely why no test
+    /// could. `pool` therefore does nothing after construction but own the
+    /// allocations and free them in `Drop`.
+    slot_ptrs: Vec<SlotPtr>,
     /// Slot indices available to the caller (main-thread-only, no concurrency).
     free_list: Vec<usize>,
     /// Per-worker work rings: caller → worker[i].
@@ -288,12 +330,13 @@ impl LdpcPipeline {
             })
             .collect();
 
-        // Collect raw pointers (as usize for Send compatibility).
-        // SAFETY: `pool` is never reallocated after this point, so the
-        // pointers remain valid until `pool` is dropped after all workers join.
-        let pool_ptrs: Vec<usize> = pool
+        // Slot addresses for the workers. Taken from `&mut` so each pointer
+        // carries write provenance, and kept as pointers rather than integers
+        // — see `SlotPtr` for why the integer round trip was undefined
+        // behaviour.
+        let pool_ptrs: Vec<SlotPtr> = pool
             .iter_mut()
-            .map(|b| b.as_mut() as *mut FrameSlot as usize)
+            .map(|b| SlotPtr(b.as_mut() as *mut FrameSlot))
             .collect();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -323,9 +366,13 @@ impl LdpcPipeline {
                     let _ = crate::affinity::pin_to_core(wi);
                     loop {
                         if let Some(idx) = work_rx.try_pop() {
-                            // SAFETY: `idx` is in [0, POOL_SIZE). The pool protocol
-                            // ensures we are the only thread touching this slot.
-                            let slot = unsafe { &mut *(ptrs[idx] as *mut FrameSlot) };
+                            // SAFETY: `idx` is in [0, POOL_SIZE) because it came
+                            // out of this worker's work ring, which only ever
+                            // carries pool indices. The frame protocol ensures we
+                            // are the only thread touching this slot until it is
+                            // pushed to the done ring below.
+                            let SlotPtr(raw) = ptrs[idx];
+                            let slot = unsafe { &mut *raw };
 
                             // decode_layered_offset_min_sum zeroes edge_r itself at
                             // the top of every call (see qc_ldpc.rs), so doing it
@@ -365,6 +412,7 @@ impl LdpcPipeline {
 
         Self {
             pool,
+            slot_ptrs: pool_ptrs,
             free_list,
             work_rings,
             done_rings,
@@ -388,9 +436,14 @@ impl LdpcPipeline {
     /// flight (caller is submitting faster than the workers can decode).
     pub fn acquire(&mut self) -> Option<LdpcFrame> {
         let idx = self.free_list.pop()?;
-        // SAFETY: pool is never reallocated; idx is in [0, POOL_SIZE).
-        let ptr = self.pool[idx].as_mut() as *mut FrameSlot;
-        Some(LdpcFrame { slot_idx: idx, ptr })
+        // SAFETY: `idx` came off the free list, so no worker holds this slot.
+        // The pointer comes from `slot_ptrs` rather than a fresh borrow of
+        // `pool` — see that field for why re-borrowing would be undefined
+        // behaviour.
+        Some(LdpcFrame {
+            slot_idx: idx,
+            ptr: self.slot_ptrs[idx].0,
+        })
     }
 
     /// Submit a frame for decoding, dispatching to the next worker in
@@ -436,9 +489,15 @@ impl LdpcPipeline {
     pub fn try_recv(&self) -> Option<LdpcFrame> {
         for done in &self.done_rings {
             if let Some(idx) = done.try_pop() {
-                // SAFETY: pool is never reallocated; idx came from the done ring.
-                let ptr = self.pool[idx].as_ref() as *const FrameSlot as *mut FrameSlot;
-                return Some(LdpcFrame { slot_idx: idx, ptr });
+                // SAFETY: `idx` came out of a done ring, so it is a pool index
+                // and its slot is no longer owned by any worker. As in
+                // `acquire`, the pointer comes from `slot_ptrs` — deriving it
+                // from a fresh borrow of `pool`, as this once did, invalidates
+                // the pointer the workers hold.
+                return Some(LdpcFrame {
+                    slot_idx: idx,
+                    ptr: self.slot_ptrs[idx].0,
+                });
             }
         }
         None
@@ -471,9 +530,31 @@ mod tests {
     use super::*;
     use crate::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 
+    /// Decoder for the pool-protocol tests.
+    ///
+    /// The frame protocol — acquire, fill, submit, receive, release, and the
+    /// pool wrapping back around — is what these tests exercise, and it does
+    /// not depend on the code being decoded. Natively they use BG1 at
+    /// $Z = 384$ so the workers do realistic work; under Miri that is
+    /// hopeless (26,112 variable nodes per frame, interpreted), and BG2 at
+    /// $Z = 2$ drives exactly the same protocol at a size Miri can finish.
+    fn protocol_decoder() -> QcLdpcDecoder {
+        if cfg!(miri) {
+            QcLdpcDecoder::with_lifting_size(BaseGraph::Bg2, 2, 0.25)
+                .expect("Z = 2 is a valid 3GPP lifting size")
+        } else {
+            QcLdpcDecoder::new(BaseGraph::Bg1, 0.25)
+        }
+    }
+
+    /// Frames pushed through the pipeline by the throughput test. Enough
+    /// natively to cycle the 16-slot pool several times; enough under Miri to
+    /// cycle it once, which is what proves slots are reused correctly.
+    const PROTOCOL_FRAMES: usize = if cfg!(miri) { 20 } else { 64 };
+
     #[test]
     fn pipeline_roundtrip_single_frame() {
-        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let decoder = protocol_decoder();
         let n = decoder.variable_node_count();
         let mut pipe = LdpcPipeline::new(decoder, 5);
 
@@ -496,7 +577,7 @@ mod tests {
 
     #[test]
     fn pipeline_all_slots_cycle() {
-        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let decoder = protocol_decoder();
         let mut pipe = LdpcPipeline::new(decoder, 3);
 
         // Submit all 16 slots, then drain all 16 results.
@@ -520,11 +601,11 @@ mod tests {
 
     #[test]
     fn pipeline_multi_worker_throughput() {
-        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let decoder = protocol_decoder();
         let n = decoder.variable_node_count();
         let mut pipe = LdpcPipeline::with_workers(decoder, 3, 4);
 
-        const FRAMES: usize = 64;
+        const FRAMES: usize = PROTOCOL_FRAMES;
         let mut submitted = 0usize;
         let mut received = 0usize;
 
@@ -551,7 +632,7 @@ mod tests {
 
     #[test]
     fn new_uses_available_hardware_parallelism() {
-        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let decoder = protocol_decoder();
         let pipe = LdpcPipeline::new(decoder, 3);
 
         // Compute the expected worker count exactly the way `new` does, so
@@ -575,7 +656,7 @@ mod tests {
     #[test]
     fn pipeline_worker_count_clamp() {
         // n_workers=0 must behave as 1 worker (no panic, correct output).
-        let decoder = QcLdpcDecoder::new(BaseGraph::Bg1, 0.25);
+        let decoder = protocol_decoder();
         let mut pipe = LdpcPipeline::with_workers(decoder, 3, 0);
         let mut frame = pipe.acquire().expect("pool has slots");
         frame.llr_mut().iter_mut().for_each(|v| *v = 5.0);

@@ -71,6 +71,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **Mutation audit with `cargo-mutants`** (`mutants.toml`, plus the tests it
+  demanded): 185 mutants across `bits`, `quantize`, `harq`, `segmentation` and
+  `spsc_queue`. Six survived, every one a real gap, and all six are now closed.
+
+  | Survivor | What it meant |
+  |---|---|
+  | `HarqBuffer::combine`: `n_filler_override > 0` | The override branch had no test at all — every caller in the suite passed `0`, so deleting the parameter would not have failed anything. |
+  | `HarqBuffer::copy_llr_into`: `dst.len() < acc.len()` → `<=` | The existing test passed a 1-element destination, which both forms reject. An exactly-`ncb` buffer — the one a caller who read `ncb()` would allocate — was never tried. |
+  | `compute_segmentation`: all four BG2 $K_b$ thresholds | The TS 38.212 §5.2.2 ladder could be loosened from `>` to `>=` unnoticed, because $K_b$ is not among the fields `SegmentationParams` reports and no test used a transport block sitting *at* a threshold. |
+
+  The $K_b$ finding is the one worth dwelling on: it is a transcribed spec
+  table feeding a value that shifts $Z$, $K$ and the filler count for a *band*
+  of transport block sizes while leaving every size outside that band correct
+  — the exact shape of a transcription slip, and invisible to round-trip tests
+  that sample sizes at random. The ladder is now `lifting_selection_k_b`, a
+  separate function purely so it can be tested at each boundary from both
+  sides.
+
+  One survivor in `bits_to_bytes` (`|` → `^`) is left as-is: `byte << 1`
+  always leaves the low bit clear and the input is validated to be 0 or 1
+  before the loop, so the two operators are provably identical there. It is an
+  equivalent mutant, not a gap.
+
+  `mutants.toml` records the scoping. A full run is ~4,500 mutants — weeks at
+  this suite's runtime — so the audit is per module, and two kinds of module
+  are excluded deliberately rather than silently: the SIMD kernels, which have
+  a stronger gate already (bit-identical equivalence against a retained scalar
+  reference) and mostly produce timeouts under mutation, and the benchmark
+  exporters, which have no assertions to violate.
+
+  A side finding worth recording: 28 of the `spsc_queue` mutants were detected
+  as TIMEOUT rather than CAUGHT — a mutated ring makes the cross-thread stress
+  tests spin forever. The defect *is* caught, after 219 seconds of waiting. The
+  loom models added alongside catch the same class in milliseconds and name the
+  ordering that broke, which is the better tool for that module; the mutation
+  run is what showed how much of the SPSC coverage rested on a hang.
+
+- **Scoped Miri run over the crate's non-SIMD `unsafe`** (CI job `miri`):
+  `cargo miri test --lib spsc_queue` and `--lib ldpc_pipeline`.
+
+  The scope is not a sample. Every other `unsafe` in the crate is a call into
+  `simd_avx2`/`simd_neon`, which Miri cannot execute — so those two modules
+  *are* the non-SIMD unsafe code: the SPSC ring's cells and the LDPC
+  pipeline's raw-pointer frame-pool protocol. The SIMD kernels are held to a
+  different standard instead, being proven equal to a retained scalar
+  reference.
+
+  Miri sees what a test suite cannot — a pointer outliving its allocation, a
+  `&mut` overlapping a `&`, an index that lands inside a different live object
+  — and it is the natural complement to the loom work: loom checks *ordering*
+  across interleavings, Miri checks *memory validity* along each one. The
+  cross-thread stress tests scale themselves down under `cfg(miri)`
+  (`STRESS_COUNT`), because Miri interprets at roughly a thousandth of native
+  speed and what it checks is structural rather than statistical.
+
 - **`DlSchDecoder` can decode code blocks concurrently**
   (`DlSchDecoder::with_pipeline`): the lock-free [`LdpcPipeline`] was built,
   benchmarked and documented, but nothing in the transport-block chain used
@@ -172,6 +227,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that reading safe — narrowing the number format buys nothing without SIMD,
   and they agree at ~64 Melem/s to within their own run-to-run spread, so the
   gap above is the register width and not the arithmetic.
+
+### Fixed
+
+- **Two aliasing violations in `LdpcPipeline`'s frame pool**, both found by
+  Miri and neither observable any other way.
+
+  The worker threads received their slot addresses as `Vec<usize>` — a raw
+  pointer is not `Send`, and the integer round trip was the shortcut around
+  that. It is undefined behaviour: converting a pointer to an integer and back
+  discards its provenance, so the reborrow inside the worker has no claim to
+  the allocation it names. Miri rejects it outright ("trying to retag from
+  `<wildcard>` ... no exposed tags have suitable permission in the borrow
+  stack"). Now a `SlotPtr` newtype carries the pointer intact and asserts
+  `Send` in one place where it can be justified.
+
+  With that repaired Miri found a second, deeper one: `acquire` and `try_recv`
+  each took a *fresh* `&mut` (or, worse, a `&` cast to `*mut`) out of the pool
+  `Vec` to build a frame, and every such borrow invalidates the pointers the
+  workers are already holding — even though nothing reads through them at that
+  instant. Both now take the pointer from the single `slot_ptrs` vector
+  created at construction, so there is one provenance chain rather than three;
+  `pool` does nothing after construction but own the allocations and free them
+  on drop.
+
+  No behaviour changes and no generated code changes under any compiler that
+  exists today, which is exactly why no test could have caught either. This is
+  the crate's lock-free showpiece, and it had been shipping undefined
+  behaviour since the pipeline was written.
 
 ## [0.4.0] — 2026-08-16
 

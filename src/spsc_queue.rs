@@ -377,6 +377,32 @@ impl<T: Copy, const N: usize> SpscRing<T, N> {
 
 #[cfg(test)]
 mod tests {
+    /// How many values the cross-thread stress tests move.
+    ///
+    /// Under Miri the count collapses to a few hundred. Miri interprets rather
+    /// than executes, and the cost lands hardest on exactly this shape of
+    /// test: a four-slot ring means the producer blocks on almost every push
+    /// and spins waiting for the consumer, and every one of those spins is
+    /// interpreted too. Nothing is lost by shrinking it, because what Miri
+    /// checks is whether *any* execution touches memory it should not — a
+    /// use-after-free, an out-of-bounds slot, an aliasing violation between
+    /// the producer's write and the consumer's read — and those are structural
+    /// properties a few hundred hand-offs already exhibit, wrapping the ring
+    /// dozens of times. The large native count exists for the opposite reason:
+    /// enough repetitions for a rare interleaving to occur at all.
+    ///
+    /// Neither substitutes for `tests/loom_spsc.rs`, which is the only one of
+    /// the three that explores interleavings *exhaustively* rather than
+    /// sampling whichever ones happen.
+    const STRESS_COUNT: u64 = if cfg!(miri) { 300 } else { 200_000 };
+
+    /// [`STRESS_COUNT`] for the large-capacity variant, whose point natively is
+    /// to run five times longer than the small one. Under Miri it does not get
+    /// that multiplier: the two tests differ in ring capacity, which is what
+    /// Miri is looking at, and multiplying an already thousand-fold-slower
+    /// interpretation buys nothing but minutes.
+    const STRESS_COUNT_LARGE: u64 = if cfg!(miri) { 300 } else { 1_000_000 };
+
     use super::*;
     use std::sync::Arc;
     use std::thread;
@@ -467,7 +493,7 @@ mod tests {
     #[test]
     fn batched_transfer_is_lossless_and_ordered_across_threads() {
         const CAP: usize = 64;
-        const TOTAL: u32 = 200_000;
+        const TOTAL: u32 = STRESS_COUNT as u32;
         let ring: Arc<SpscRing<u32, CAP>> = Arc::new(SpscRing::new());
 
         let producer = {
@@ -577,7 +603,7 @@ mod tests {
     /// merely asserting on it in prose.
     #[test]
     fn spsc_ring_concurrent_stress_small_capacity() {
-        const N_SMALL: u64 = 200_000;
+        const N_SMALL: u64 = STRESS_COUNT;
         let ring: Arc<SpscRing<u64, 4>> = Arc::new(SpscRing::new());
 
         let producer_ring = Arc::clone(&ring);
@@ -623,7 +649,7 @@ mod tests {
     /// happens thousands of times over the run.
     #[test]
     fn spsc_ring_concurrent_stress_large_capacity() {
-        const N_LARGE: u64 = 1_000_000;
+        const N_LARGE: u64 = STRESS_COUNT_LARGE;
         let ring: Arc<SpscRing<u64, 4096>> = Arc::new(SpscRing::new());
 
         let producer_ring = Arc::clone(&ring);
