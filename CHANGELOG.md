@@ -71,6 +71,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **Chase-II soft-decision BCH decoding** (`BchCode::decode_chase2`,
+  `Chase2Report`): corrects error patterns beyond the algebraic limit $t$ by
+  using the demodulator's reliabilities, which the hard decoder throws away.
+
+  It hard-decides from the LLR signs, takes the $p$ positions with the
+  smallest $\lvert \mathrm{LLR} \rvert$, runs the existing
+  Berlekamp–Massey/Chien/Forney decoder on each of the $2^p$ ways of flipping
+  a subset of them, and keeps the surviving codeword of least **analog
+  weight** — the total reliability that has to be disbelieved to accept it,
+  $\sum_{i \thinspace : \thinspace c_i \ne \hat b_i} \lvert \mathrm{LLR}_i
+  \rvert$. That metric is maximum-likelihood among the candidates found,
+  because on an AWGN channel a codeword's log-likelihood is affine in exactly
+  that sum.
+
+  A codeword carrying $t + 1$ errors is uncorrectable algebraically no matter
+  how obvious the answer looks; Chase-II recovers it whenever the surplus
+  errors sit among the positions the demodulator already doubted, which is the
+  usual case because errors concentrate where the LLR was small. Cost is $2^p$
+  algebraic decodes, so $p$ belongs in single digits.
+
+  Tested against what it could get wrong rather than for coverage: that it
+  corrects $t + 1$ errors *and* that the algebraic decoder genuinely fails on
+  the same pattern (a Chase-II that silently reduced to `decode` would pass a
+  test asserting only the first); that it never disagrees with a successful
+  algebraic decode; that a clean codeword comes back untouched with zero
+  analog weight; and that $p = 0$ degenerates to exactly one hard decode.
+  Five injected defects — keeping the worst candidate, searching the *most*
+  reliable positions, searching none, inverting the hard decision, and scoring
+  the metric over agreeing instead of disagreeing positions — each fail at
+  least one.
+
 - **Adaptive CA-SCL list size** (`PolarDecoder::decode_scl_adaptive`,
   `AdaptiveDecodeReport`): decodes at $L = 1$ first, and escalates to 2, 4, …
   up to the configured list size only when the CRC rejects the result.

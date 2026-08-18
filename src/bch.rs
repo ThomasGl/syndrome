@@ -232,6 +232,25 @@ fn minimal_poly_bits(
 /// Construct with [`BchCode::new`]; `k` is derived from `t` (not chosen
 /// directly), matching standard BCH code construction. See the module docs
 /// for the full algorithm description.
+/// What [`BchCode::decode_chase2`] found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chase2Report {
+    /// Analog weight of the winning codeword: the total $\lvert \mathrm{LLR}
+    /// \rvert$ over positions where it disagrees with the hard decision.
+    /// Smaller is more likely; zero means the hard decision was already a
+    /// codeword.
+    pub analog_weight: f32,
+    /// How many of the $2^p$ test patterns the algebraic decoder accepted.
+    /// A low count relative to $2^p$ means the search was mostly rejected,
+    /// which is normal; zero is reported as
+    /// [`FecError::DecoderNotConverged`] instead.
+    pub candidates: usize,
+    /// Hamming distance between the returned codeword and the hard decision.
+    /// Exceeding the code's $t$ is the whole point — it is what the soft
+    /// information bought.
+    pub flipped_from_hard: usize,
+}
+
 pub struct BchCode {
     t: usize,
     n: usize,
@@ -948,6 +967,180 @@ impl BchCode {
         self.decode_full(codeword)
     }
 
+    /// Chase-II soft-decision decode.
+    ///
+    /// # What it buys over [`BchCode::decode`]
+    ///
+    /// The algebraic decoder is a *hard*-decision decoder: it takes a bit
+    /// vector and knows nothing about how confident the demodulator was in
+    /// each bit. That discards most of what the channel told the receiver.
+    /// When a codeword carries $t + 1$ errors the algebraic decoder simply
+    /// fails, even when the demodulator was almost certain about all but a
+    /// few positions and the right answer is one plausible bit-flip away.
+    ///
+    /// Chase-II uses the reliabilities to make a small number of educated
+    /// guesses. It flips subsets of the $p$ *least reliable* bits, runs the
+    /// algebraic decoder on each perturbed word, and keeps the codeword
+    /// closest to what was actually received. Errors beyond $t$ therefore
+    /// become correctable whenever enough of them sit among the positions the
+    /// demodulator already doubted — which is the usual case, because an
+    /// error is far likelier where the LLR was small.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Hard-decide every bit from the sign of its LLR.
+    /// 2. Take the $p$ positions with the smallest $\lvert \mathrm{LLR}
+    ///    \rvert$ — the least reliable ones.
+    /// 3. For each of the $2^p$ subsets of those positions, flip that subset,
+    ///    run [`BchCode::decode`] on the result, and keep whatever codeword
+    ///    it produces (discarding the patterns where it fails).
+    /// 4. Score every distinct candidate by its **analog weight**,
+    ///    $\sum_{i \thinspace : \thinspace c_i \ne \hat b_i} \lvert
+    ///    \mathrm{LLR}_i \rvert$ — the total reliability that has to be
+    ///    disbelieved to accept that codeword — and return the smallest. This
+    ///    is maximum-likelihood among the candidates found: on an AWGN
+    ///    channel the log-likelihood of a codeword is affine in exactly that
+    ///    sum.
+    ///
+    /// # Cost
+    ///
+    /// $2^p$ algebraic decodes. $p$ is the entire complexity knob and it is
+    /// exponential, so it belongs in single digits: $p = 3$ or $4$ is the
+    /// usual choice and already recovers most of the available gain, since
+    /// the probability that a decisive error sits outside the $p$ least
+    /// reliable positions falls quickly with $p$.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` — Channel LLRs, length $n$. Positive means bit 0, matching
+    ///   [`crate::channel_sim`]. Must be finite.
+    /// * `codeword_out` — Corrected codeword, length $n$.
+    /// * `p` — Number of least-reliable positions to search over. Capped at
+    ///   16 to keep $2^p$ bounded.
+    ///
+    /// # Returns
+    ///
+    /// A [`Chase2Report`] naming the winning candidate's analog weight, how
+    /// many of the $2^p$ test patterns produced a codeword at all, and how
+    /// many bits the result differs from the hard decision by.
+    ///
+    /// # Errors
+    ///
+    /// * [`FecError::InvalidParam`] if `llr` contains a non-finite value or
+    ///   `p > 16`.
+    /// * [`FecError::BufferTooSmall`] if `llr` or `codeword_out` is not
+    ///   exactly $n$ long.
+    /// * [`FecError::DecoderNotConverged`] if no test pattern yielded a
+    ///   codeword. `codeword_out` then holds the hard decision unchanged, so
+    ///   a caller with its own CRC can still inspect it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::BchCode;
+    ///
+    /// let bch = BchCode::new(2).unwrap(); // corrects 2 errors algebraically
+    /// let info = vec![1u8; bch.k()];
+    /// let mut codeword = vec![0u8; bch.n()];
+    /// bch.encode(&info, &mut codeword).unwrap();
+    ///
+    /// // Confident LLRs everywhere, except three positions the demodulator
+    /// // got wrong and was unsure about — one more error than `t` allows.
+    /// let mut llr: Vec<f32> = codeword.iter().map(|&b| if b == 0 { 4.0 } else { -4.0 }).collect();
+    /// for &i in &[3usize, 17, 42] {
+    ///     llr[i] = -llr[i].signum() * 0.3;
+    /// }
+    ///
+    /// let mut out = vec![0u8; bch.n()];
+    /// let report = bch.decode_chase2(&llr, &mut out, 4).unwrap();
+    /// assert_eq!(out, codeword);
+    /// assert_eq!(report.flipped_from_hard, 3);
+    /// ```
+    pub fn decode_chase2(
+        &self,
+        llr: &[f32],
+        codeword_out: &mut [u8],
+        p: usize,
+    ) -> Result<Chase2Report, FecError> {
+        if llr.len() != self.n || codeword_out.len() != self.n {
+            return Err(FecError::BufferTooSmall {
+                required: self.n,
+                provided: llr.len().min(codeword_out.len()),
+            });
+        }
+        if p > 16 {
+            return Err(FecError::InvalidParam(
+                "chase-II searches 2^p patterns; p must be <= 16",
+            ));
+        }
+        if llr.iter().any(|v| !v.is_finite()) {
+            return Err(FecError::InvalidParam(
+                "chase-II: llr contains NaN or infinite value",
+            ));
+        }
+
+        // Step 1: hard decision. Positive LLR means bit 0.
+        let hard: Vec<u8> = llr.iter().map(|&v| u8::from(v < 0.0)).collect();
+        codeword_out.copy_from_slice(&hard);
+
+        // Step 2: the p least reliable positions, smallest |LLR| first.
+        let mut order: Vec<usize> = (0..self.n).collect();
+        order.sort_by(|&a, &b| {
+            llr[a]
+                .abs()
+                .partial_cmp(&llr[b].abs())
+                .expect("non-finite LLRs were rejected above")
+                .then(a.cmp(&b))
+        });
+        let weak = &order[..p.min(self.n)];
+
+        // Steps 3-4: try every subset of the weak positions, keeping the
+        // candidate of least analog weight.
+        let mut trial = vec![0u8; self.n];
+        let mut best: Option<(f32, Vec<u8>)> = None;
+        let mut candidates = 0usize;
+
+        for mask in 0u32..(1u32 << weak.len()) {
+            trial.copy_from_slice(&hard);
+            for (bit, &pos) in weak.iter().enumerate() {
+                if mask >> bit & 1 == 1 {
+                    trial[pos] ^= 1;
+                }
+            }
+            if self.decode(&mut trial).is_err() {
+                continue;
+            }
+            candidates += 1;
+
+            // Analog weight: the reliability that must be disbelieved to
+            // accept this codeword.
+            let weight: f32 = trial
+                .iter()
+                .zip(&hard)
+                .zip(llr)
+                .filter(|((c, h), _)| c != h)
+                .map(|((_, _), l)| l.abs())
+                .sum();
+            match &best {
+                Some((w, _)) if *w <= weight => {}
+                _ => best = Some((weight, trial.clone())),
+            }
+        }
+
+        match best {
+            Some((weight, cw)) => {
+                let flipped = cw.iter().zip(&hard).filter(|(a, b)| a != b).count();
+                codeword_out.copy_from_slice(&cw);
+                Ok(Chase2Report {
+                    analog_weight: weight,
+                    candidates,
+                    flipped_from_hard: flipped,
+                })
+            }
+            None => Err(FecError::DecoderNotConverged),
+        }
+    }
+
     /// Decode a shortened codeword produced by
     /// [`BchCode::shortened_encode`].
     ///
@@ -1026,6 +1219,167 @@ impl BchCode {
 
 #[cfg(test)]
 mod tests {
+    /// Chase-II must correct error patterns the algebraic decoder cannot,
+    /// whenever the extra errors sit among the least reliable positions.
+    ///
+    /// This is the entire claim. With $t + 1$ errors, [`BchCode::decode`]
+    /// fails outright; Chase-II succeeds provided its $p$-position search
+    /// covers the surplus. The test asserts *both* halves — that the hard
+    /// decoder fails and that the soft one does not — because a Chase-II that
+    /// silently reduced to the algebraic decoder would pass a test asserting
+    /// only the second.
+    #[test]
+    fn chase2_corrects_beyond_the_algebraic_limit() {
+        for t in [2usize, 3, 4] {
+            let bch = BchCode::new(t).unwrap();
+            let info = vec![1u8; bch.k()];
+            let mut codeword = vec![0u8; bch.n()];
+            bch.encode(&info, &mut codeword).unwrap();
+
+            // t+1 errors, each at a position the demodulator was unsure about.
+            let positions: Vec<usize> = (0..=t).map(|i| 7 + i * 13).collect();
+            let mut llr: Vec<f32> = codeword
+                .iter()
+                .map(|&b| if b == 0 { 5.0 } else { -5.0 })
+                .collect();
+            for &i in &positions {
+                llr[i] = -llr[i].signum() * 0.4;
+            }
+
+            // The hard decoder gets t+1 errors and must fail.
+            let mut hard: Vec<u8> = llr.iter().map(|&v| u8::from(v < 0.0)).collect();
+            assert_ne!(hard, codeword, "the test must actually inject errors");
+            let hard_result = bch.decode(&mut hard);
+            assert!(
+                hard_result.is_err() || hard != codeword,
+                "t={t}: the algebraic decoder recovered {} errors, so this pattern \
+                 does not exercise Chase-II",
+                t + 1
+            );
+
+            let mut out = vec![0u8; bch.n()];
+            let report = bch
+                .decode_chase2(&llr, &mut out, t + 2)
+                .unwrap_or_else(|e| panic!("t={t}: chase-II failed: {e:?}"));
+            assert_eq!(out, codeword, "t={t}: chase-II returned the wrong codeword");
+            assert_eq!(report.flipped_from_hard, t + 1);
+        }
+    }
+
+    /// On a clean channel Chase-II must return the transmitted codeword with
+    /// zero analog weight — the hard decision was already right, and no
+    /// amount of searching should talk it out of that.
+    #[test]
+    fn chase2_leaves_a_clean_codeword_alone() {
+        let bch = BchCode::new(3).unwrap();
+        let info: Vec<u8> = (0..bch.k()).map(|i| (i % 3 == 0) as u8).collect();
+        let mut codeword = vec![0u8; bch.n()];
+        bch.encode(&info, &mut codeword).unwrap();
+        let llr: Vec<f32> = codeword
+            .iter()
+            .map(|&b| if b == 0 { 6.0 } else { -6.0 })
+            .collect();
+
+        let mut out = vec![0u8; bch.n()];
+        let report = bch.decode_chase2(&llr, &mut out, 4).unwrap();
+        assert_eq!(out, codeword);
+        assert_eq!(report.analog_weight, 0.0);
+        assert_eq!(report.flipped_from_hard, 0);
+    }
+
+    /// Chase-II must never do *worse* than the algebraic decoder: wherever
+    /// the hard decoder succeeds, the soft one must produce the same
+    /// codeword.
+    ///
+    /// A search that returns the maximum-likelihood candidate cannot lose to
+    /// one that returns an arbitrary candidate, but only if the metric is
+    /// right. Scoring by anything other than analog weight — Hamming distance
+    /// from the hard decision, say — would break this on patterns where a
+    /// nearer codeword is less likely.
+    #[test]
+    fn chase2_agrees_with_the_algebraic_decoder_within_its_range() {
+        let bch = BchCode::new(3).unwrap();
+        let info: Vec<u8> = (0..bch.k()).map(|i| (i % 5 < 2) as u8).collect();
+        let mut codeword = vec![0u8; bch.n()];
+        bch.encode(&info, &mut codeword).unwrap();
+
+        let mut state = 0x51EE_D001u64;
+        for trial in 0..30 {
+            // Up to t errors: inside the algebraic decoder's range.
+            let n_err = 1 + (trial % 3);
+            let mut received = codeword.clone();
+            let mut llr: Vec<f32> = codeword
+                .iter()
+                .map(|&b| if b == 0 { 5.0 } else { -5.0 })
+                .collect();
+            for _ in 0..n_err {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let pos = (state >> 33) as usize % bch.n();
+                received[pos] ^= 1;
+                llr[pos] = -llr[pos].signum() * 0.5;
+            }
+
+            let mut hard = received.clone();
+            if bch.decode(&mut hard).is_err() {
+                continue;
+            }
+            let mut soft = vec![0u8; bch.n()];
+            bch.decode_chase2(&llr, &mut soft, 4).unwrap();
+            assert_eq!(
+                soft, hard,
+                "trial {trial}: chase-II disagreed with a successful algebraic decode"
+            );
+        }
+    }
+
+    /// `p = 0` degenerates to a single algebraic decode of the hard decision,
+    /// which is the correct boundary: no least-reliable positions to search
+    /// means no test patterns beyond the identity.
+    #[test]
+    fn chase2_with_zero_search_positions_is_a_plain_hard_decode() {
+        let bch = BchCode::new(2).unwrap();
+        let info = vec![0u8; bch.k()];
+        let mut codeword = vec![0u8; bch.n()];
+        bch.encode(&info, &mut codeword).unwrap();
+        let mut llr: Vec<f32> = codeword
+            .iter()
+            .map(|&b| if b == 0 { 3.0 } else { -3.0 })
+            .collect();
+        llr[9] = -llr[9]; // one error, inside t
+
+        let mut out = vec![0u8; bch.n()];
+        let report = bch.decode_chase2(&llr, &mut out, 0).unwrap();
+        assert_eq!(out, codeword);
+        assert_eq!(report.candidates, 1, "p=0 must try exactly one pattern");
+    }
+
+    /// Hostile inputs must be rejected rather than panicking or searching
+    /// 2^64 patterns.
+    #[test]
+    fn chase2_rejects_bad_parameters() {
+        let bch = BchCode::new(2).unwrap();
+        let llr = vec![1.0f32; bch.n()];
+        let mut out = vec![0u8; bch.n()];
+
+        assert!(matches!(
+            bch.decode_chase2(&llr, &mut out, 17),
+            Err(FecError::InvalidParam(_))
+        ));
+        let mut nan_llr = llr.clone();
+        nan_llr[0] = f32::NAN;
+        assert!(matches!(
+            bch.decode_chase2(&nan_llr, &mut out, 3),
+            Err(FecError::InvalidParam(_))
+        ));
+        let mut short = vec![0u8; bch.n() - 1];
+        assert!(matches!(
+            bch.decode_chase2(&llr, &mut short, 3),
+            Err(FecError::BufferTooSmall { .. })
+        ));
+    }
+
     use super::*;
 
     use crate::test_util::Xorshift64;

@@ -63,7 +63,7 @@ pub(crate) mod simd_avx2;
 pub(crate) mod simd_neon;
 
 pub use affinity::pin_to_core;
-pub use bch::BchCode;
+pub use bch::{BchCode, Chase2Report};
 pub use bg_tables::*;
 pub use bits::{bits_to_bytes, bytes_to_bits, hard_decision};
 pub use crc::{Crc24, CrcKind};
