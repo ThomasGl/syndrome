@@ -108,6 +108,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordering that broke, which is the better tool for that module; the mutation
   run is what showed how much of the SPSC coverage rested on a hang.
 
+- **Load-aware dispatch in `LdpcPipeline`** (`pick_worker`): frames now go to
+  the worker with the fewest outstanding, ties broken by a rotating cursor,
+  replacing strict round-robin.
+
+  Round-robin is only fair when every frame costs the same, and LDPC frames do
+  not: the decoder stops as soon as the syndrome check passes, so a code block
+  from a clean channel finishes in two iterations while a marginal one runs the
+  full budget — an order of magnitude apart on one configuration. Dealing in
+  rotation therefore hands each worker whatever lands on its turn, and a run of
+  expensive frames on one worker leaves the rest idle while it drains. The
+  count is maintained on the submitting thread alone (incremented on dispatch,
+  decremented when a frame returns), so the policy costs an `n_workers` scan
+  and no atomics.
+
+  Ties rotate rather than taking the first minimum, which matters at the start
+  of a burst when every worker is at zero: without it the whole burst would go
+  to worker 0 until something completed. The policy therefore degrades to
+  round-robin exactly when round-robin is right — when nothing distinguishes
+  the workers.
+
+  `pick_worker` is a free function over the load vector precisely so it can be
+  tested: which worker `submit` picks cannot be asserted from outside, because
+  the workers run concurrently and any such test measures the scheduler too.
+
 - **Scoped Miri run over the crate's non-SIMD `unsafe`** (CI job `miri`):
   `cargo miri test --lib spsc_queue` and `--lib ldpc_pipeline`.
 

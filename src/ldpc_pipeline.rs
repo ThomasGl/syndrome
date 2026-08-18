@@ -227,6 +227,61 @@ impl LdpcFrame {
     }
 }
 
+/// Choose which worker a frame goes to: the one with the fewest frames
+/// outstanding, ties broken by a rotating cursor.
+///
+/// # Why not round-robin
+///
+/// Round-robin is only fair when every frame costs the same, and LDPC frames
+/// do not. The decoder stops as soon as the syndrome check passes, so a code
+/// block that arrived over a clean channel finishes in two iterations while a
+/// marginal one runs the full budget — an order of magnitude apart on the same
+/// configuration. Dealing frames out in strict rotation therefore hands worker
+/// *k* whatever lands on its turn, and a run of expensive frames all landing on
+/// one worker leaves the others idle while it works through the backlog. The
+/// pipeline's throughput is set by its slowest queue, so that idling is a
+/// direct loss.
+///
+/// Fewest-outstanding is the standard fix and needs no coordination: the count
+/// is maintained on the submitting thread alone (incremented here, decremented
+/// when a frame comes back), so the policy costs an `n_workers`-element scan
+/// and no atomics.
+///
+/// # Why ties rotate
+///
+/// At the start of a burst every worker has zero outstanding, and taking the
+/// first minimum would send the whole burst to worker 0 until one of them
+/// completed. The cursor makes an all-equal state deal out in rotation, so the
+/// policy degrades to round-robin exactly when round-robin is right — when
+/// nothing is known to distinguish the workers.
+///
+/// # Arguments
+///
+/// * `outstanding` - Frames dispatched to each worker and not yet returned.
+///   Must be non-empty.
+/// * `cursor` - Monotonically increasing submit counter, used for tie-breaking.
+///
+/// # Returns
+///
+/// An index into `outstanding`.
+fn pick_worker(outstanding: &[usize], cursor: usize) -> usize {
+    let n = outstanding.len();
+    debug_assert!(n > 0, "a pipeline always has at least one worker");
+    let mut best = cursor % n;
+    let mut best_load = outstanding[best];
+    // Start at the cursor and walk forward, keeping a strict `<` so the first
+    // worker at the minimum load — counting from the cursor — wins. That is
+    // what makes an all-equal state rotate.
+    for step in 1..n {
+        let wi = (cursor + step) % n;
+        if outstanding[wi] < best_load {
+            best = wi;
+            best_load = outstanding[wi];
+        }
+    }
+    best
+}
+
 /// Lock-free pipelined LDPC decoder with optional multi-worker parallelism.
 ///
 /// See [module-level documentation](self) for the frame lifecycle.
@@ -258,8 +313,14 @@ pub struct LdpcPipeline {
     /// Per-worker done rings: worker[i] → caller.
     done_rings: Vec<Arc<SpscRing<usize, POOL_SIZE>>>,
     n_workers: usize,
-    /// Round-robin counter for submit dispatch.
+    /// Rotating cursor used to break ties in [`pick_worker`], so equally
+    /// loaded workers are chosen in turn rather than always the lowest index.
     next_submit: usize,
+    /// Frames dispatched to each worker and not yet returned through its done
+    /// ring — queued *and* in-flight. Main-thread-only: `submit` increments,
+    /// `try_recv` decrements, and no worker ever touches it, so it needs no
+    /// synchronisation of its own.
+    outstanding: Vec<usize>,
     stop_flag: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
@@ -418,6 +479,7 @@ impl LdpcPipeline {
             done_rings,
             n_workers,
             next_submit: 0,
+            outstanding: vec![0; n_workers],
             stop_flag,
             workers,
         }
@@ -446,8 +508,7 @@ impl LdpcPipeline {
         })
     }
 
-    /// Submit a frame for decoding, dispatching to the next worker in
-    /// round-robin order.
+    /// Submit a frame for decoding, dispatching to the least loaded worker.
     ///
     /// On success the frame is consumed and its slot belongs to the worker
     /// until it comes back through [`LdpcPipeline::try_recv`]. On failure —
@@ -474,11 +535,12 @@ impl LdpcPipeline {
     /// Returns the frame unchanged if the target worker's ring is full.
     pub fn submit(&mut self, frame: LdpcFrame) -> Result<(), LdpcFrame> {
         let idx = frame.slot_idx;
-        let wi = self.next_submit % self.n_workers;
+        let wi = pick_worker(&self.outstanding, self.next_submit);
         if self.work_rings[wi].try_push(idx).is_err() {
             return Err(frame);
         }
-        // Only advance the round-robin cursor on a successful dispatch, so a
+        self.outstanding[wi] += 1;
+        // Only advance the tie-break cursor on a successful dispatch, so a
         // full ring does not silently skip a worker's turn.
         self.next_submit = self.next_submit.wrapping_add(1);
         Ok(())
@@ -486,9 +548,10 @@ impl LdpcPipeline {
 
     /// Poll for a completed frame without blocking. Checks all done rings in
     /// order and returns the first available completed frame.
-    pub fn try_recv(&self) -> Option<LdpcFrame> {
-        for done in &self.done_rings {
+    pub fn try_recv(&mut self) -> Option<LdpcFrame> {
+        for (wi, done) in self.done_rings.iter().enumerate() {
             if let Some(idx) = done.try_pop() {
+                self.outstanding[wi] = self.outstanding[wi].saturating_sub(1);
                 // SAFETY: `idx` came out of a done ring, so it is a pool index
                 // and its slot is no longer owned by any worker. As in
                 // `acquire`, the pointer comes from `slot_ptrs` — deriving it
@@ -527,9 +590,6 @@ impl Drop for LdpcPipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::qc_ldpc::{BaseGraph, QcLdpcDecoder};
-
     /// Decoder for the pool-protocol tests.
     ///
     /// The frame protocol — acquire, fill, submit, receive, release, and the
@@ -551,6 +611,104 @@ mod tests {
     /// natively to cycle the 16-slot pool several times; enough under Miri to
     /// cycle it once, which is what proves slots are reused correctly.
     const PROTOCOL_FRAMES: usize = if cfg!(miri) { 20 } else { 64 };
+
+    /// The dispatch policy, exercised directly rather than through the
+    /// threads.
+    ///
+    /// Which worker a frame goes to cannot be asserted from outside
+    /// [`LdpcPipeline::submit`] — the workers run concurrently, so any test
+    /// that submits frames and inspects the outcome is testing the scheduler
+    /// as much as the policy. Extracting [`pick_worker`] makes the decision a
+    /// pure function of the load vector, which *can* be pinned exactly.
+    #[test]
+    fn pick_worker_prefers_the_least_loaded() {
+        // Strictly least loaded wins regardless of where the cursor sits.
+        for cursor in 0..8 {
+            assert_eq!(pick_worker(&[3, 0, 5], cursor), 1);
+            assert_eq!(pick_worker(&[9, 9, 1, 9], cursor), 2);
+            assert_eq!(pick_worker(&[0, 4, 4, 4], cursor), 0);
+        }
+        // A single worker is always the answer.
+        for cursor in 0..4 {
+            assert_eq!(pick_worker(&[7], cursor), 0);
+        }
+    }
+
+    /// With every worker equally loaded the policy must rotate, not pile onto
+    /// worker 0.
+    ///
+    /// This is the case that matters at the start of a burst, when nothing
+    /// distinguishes the workers: taking the first minimum would send the
+    /// whole burst to one worker until something completed, which is worse
+    /// than the round-robin it replaced.
+    #[test]
+    fn pick_worker_rotates_when_all_workers_are_equal() {
+        let idle = [0usize; 4];
+        let picks: Vec<usize> = (0..8).map(|c| pick_worker(&idle, c)).collect();
+        assert_eq!(picks, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+
+        // Equal-but-nonzero must rotate too — it is the same information.
+        let busy = [2usize; 3];
+        let picks: Vec<usize> = (0..6).map(|c| pick_worker(&busy, c)).collect();
+        assert_eq!(picks, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    /// A tie *at the minimum* rotates among the tied workers only, never
+    /// selecting a more loaded one.
+    #[test]
+    fn pick_worker_breaks_minimum_ties_without_choosing_a_busier_worker() {
+        // Workers 0 and 2 are tied at the minimum; 1 and 3 are busier.
+        let load = [1usize, 6, 1, 6];
+        for cursor in 0..8 {
+            let chosen = pick_worker(&load, cursor);
+            assert!(
+                chosen == 0 || chosen == 2,
+                "cursor {cursor} chose worker {chosen}, which is not at the minimum load"
+            );
+        }
+        // Both tied workers are reachable, so the tie-break is not stuck.
+        let chosen: std::collections::BTreeSet<usize> =
+            (0..8).map(|c| pick_worker(&load, c)).collect();
+        assert_eq!(chosen, [0, 2].into_iter().collect());
+    }
+
+    /// The load counters must return to zero once every frame has come back,
+    /// or the policy would drift permanently after the first burst.
+    #[test]
+    fn outstanding_counts_return_to_zero_after_a_full_drain() {
+        let decoder = QcLdpcDecoder::with_lifting_size(BaseGraph::Bg2, 2, 0.5).unwrap();
+        let mut pipe = LdpcPipeline::with_workers(decoder, 2, 3);
+
+        const N: usize = 9;
+        for _ in 0..N {
+            let mut frame = pipe.acquire().expect("pool has 16 slots");
+            frame.llr_mut().iter_mut().for_each(|v| *v = 1.0);
+            assert!(pipe.submit(frame).is_ok(), "rings hold 16 each");
+        }
+        assert_eq!(
+            pipe.outstanding.iter().sum::<usize>(),
+            N,
+            "every submitted frame must be counted against some worker"
+        );
+
+        let mut received = 0usize;
+        while received < N {
+            if let Some(frame) = pipe.try_recv() {
+                pipe.release(frame);
+                received += 1;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        assert!(
+            pipe.outstanding.iter().all(|&c| c == 0),
+            "load counters left as {:?} after draining every frame",
+            pipe.outstanding
+        );
+    }
+
+    use super::*;
+    use crate::qc_ldpc::{BaseGraph, QcLdpcDecoder};
 
     #[test]
     fn pipeline_roundtrip_single_frame() {
