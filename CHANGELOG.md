@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Compatibility: this cycle is a minor bump, not a patch.** Two changes break
+> against 0.4.0:
+>
+> * **Reed-Solomon parity bytes change.** The generator matrix is now Cauchy,
+>   because the previous one could not recover every erasure pattern within the
+>   code's stated capability (see *Fixed*). Data written by 0.4.0 or earlier
+>   decodes with `ReedSolomon::with_matrix(k, m, MatrixKind::PowerVandermonde)`.
+> * **`LdpcPipeline::submit` returns `Result<(), LdpcFrame>`** instead of
+>   `bool`, so a failed dispatch can no longer leak a pool slot.
+>
+> Nothing else changes an existing signature or an on-the-wire format.
+
 ### Added
 
 - **Fixed-point QC-LDPC decode path** (`src/qc_ldpc.rs`, `src/quantize.rs`,
