@@ -35,7 +35,10 @@ Two charts are displayed:
 All four implementations use the **identical** algorithm:
 
 - GF(256), primitive polynomial `0x11D`.
-- Encoding matrix: `coeffs[i*d+j] = α^((i*j) mod 255)`.
+- Encoding matrix: Cauchy, `coeffs[i*d+j] = 1 / (i ^ (p + j))` over GF(256).
+  Chosen over the older `α^((i*j) mod 255)` because every square submatrix of
+  a Cauchy matrix is invertible, so every erasure pattern within the code's
+  capability is recoverable; see `MatrixKind` in `src/reed_solomon.rs`.
 - `encode_into`: zero parity; for each data shard `j`, each parity row `i`, `parity[i][k] ^= mul(coeffs[i][j], data[j][k])`.
 - Bench config: `data_shards=10, parity_shards=4`, `shard_len ∈ {256, 1024, 4096, 16384}`.
 

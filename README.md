@@ -52,7 +52,7 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 | **Hamming(7,4)** | 1950 | Syndrome lookup | $O(1)$ / nibble | ECC teaching, SECDED DRAM ancestor | Hamming 1950 |
 | **Golay(24,12,8)** | 1949 | Syndrome table (2 325 cosets) | $O(1)$ / block | Voyager imaging, CCSDS telecommand, MIL-STD-188-141 ALE | Golay 1949 |
 | **BCH(255,k,t≤10)** | 1959–60 | Berlekamp–Massey + Chien | $O(nt)$ | DVB-S2 outer code, NAND-flash controllers | Bose–Chaudhuri 1960; Hocquenghem 1959 |
-| **Reed-Solomon GF(256)** | 1960 | Erasure (Vandermonde); errors-and-erasures (syndrome-verified search) | $O(n \cdot p)$ erasure; $O\!\big(\binom{n}{t} \cdot \text{len}\big)$ for $t$ unknown-position errors | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
+| **Reed-Solomon GF(256)** | 1960 | Erasure (Cauchy matrix); errors-and-erasures (syndrome-verified search) | $O(n \cdot p)$ erasure; $O\!\big(\binom{n}{t} \cdot \text{len}\big)$ for $t$ unknown-position errors | QR codes, S3/Ceph storage, CD/Blu-ray, DVB | Reed & Solomon 1960 |
 | **Convolutional (Viterbi)** | 1967 | Hard ACS + soft max-log-MAP; zero-terminated and tail-biting (WAVA) | $O(2^{K-1} L)$, $\times$ laps for tail-biting | GSM/2G, DAB radio, legacy 802.11, deep space | Viterbi 1967; Shao–Lin–Fossorier 2003 (WAVA) |
 | **Turbo (LTE PCCC)** | 1993 | Iterative max-log-MAP (BCJR) | $O(8 K \cdot \text{iters})$ | 3G UMTS, 4G LTE data channels | Berrou et al. 1993 |
 | **QC-LDPC (BG1/BG2)** | 1963 / 2004 | Layered Offset Min-Sum, SIMD | $O(E Z \cdot \text{iters})$ | 5G NR data, Wi-Fi 6/7, DVB-S2X, 10GBASE-T | Gallager 1963; Fossorier 2004 |
@@ -147,7 +147,7 @@ syndrome/
 │   ├── viterbi.rs          — Rate-1/2 K=7 Viterbi (hard Hamming ACS + soft max-log-MAP, zero-tail + tail-biting)
 │   ├── turbo.rs            — LTE rate-1/3 Turbo (TS 36.212): QPP interleaver, max-log-MAP
 │   ├── polar.rs            — Polar codes: SC + CA-SCL decode, 3GPP reliability seq
-│   ├── reed_solomon.rs     — GF(256) Vandermonde RS: erasure + errors-and-erasures decode
+│   ├── reed_solomon.rs     — GF(256) Cauchy-matrix RS: erasure + errors-and-erasures decode
 │   ├── bch.rs              — Binary BCH(255,k,t≤10): Berlekamp–Massey + Chien search
 │   ├── golay.rs            — Extended Golay(24,12,8): syndrome-table 3-error correction
 │   ├── hamming.rs          — Hamming(7,4) encode/decode
@@ -398,11 +398,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (473 tests total on x86-64; 471 on AArch64)
+### 4.1 Component coverage (476 tests total on x86-64; 474 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 259 (x86-64) / 257 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 261 (x86-64) / 259 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
 | int8 LDPC kernel equivalence (scalar vs AVX2, bit-for-bit) | 8 | `tests/ldpc_int8_kernel_equivalence.rs` |
@@ -414,7 +414,7 @@ loop {
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
 | SPSC memory-ordering model check (loom, exhaustive) | 5 — not counted above; needs `--cfg loom` | `tests/loom_spsc.rs` |
 | Miri over the non-SIMD `unsafe` (SPSC ring, LDPC frame pool) | 14 of the unit tests above, re-run under `cargo miri` | `spsc_queue`, `ldpc_pipeline` |
-| Doctests | 131 | `///` examples in all public API |
+| Doctests | 132 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,
@@ -424,7 +424,7 @@ self-dual-code literature fact (the all-ones vector is always a codeword,
 verified exhaustively over all 4096 messages) — so a refactor that silently
 changes the algorithm fails loudly even when every round-trip test still
 passes. Reed-Solomon is deliberately absent from this
-suite: this crate's coefficients are a Vandermonde-style erasure scheme, not
+suite: this crate's coefficients are a Cauchy-matrix erasure scheme, not
 CCSDS 131.0-B's dual-basis systematic code, so no independently published KAT
 applies to it — it is skipped rather than tested against a mismatched
 standard (see `tests/reference_vectors.rs`'s own module doc). The
@@ -1133,7 +1133,7 @@ incremental redundancy
 
 **Algorithms:** QC-LDPC (layered offset min-sum, base graphs BG1/BG2) · polar
 codes (successive cancellation, CA-SCL list decoding) · Reed–Solomon over
-GF(256) (Vandermonde erasure) · BCH (Berlekamp–Massey, Chien search) ·
+GF(256) (Cauchy-matrix erasure) · BCH (Berlekamp–Massey, Chien search) ·
 convolutional codes / Viterbi (hard ACS, soft max-log-MAP) · LTE Turbo (PCCC,
 BCJR, QPP interleaver) · extended binary Golay(24,12,8) · Hamming(7,4) ·
 CRC-24A/B/C, CRC-16/11/6

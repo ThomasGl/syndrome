@@ -1,6 +1,10 @@
 // Reed-Solomon erasure encoder — exact algorithm port from src/reed_solomon.rs.
 // GF(256), primitive polynomial 0x11D.
-// coeffs[i*d+j] = alpha^((i*j) mod 255)
+// Cauchy generator matrix: coeffs[i*d+j] = 1 / (i ^ (p + j)), where the two
+// index sets are disjoint so no denominator is zero. This mirrors
+// MatrixKind::Cauchy on the Rust side; see that type's docs for why every
+// square submatrix of it is invertible, which the earlier alpha^(i*j)
+// construction did not guarantee.
 // encode_into: parity[i][k] ^= mul(coeffs[i][j], data[j][k])
 //
 // Build: g++ -O3 -march=native -std=c++17 -o rs_encode bench/cpp/rs_encode.cpp
@@ -49,6 +53,11 @@ static inline uint8_t pow_alpha(int power) {
     return gf_exp[((power % 255) + 255) % 255];
 }
 
+// Multiplicative inverse in GF(256): alpha^(255 - log a).
+static inline uint8_t gf_inv(uint8_t a) {
+    return gf_exp[255 - (int)gf_log[a]];
+}
+
 // ---- RS encoder ------------------------------------------------------------
 
 struct ReedSolomon {
@@ -59,7 +68,7 @@ struct ReedSolomon {
         : d(data_shards), p(parity_shards) {
         for (int i = 0; i < p; ++i)
             for (int j = 0; j < d; ++j)
-                coeffs[i * d + j] = pow_alpha(i * j);
+                coeffs[i * d + j] = gf_inv((uint8_t)(i ^ (p + j)));
     }
 
     void encode_into(const uint8_t* const* data, size_t shard_len,

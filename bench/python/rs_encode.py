@@ -49,6 +49,10 @@ def gf_mul(a: int, b: int) -> int:
 def pow_alpha(power: int) -> int:
     return _EXP[power % 255]
 
+def gf_inv(a: int) -> int:
+    """Multiplicative inverse in GF(256): alpha^(255 - log a)."""
+    return _EXP[255 - _LOG[a]]
+
 # ---------------------------------------------------------------------------
 # Same-algorithm encoder (mirrors encode_into from reed_solomon.rs)
 # ---------------------------------------------------------------------------
@@ -62,11 +66,17 @@ ITERS  = 200   # Python is slow; keep timing runs reasonable
 WARMUP = 20
 
 def build_coeffs(d: int, p: int) -> list[int]:
-    """Vandermonde matrix coeffs[i*d+j] = alpha^(i*j mod 255)."""
+    """Cauchy matrix coeffs[i*d+j] = 1 / (i ^ (p + j)).
+
+    The two index sets are disjoint, so no denominator is zero. This mirrors
+    MatrixKind::Cauchy in src/reed_solomon.rs; see that type's docs for why
+    every square submatrix of it is invertible, which the earlier alpha^(i*j)
+    construction did not guarantee.
+    """
     coeffs = []
     for i in range(p):
         for j in range(d):
-            coeffs.append(pow_alpha(i * j))
+            coeffs.append(gf_inv(i ^ (p + j)))
     return coeffs
 
 COEFFS = build_coeffs(DATA_SHARDS, PARITY_SHARDS)

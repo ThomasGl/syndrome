@@ -76,7 +76,7 @@ pub use polar::{AdaptiveDecodeReport, PolarDecoder, PolarEncoder};
 pub use qc_ldpc::{BaseGraph, LdpcWorkspace, QcLdpcDecoder, QcLdpcEncoder};
 pub use quantize::{QuantParams, dequantize_llr, quantize_llr, quantize_llr_i16};
 pub use rate_matching::{rate_dematch_llr, rate_match};
-pub use reed_solomon::ReedSolomon;
+pub use reed_solomon::{MatrixKind, ReedSolomon};
 pub use segmentation::{SegmentationParams, compute_segmentation, segment};
 pub use spsc_queue::SpscRing;
 pub use transport_block::{DecodeReport, DlSchConfig, DlSchDecoder, DlSchEncoder};

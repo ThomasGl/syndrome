@@ -6,8 +6,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 2560,
-    "ns_per_iter": 896468.6,
-    "mib_per_s": 2.7
+    "ns_per_iter": 1092366.9,
+    "mib_per_s": 2.2
   },
   {
     "lang": "python_same_algo",
@@ -16,8 +16,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 10240,
-    "ns_per_iter": 4043808.8,
-    "mib_per_s": 2.4
+    "ns_per_iter": 4955131.4,
+    "mib_per_s": 2.0
   },
   {
     "lang": "python_same_algo",
@@ -26,8 +26,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 40960,
-    "ns_per_iter": 16728509.3,
-    "mib_per_s": 2.3
+    "ns_per_iter": 20698231.0,
+    "mib_per_s": 1.9
   },
   {
     "lang": "python_same_algo",
@@ -36,8 +36,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 163840,
-    "ns_per_iter": 67890934.0,
-    "mib_per_s": 2.3
+    "ns_per_iter": 90873332.6,
+    "mib_per_s": 1.7
   },
   {
     "lang": "python_reedsolo",
@@ -46,7 +46,7 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 2560,
-    "ns_per_iter": 1196950.9,
+    "ns_per_iter": 1243432.9,
     "mib_per_s": 2.0,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
@@ -57,8 +57,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 10240,
-    "ns_per_iter": 4479230.0,
-    "mib_per_s": 2.2,
+    "ns_per_iter": 5374541.3,
+    "mib_per_s": 1.8,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
   {
@@ -68,8 +68,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 40960,
-    "ns_per_iter": 18180096.1,
-    "mib_per_s": 2.1,
+    "ns_per_iter": 19806235.4,
+    "mib_per_s": 2.0,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   },
   {
@@ -79,8 +79,8 @@
     "data_shards": 10,
     "parity_shards": 4,
     "payload_bytes": 163840,
-    "ns_per_iter": 71450402.3,
-    "mib_per_s": 2.2,
+    "ns_per_iter": 78471974.5,
+    "mib_per_s": 2.0,
     "note": "different algorithm (generator-polynomial); parity bytes do NOT match same_algo group"
   }
 ]

@@ -277,6 +277,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reed-Solomon could not recover every erasure pattern within its stated
+  capability.** The generator matrix is now Cauchy,
+  $C_{ij} = (x_i \oplus y_j)^{-1}$ with $x_i = i$ and $y_j = m + j$, replacing
+  $C_{ij} = \alpha^{ij}$.
+
+  **This changes parity bytes on the wire.** Data encoded by syndrome 0.4.0 or
+  earlier must be decoded with
+  `ReedSolomon::with_matrix(k, m, MatrixKind::PowerVandermonde)`, which builds
+  the old matrix and is retained for exactly that purpose.
+
+  Recovery inverts the submatrix of $C$ on the missing data columns and on as
+  many surviving parity rows as are needed. Writing $x_c = \alpha^{j_c}$, that
+  submatrix is $\left[x_c^{\thinspace i_r}\right]$. While the surviving parity
+  rows are $0, 1, \dots$ consecutively — which is what happens when no parity
+  shard is lost — it is a true Vandermonde and nonsingular. Lose a parity
+  shard and the row exponents skip: rows $\lbrace 0, 1, 3 \rbrace$ give
+  $\left[1, x, x^3\right]$, a *generalized* Vandermonde whose determinant
+  carries an extra symmetric factor, and over GF(256) that factor sometimes
+  vanishes. The decoder then reported
+  `FecError::InvalidParam("matrix not invertible")` for a shard set that
+  should have been recoverable.
+
+  It is not a corner case, and it is not confined to exotic geometries: at
+  $k = 12$, $m = 5$ — an ordinary RS(17, 12) — 18 of the 6,187 patterns inside
+  the code's capability failed; at $k = 16$, $m = 6$, 254 of 74,612; at
+  $k = 20$, $m = 6$, 684 of 230,229. The patterns that break it are exactly
+  those losing *both* data and parity shards, which is why an erasure test
+  dropping only data shards finds nothing wrong — and why the module's own
+  documentation asserted the opposite in good faith.
+
+  Every square submatrix of a Cauchy matrix is a Cauchy matrix, and a Cauchy
+  determinant is nonzero whenever the two index sets are distinct within
+  themselves and disjoint from each other. All three hold by construction for
+  any subset, so recovery now succeeds for **every** pattern; the new tests
+  enumerate the full pattern space at each of those geometries and assert zero
+  failures for Cauchy against the exact counts above for the old matrix.
+
+  The module documentation's nonsingularity argument was wrong and is
+  rewritten. The C++ and Python reference encoders in `bench/` are updated to
+  the same construction, so the cross-language checksum gate still compares
+  three independent implementations of the same thing — all three agree on the
+  new parity.
+
 - **Two aliasing violations in `LdpcPipeline`'s frame pool**, both found by
   Miri and neither observable any other way.
 

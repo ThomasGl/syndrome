@@ -49,42 +49,53 @@
 //! is duplicated to length 512 so the sum never needs an explicit `% 255`).
 //! Division is the same identity run in reverse (subtracting exponents).
 //!
-//! # Why $\alpha^{ij}$ makes erasure recovery always possible
+//! # Why every erasure pattern is recoverable
 //!
-//! The encoder's coefficient matrix is $C_{ij} = \alpha^{ij}$ for parity row
-//! $i \in \lbrace 0, \dots, \text{parity\\_shards}-1\rbrace$ and data column $j \in
-//! \lbrace 0, \dots, \text{data\\_shards}-1\rbrace$ — the same shape as a **Vandermonde
-//! matrix** built from the points $1, \alpha, \alpha^2, \dots$ (row $i$ is
-//! the vector of successive powers of $\alpha^i$). Systematic encoding pairs
-//! this with an implicit identity block for the data shards themselves, so
-//! the *full* codeword's shard-to-symbol map, restricted to any
-//! `data_shards`-sized subset of surviving shards, is a square submatrix of
-//! $\begin{bmatrix} I \\\\ C \end{bmatrix}$.
+//! The encoder's coefficient matrix is a **Cauchy matrix**: $C_{ij} = (x_i
+//! \oplus y_j)^{-1}$ with $x_i = i$ for parity row $i$ and $y_j = m + j$ for
+//! data column $j$, where $m$ is the parity-shard count. The two index sets
+//! are disjoint by construction, so no denominator is zero, and $k + m \le
+//! 256$ keeps them inside GF(256).
 //!
-//! Recovering `e ≤ parity_shards` missing data shards means solving a linear
-//! system whose coefficient matrix is the corresponding `e × e` submatrix of
-//! $C$ restricted to the missing columns and to `e` of the surviving parity
-//! rows — and every such submatrix is itself Vandermonde-structured (rows
-//! indexed by a subset of powers of $\alpha$, columns by a subset of
-//! exponents). The key lemma:
+//! Systematic encoding pairs $C$ with an implicit identity block for the data
+//! shards, so recovering $e$ missing data shards means solving a linear system
+//! whose matrix is the $e \times e$ submatrix of $C$ on the missing columns
+//! and on $e$ surviving parity rows. Two facts finish the argument. Every
+//! square submatrix of a Cauchy matrix is itself a Cauchy matrix — a submatrix
+//! just restricts the index sets — and a Cauchy determinant is
 //!
-//! $$\det V = \det\negthinspace \left[\alpha^{i_r \cdot j_c}\right]\_{r,c=1}^{e} =
-//! \prod\_{r < r'} \left(\alpha^{i_{r'}} - \alpha^{i_r}\right) \cdot
-//! (\text{unit factor}) \neq 0 \iff \alpha^{i_1}, \dots, \alpha^{i_e}
-//! \text{ are pairwise distinct}$$
+//! $$\det = \frac{\prod\_{r < r'} (x_r \oplus x_{r'}) \thinspace
+//!   \prod\_{c < c'} (y_c \oplus y_{c'})}{\prod\_{r, c} (x_r \oplus y_c)} ,$$
 //!
-//! (the standard Vandermonde determinant identity, valid over any field,
-//! including $GF(256)$ where "$-$" is XOR). Since $i_1, \dots, i_e$ are
-//! distinct parity-row indices in $\lbrace 0, \dots, \text{parity\\_shards}-1\rbrace$
-//! and $\alpha$ has multiplicative order 255 (with `parity_shards ≤ 255` in
-//! any valid construction), the powers $\alpha^{i_r}$ are automatically
-//! pairwise distinct — so the determinant is always nonzero, so the
-//! submatrix is always invertible, for *every* choice of which `e` shards
-//! are missing and which surviving parity rows are used to recover them.
-//! This is the whole argument for why the internal Gauss-Jordan matrix
-//! inversion used during erasure recovery never needs to (and, for a
-//! correctly-shaped erasure pattern, never does) hit its "matrix is
-//! singular" `None` branch.
+//! which is nonzero exactly when the $x$ are pairwise distinct, the $y$ are
+//! pairwise distinct, and the two sets are disjoint. All three hold for any
+//! subset of the indices, so the determinant is nonzero for **every** choice
+//! of which shards are missing and which surviving parity rows are used. That
+//! is why the Gauss-Jordan inversion in erasure recovery never reaches its
+//! "matrix is singular" branch.
+//!
+//! # The construction this replaced, and why it was not enough
+//!
+//! [`MatrixKind::PowerVandermonde`] ($C_{ij} = \alpha^{ij}$) is still
+//! available, because syndrome 0.4.0 and earlier wrote parity with it. It does
+//! **not** have the property above, and the way it fails is instructive.
+//!
+//! Write $x_c = \alpha^{j_c}$ for the missing columns. The recovery submatrix
+//! is $\left[x_c^{\thinspace i_r}\right]$ over the surviving parity rows
+//! $i_r$. When no parity shard is lost those rows are $0, 1, \dots, e-1$,
+//! consecutive, and the matrix is a genuine Vandermonde — nonsingular,
+//! because the $x_c$ are distinct. Lose a parity shard and the row exponents
+//! skip a value: rows $\lbrace 0, 1, 3 \rbrace$ give
+//! $\left[1, x, x^3\right]$, which is a *generalized* Vandermonde. Its
+//! determinant is the Vandermonde determinant times a Schur polynomial — for
+//! that example, $x_1 \oplus x_2 \oplus x_3$ — and over a finite field such a
+//! factor can vanish.
+//!
+//! The distinction is easy to miss because it only shows up when data *and*
+//! parity are lost together, so an erasure test that only drops data shards
+//! sees nothing wrong. It is not rare: at $k = 12$, $m = 5$ the power matrix
+//! cannot recover 18 of the 6,187 patterns inside its stated capability, and
+//! at $k = 20$, $m = 6$, 684 of 230,229.
 
 use std::cmp;
 
@@ -185,6 +196,61 @@ impl GfTables {
         // return alpha^power
         self.exp.0[power % 255]
     }
+}
+
+/// Which coefficient matrix the codec is built from.
+///
+/// The two differ in exactly one property, and it is the property erasure
+/// coding exists for: whether *every* pattern of up to `parity_shards` lost
+/// shards can be recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixKind {
+    /// $C_{ij} = (x_i \oplus y_j)^{-1}$ with $x_i = i$ and $y_j = m + j$ —
+    /// a **Cauchy matrix**. The default, and the one to use.
+    ///
+    /// Every square submatrix of a Cauchy matrix is itself a Cauchy matrix,
+    /// and a Cauchy determinant has the closed form
+    ///
+    /// $$\det = \frac{\prod_{r < r'} (x_r \oplus x_{r'}) \thinspace
+    ///   \prod_{c < c'} (y_c \oplus y_{c'})}
+    ///   {\prod_{r, c} (x_r \oplus y_c)} ,$$
+    ///
+    /// which is nonzero whenever the $x$ are pairwise distinct, the $y$ are
+    /// pairwise distinct, and the two sets are disjoint. All three hold by
+    /// construction here. So recovery succeeds for **every** choice of which
+    /// shards are missing, with no dependence on which rows the decoder
+    /// happens to select — which is the guarantee the geometry is sold on.
+    ///
+    /// Requires $k + m \le 256$, since it needs that many distinct GF(256)
+    /// elements.
+    Cauchy,
+
+    /// $C_{ij} = \alpha^{ij}$. **Cannot recover every erasure pattern**;
+    /// present only to read data written by syndrome 0.4.0 and earlier, which
+    /// used it.
+    ///
+    /// The failure is specific and worth stating exactly, because the shape
+    /// of it is what makes it easy to miss. Recovery inverts the submatrix of
+    /// $C$ on the missing data columns $j_c$ and on however many surviving
+    /// parity rows $i_r$ the decoder needs. Writing $x_c = \alpha^{j_c}$, that
+    /// submatrix is $\left[x_c^{\thinspace i_r}\right]$. When the surviving
+    /// parity rows are $0, 1, \dots, m-1$ — which is what happens when no
+    /// parity shard is lost — the row exponents are consecutive, the matrix is
+    /// a true Vandermonde, and it is nonsingular because the $x_c$ are
+    /// distinct. Lose a parity shard and the exponents skip: rows
+    /// $\lbrace 0, 1, 3 \rbrace$ give $\left[1, x, x^3\right]$, a *generalized*
+    /// Vandermonde whose determinant carries an extra symmetric factor — here
+    /// $x_1 \oplus x_2 \oplus x_3$ — and over a finite field that factor can
+    /// vanish.
+    ///
+    /// It is not a corner case. At $k = 12$, $m = 5$, 18 of the 6,187
+    /// recoverable-in-principle erasure patterns fail; at $k = 16$, $m = 6$,
+    /// 254 of 74,612. `reed_solomon::tests::cauchy_recovers_every_pattern_the_
+    /// power_matrix_cannot` enumerates them. The decoder reports
+    /// [`FecError::InvalidParam`] rather than returning wrong data, so the
+    /// failure is loud — but a shard set that *should* be recoverable is not,
+    /// which for an erasure code is the whole contract.
+    PowerVandermonde,
 }
 
 /// Systematic Reed-Solomon erasure codec over GF(256).
@@ -685,12 +751,74 @@ impl ReedSolomon {
     /// shards are left unchanged and parity shards are linear combinations of
     /// data shards.
     pub fn new(data_shards: usize, parity_shards: usize) -> Self {
+        Self::with_matrix(data_shards, parity_shards, MatrixKind::Cauchy)
+    }
+
+    /// Build the codec with an explicit generator-matrix construction.
+    ///
+    /// [`ReedSolomon::new`] uses [`MatrixKind::Cauchy`], which is the one that
+    /// can recover every erasure pattern within the code's capability. The
+    /// other exists to read data written by an earlier version — see
+    /// [`MatrixKind`] for what separates them, and for what
+    /// [`MatrixKind::PowerVandermonde`] cannot do.
+    ///
+    /// # Arguments
+    ///
+    /// * `data_shards`   - $k$, the number of data shards.
+    /// * `parity_shards` - $m$, the number of parity shards.
+    /// * `kind`          - Which coefficient matrix to build.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::reed_solomon::{MatrixKind, ReedSolomon};
+    ///
+    /// let modern = ReedSolomon::new(10, 4);
+    /// let legacy = ReedSolomon::with_matrix(10, 4, MatrixKind::PowerVandermonde);
+    /// let data: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 16]).collect();
+    /// // Different matrices, so different parity bytes on the wire.
+    /// assert_ne!(modern.encode(&data).unwrap(), legacy.encode(&data).unwrap());
+    /// ```
+    #[must_use]
+    pub fn with_matrix(data_shards: usize, parity_shards: usize, kind: MatrixKind) -> Self {
         let tables = GfTables::new();
         let mut coeffs = vec![0u8; parity_shards * data_shards];
-        for i in 0..parity_shards {
-            for j in 0..data_shards {
-                // coefficient = alpha^{i * j}
-                coeffs[i * data_shards + j] = tables.pow_alpha(i * j);
+        match kind {
+            MatrixKind::Cauchy => {
+                // C[i][j] = 1 / (x_i + y_j) over GF(256), with the two index
+                // sets disjoint: x_i = i and y_j = m + j. Addition is XOR, so
+                // x_i + y_j is zero exactly when the two indices coincide —
+                // which the disjointness rules out, so no entry divides by
+                // zero. See `MatrixKind::Cauchy` for why every square
+                // submatrix of this is invertible.
+                //
+                // The construction needs k + m distinct field elements, and
+                // GF(256) has 256. Beyond that the index sets would wrap and
+                // stop being disjoint, so the geometry is rejected at
+                // `validate_encode_inputs` rather than silently producing a
+                // matrix with a zero denominator.
+                for i in 0..parity_shards {
+                    for j in 0..data_shards {
+                        let x = i as u32;
+                        let y = (parity_shards + j) as u32;
+                        let denom = (x ^ y) as u8;
+                        coeffs[i * data_shards + j] = if denom == 0 {
+                            // Unreachable for k + m <= 256; keeps the
+                            // construction total rather than panicking on a
+                            // geometry that is rejected elsewhere.
+                            0
+                        } else {
+                            tables.div(1, denom)
+                        };
+                    }
+                }
+            }
+            MatrixKind::PowerVandermonde => {
+                for i in 0..parity_shards {
+                    for j in 0..data_shards {
+                        coeffs[i * data_shards + j] = tables.pow_alpha(i * j);
+                    }
+                }
             }
         }
         ReedSolomon {
@@ -1880,6 +2008,206 @@ mod tests {
         out
     }
 
+    /// GF(256) multiplicative inverse, found by exhaustive search over
+    /// [`gf_mul_peasant`].
+    ///
+    /// 255 trial multiplications, which is irrelevant at test scale and buys
+    /// the property that matters: it shares no table, no logarithm and no code
+    /// path with `GfTables`, so a reference built on it is genuinely
+    /// independent of the implementation it checks.
+    #[cfg(test)]
+    fn gf_inv_peasant(a: u8) -> u8 {
+        assert!(a != 0, "GF(256) has no inverse for 0");
+        (1u16..256)
+            .map(|b| b as u8)
+            .find(|&b| gf_mul_peasant(a, b) == 1)
+            .expect("every nonzero element of a field has an inverse")
+    }
+
+    /// Reference parity for the Cauchy construction, computed from scratch.
+    ///
+    /// `parity[i][b] = XOR_j (x_i + y_j)^-1 * data[j][b]` with `x_i = i` and
+    /// `y_j = m + j`, built entirely from [`gf_mul_peasant`] and
+    /// [`gf_inv_peasant`]. Nothing here touches `GfTables`, the codec's
+    /// coefficient matrix, or its encode path, so agreement between this and
+    /// `ReedSolomon::encode` is evidence about the construction rather than a
+    /// tautology.
+    #[cfg(test)]
+    fn cauchy_parity_reference(
+        data: &[Vec<u8>],
+        parity_shards: usize,
+        shard_len: usize,
+    ) -> Vec<Vec<u8>> {
+        let d = data.len();
+        (0..parity_shards)
+            .map(|i| {
+                (0..shard_len)
+                    .map(|b| {
+                        let mut acc = 0u8;
+                        for (j, dj) in data.iter().enumerate().take(d) {
+                            let denom = (i as u8) ^ ((parity_shards + j) as u8);
+                            acc ^= gf_mul_peasant(gf_inv_peasant(denom), dj[b]);
+                        }
+                        acc
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Both generator matrices must agree with an independently computed
+    /// reference, so the constructions are pinned to their definitions rather
+    /// than to themselves.
+    ///
+    /// The two references share no code with the codec: `GfTables`'s
+    /// logarithm tables are not used, and neither is its coefficient matrix.
+    /// The Cauchy side is built from an exhaustive-search inverse; the
+    /// power side is a Horner polynomial evaluation, which is structurally
+    /// unrelated to the codec's multiply-accumulate over precomputed
+    /// coefficients — $C_{ij} = \alpha^{ij}$ means parity row $i$ is exactly
+    /// $p(\alpha^i)$ for $p(x) = \sum_j \mathrm{data}_j x^j$.
+    #[test]
+    fn both_matrix_constructions_match_independent_references() {
+        let mut state = 0xCA00_C11Fu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        for (d, p) in [(4usize, 3usize), (7, 5), (12, 5)] {
+            let shard_len = 9usize;
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|_| (0..shard_len).map(|_| next()).collect())
+                .collect();
+
+            let cauchy = ReedSolomon::with_matrix(d, p, MatrixKind::Cauchy)
+                .encode(&data)
+                .unwrap();
+            assert_eq!(
+                cauchy,
+                cauchy_parity_reference(&data, p, shard_len),
+                "Cauchy parity disagrees with the independent reference at d={d} p={p}"
+            );
+
+            let power = ReedSolomon::with_matrix(d, p, MatrixKind::PowerVandermonde)
+                .encode(&data)
+                .unwrap();
+            let power_ref: Vec<Vec<u8>> = (0..p)
+                .map(|i| horner_eval_parity(&data, gf_pow_peasant(2, i), shard_len))
+                .collect();
+            assert_eq!(
+                power, power_ref,
+                "alpha^(ij) parity disagrees with Horner evaluation at d={d} p={p}"
+            );
+
+            // And the two constructions are genuinely different codes.
+            assert_ne!(cauchy, power, "the two matrices must not coincide");
+        }
+    }
+
+    /// The Cauchy matrix recovers every erasure pattern within the code's
+    /// capability; the power matrix does not.
+    ///
+    /// This is the reason [`ReedSolomon::new`] builds a Cauchy matrix, and
+    /// the failure it avoids is not a corner case. Recovery inverts the
+    /// submatrix of $C$ on the missing data columns and on as many surviving
+    /// parity rows as are needed. For $C_{ij} = \alpha^{ij}$ that submatrix
+    /// is $[x_c^{\thinspace i_r}]$ with $x_c = \alpha^{j_c}$ — a true
+    /// Vandermonde, hence nonsingular, *only* while the surviving parity rows
+    /// are $0, 1, \dots$ consecutively. Lose a parity shard and the exponents
+    /// skip, the matrix becomes a generalized Vandermonde, its determinant
+    /// picks up a symmetric factor, and over GF(256) that factor sometimes
+    /// vanishes.
+    ///
+    /// So the erasure patterns that break it are exactly the ones that lose
+    /// *both* data and parity shards, which is why a test erasing only data
+    /// would find nothing. The counts below were obtained by enumeration and
+    /// are asserted rather than described, so a future change to either
+    /// construction cannot quietly move them.
+    #[test]
+    fn cauchy_recovers_every_pattern_the_power_matrix_cannot() {
+        /// Every way to lose `lost` of `n` shards.
+        fn subsets(n: usize, lost: usize) -> Vec<Vec<usize>> {
+            let mut out = Vec::new();
+            fn rec(
+                start: usize,
+                n: usize,
+                k: usize,
+                cur: &mut Vec<usize>,
+                out: &mut Vec<Vec<usize>>,
+            ) {
+                if cur.len() == k {
+                    out.push(cur.clone());
+                    return;
+                }
+                for v in start..n {
+                    cur.push(v);
+                    rec(v + 1, n, k, cur, out);
+                    cur.pop();
+                }
+            }
+            rec(0, n, lost, &mut Vec::new(), &mut out);
+            out
+        }
+
+        /// Enumerate every full-capability erasure pattern (any split of `m`
+        /// losses between data and parity) and count those that do not come
+        /// back correct.
+        fn unrecoverable(d: usize, p: usize, kind: MatrixKind) -> (usize, usize) {
+            let rs = ReedSolomon::with_matrix(d, p, kind);
+            let data: Vec<Vec<u8>> = (0..d)
+                .map(|i| vec![(i as u8).wrapping_mul(37).wrapping_add(11); 4])
+                .collect();
+            let parity = rs.encode(&data).unwrap();
+            let (mut bad, mut total) = (0usize, 0usize);
+            for p_lost in 0..p {
+                for de in subsets(d, p - p_lost) {
+                    for pe in subsets(p, p_lost) {
+                        total += 1;
+                        let mut shards: Vec<Option<Vec<u8>>> = data
+                            .iter()
+                            .cloned()
+                            .map(Some)
+                            .chain(parity.iter().cloned().map(Some))
+                            .collect();
+                        for &e in &de {
+                            shards[e] = None;
+                        }
+                        for &e in &pe {
+                            shards[d + e] = None;
+                        }
+                        let ok = rs.decode(&mut shards).is_ok()
+                            && (0..d).all(|i| shards[i].as_ref() == Some(&data[i]));
+                        if !ok {
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+            (bad, total)
+        }
+
+        // (d, p, how many patterns the power matrix cannot recover)
+        for (d, p, power_failures) in [(8usize, 4usize, 0usize), (12, 5, 18), (10, 6, 46)] {
+            let (cauchy_bad, total) = unrecoverable(d, p, MatrixKind::Cauchy);
+            assert_eq!(
+                cauchy_bad, 0,
+                "Cauchy failed {cauchy_bad} of {total} erasure patterns at d={d} p={p}; \
+                 every square submatrix of a Cauchy matrix is invertible, so this cannot \
+                 happen unless the construction is wrong"
+            );
+
+            let (power_bad, power_total) = unrecoverable(d, p, MatrixKind::PowerVandermonde);
+            assert_eq!(power_total, total);
+            assert_eq!(
+                power_bad, power_failures,
+                "alpha^(ij) failed {power_bad} of {total} patterns at d={d} p={p}, \
+                 expected {power_failures}"
+            );
+        }
+    }
+
     /// Increments `bytes` as a big-endian base-256 counter in place.
     /// Returns `false` (instead of wrapping silently) once every value has
     /// been produced, i.e. after processing all-`0xFF`.
@@ -1956,9 +2284,8 @@ mod tests {
                 }
             }
             if error_count <= max_errors {
-                for pi in 0..p {
-                    let point = gf_pow_peasant(2, pi);
-                    let parity_row = horner_eval_parity(&data, point, shard_len);
+                let parity_rows = cauchy_parity_reference(&data, p, shard_len);
+                for (pi, parity_row) in parity_rows.iter().enumerate() {
                     if let Some(recv) = shards[d + pi].as_ref()
                         && recv.as_slice() != parity_row.as_slice()
                     {
