@@ -9,9 +9,8 @@
 [![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
-[![6G Research](https://img.shields.io/badge/6G-IMT--2030%20research-blueviolet)](src/sixg.rs)
 
-**A high-performance, multi-standard Forward Error Correction library in safe Rust — nine FEC cores spanning every wireless generation: Hamming and Golay (the classics), BCH and Reed-Solomon (storage and satellites), convolutional/Viterbi (2G), Turbo (3G/4G LTE), and QC-LDPC + Polar (5G NR TS 38.212, Wi-Fi 6/7, 6G research) — with AVX2/NEON SIMD, lock-free pipelining, runnable teaching examples, and end-to-end media reconstruction tests.**
+**A high-performance, multi-standard Forward Error Correction library in Rust — safe-by-default, with Miri-verified unsafe confined to the SIMD and lock-free cores — nine FEC cores spanning every wireless generation: Hamming and Golay (the classics), BCH and Reed-Solomon (storage and satellites), convolutional/Viterbi (2G), Turbo (3G/4G LTE), and QC-LDPC + Polar (5G NR TS 38.212, Wi-Fi 6/7, 6G research) — with AVX2/NEON SIMD, lock-free pipelining, runnable teaching examples, and end-to-end media reconstruction tests.**
 
 ![QC-LDPC layered offset min-sum decode converging on a real, noise-corrupted 802.11 Wi-Fi codeword](bench/dashboard/exports/ldpc_convergence.gif)
 
@@ -38,11 +37,11 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 
 | What | Detail |
 |---|---|
-| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G research) |
+| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G) — link-adaptation profiles over the existing 5G NR LDPC/Polar kernels, not a distinct FEC spec (no 6G FEC standard is ratified yet) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); GFNI-accelerated GF(256) multiply for RS where available, AVX2 VPSHUFB nibble-table fallback elsewhere; NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 425 total on x86-64 (423 on AArch64: 7 AVX2/GFNI tests drop out, 5 NEON-only ones appear) — 235 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test) · 12 integration (5G NR + Wi-Fi) · 4 LDPC offset-β validation · 4 media reconstruction · 14 reference vectors · 38 robustness · 118 doctests |
+| **Tests** | 486 across unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test), integration (5G NR + Wi-Fi), LDPC offset-β validation, media reconstruction, reference vectors, robustness, and doctests — run `cargo test --all` for the current per-category split (it shifts release to release) |
 | **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~162/90 Gbit/s encode/decode (GFNI, AVX2 VPSHUFB fallback), LDPC: ~219 Melem/s · all numbers from running code |
@@ -90,7 +89,7 @@ decoders. When either standard ratifies a genuinely new code, it gets a row.
 
 ## Plain-English Summary *(for recruiters and non-specialists)*
 
-> **The one-sentence version:** this library implements the error-correction algorithms that live inside every 5G phone chip, Wi-Fi router, and satellite terminal — in safe Rust, matching hand-optimised C++ speed.
+> **The one-sentence version:** this library implements the error-correction algorithms that live inside every 5G phone chip, Wi-Fi router, and satellite terminal — in Rust, matching hand-optimised C++ speed.
 
 ### What problem does it solve?
 
@@ -1121,7 +1120,7 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 | Project | Language | Domain | Notes |
 |---|---|---|---|
-| [AFF3CT](https://github.com/aff3ct/aff3ct) | C++17 | LDPC, Turbo, Polar, RS, BCH | Full FEC framework; AVX2/AVX-512; primary C++ reference (this library now covers the same core algorithm set in safe Rust). Paper: Cassagne et al., *SoftwareX* 2019. |
+| [AFF3CT](https://github.com/aff3ct/aff3ct) | C++17 | LDPC, Turbo, Polar, RS, BCH | Full FEC framework; AVX2/AVX-512; primary C++ reference (this library now covers the same core algorithm set in Rust). Paper: Cassagne et al., *SoftwareX* 2019. |
 | [OpenAirInterface](https://gitlab.eurecom.fr/oai/openairinterface5g) | C | 5G NR PHY L1 | Open-source gNB/UE; LDPC from 3GPP BG1/BG2. |
 | [srsRAN Project](https://github.com/srsran/srsRAN_Project) | C++17 | 5G NR PHY | Production-quality open-source gNB; LDPC with AVX2 paths. |
 | [rav1e](https://github.com/xiph/rav1e) | Rust | AV1 video codec | Demonstrates Rust competing with C++ on DSP kernels. |
@@ -1147,7 +1146,7 @@ BCJR, QPP interleaver) · extended binary Golay(24,12,8) · Hamming(7,4) ·
 CRC-24A/B/C, CRC-16/11/6
 
 **Standards:** 3GPP TS 38.212 (5G NR) · 3GPP TS 36.212 (LTE) · IEEE
-802.11ax/be (Wi-Fi 6/7) · DVB-S2 · CCSDS · IMT-2030 (6G research)
+802.11ax/be (Wi-Fi 6/7) · IMT-2030 (6G research profiles over the 5G kernels)
 
 **Engineering:** Rust · SIMD (AVX2, VPSHUFB, NEON) · zero-allocation hot
 paths · lock-free SPSC ring buffer · thread affinity · rate matching ·
@@ -1168,7 +1167,7 @@ Questions this repository answers: *Is there a Rust library for 5G NR LDPC
 encoding and decoding? How do I implement TS 38.212 code block segmentation
 and rate matching? What is a Rust alternative to AFF3CT? How does a polar
 SCL decoder work? How do I do Reed-Solomon erasure coding in Rust with SIMD?
-How fast can safe Rust decode LDPC compared to C++?*
+How fast can Rust decode LDPC compared to C++?*
 
 ---
 

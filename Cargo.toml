@@ -4,7 +4,7 @@ version = "0.5.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
-description = "Multi-standard Forward Error Correction in safe Rust: 5G NR TS 38.212 (QC-LDPC LOMS), Wi-Fi 6/7, Bluetooth (LE Coded PHY, BR/EDR), Reed-Solomon, Viterbi and Polar codes, with AVX2/NEON SIMD and lock-free pipelining."
+description = "Multi-standard Forward Error Correction in Rust: 5G NR TS 38.212 (QC-LDPC LOMS), Wi-Fi 6/7, Bluetooth (LE Coded PHY, BR/EDR), Reed-Solomon, Viterbi and Polar codes, with AVX2/NEON SIMD and lock-free pipelining."
 authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
 readme = "README.md"
 repository = "https://github.com/ThomasGl/syndrome"
@@ -52,7 +52,14 @@ all-features = true
 
 [dependencies]
 core_affinity = { version = "0.6", optional = true }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+# Optional: only `src/bin/{ber_sim,ldpc_pipeline_bench,ldpc_convergence_export}.rs`
+# use it, and those exporters are excluded from the published tarball (see
+# `exclude` above). Gated behind the `bench-export` feature below rather than
+# a plain [dependencies] entry so downstream consumers of the *library* never
+# resolve or build it -- `cargo build --bins` (dev-dependencies are not
+# visible to [[bin]] targets) needs `--features bench-export` to build those
+# three exporters, e.g. `cargo run --bin ber_sim --features bench-export`.
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 
 [build-dependencies]
 serde_json = "1.0"
@@ -72,6 +79,27 @@ serde_json = "1.0"
 # 0.1.0 rather than after. If a genuine compile-time SIMD or `#![no_std]` switch is
 # added later, introducing a feature for it is backward-compatible.
 affinity = ["core_affinity"]
+# Enables `serde_json` for the 3 src/bin/ exporters that emit JSON. Not
+# needed by the library itself, and not needed by `bench/run_all.sh` (its two
+# `cargo run` targets, bench_export/ldpc_bench_export, don't use JSON).
+bench-export = ["dep:serde_json"]
+
+# Explicit [[bin]] entries (Cargo auto-discovers src/bin/*.rs otherwise) only
+# for the 3 exporters that need `serde_json`: `required-features` makes Cargo
+# skip building/testing them unless `--features bench-export` is passed,
+# instead of failing to compile every plain `cargo build --bins`/`cargo test`.
+# The other 5 src/bin/ binaries stay auto-discovered.
+[[bin]]
+name = "ber_sim"
+required-features = ["bench-export"]
+
+[[bin]]
+name = "ldpc_pipeline_bench"
+required-features = ["bench-export"]
+
+[[bin]]
+name = "ldpc_convergence_export"
+required-features = ["bench-export"]
 
 [dev-dependencies]
 proptest = "1.4"
