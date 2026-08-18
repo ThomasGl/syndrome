@@ -398,7 +398,7 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (482 tests total on x86-64; 480 on AArch64)
+### 4.1 Component coverage (485 tests total on x86-64; 483 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
@@ -412,6 +412,7 @@ loop {
 | End-to-end media reconstruction | 4 | `tests/media_reconstruction.rs` |
 | Reference-vector conformance (published known answers) | 14 | `tests/reference_vectors.rs` |
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
+| Rustdoc LaTeX survives markdown's escape pass (+ real KaTeX parse when installed) | 3 | `tests/doc_math.rs` |
 | SPSC memory-ordering model check (loom, exhaustive) | 5 — not counted above; needs `--cfg loom` | `tests/loom_spsc.rs` |
 | Miri over the non-SIMD `unsafe` (SPSC ring, LDPC frame pool) | 14 of the unit tests above, re-run under `cargo miri` | `spsc_queue`, `ldpc_pipeline` |
 | Doctests | 133 | `///` examples in all public API |

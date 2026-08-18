@@ -71,6 +71,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **The rustdoc LaTeX gate is now a test** (`tests/doc_math.rs`), not only a CI
+  job. It runs in every `cargo test`, so broken math cannot reach a release
+  through a path that skipped CI.
+
+  Pure Rust with no dependencies: it extracts every `$…$` and `$$…$$` span from
+  the crate's doc comments, applies CommonMark's backslash-escape rule, and
+  checks the five documented failure classes — a row break written with two
+  backslashes instead of four, a spacing or grouping macro whose backslash
+  CommonMark eats (`\,`, `\;`, `\!`, `\{`, `\}`), a `&` that reaches KaTeX
+  bare, an `_` inside `\text{}`, and unbalanced braces or environments.
+
+  Where Node and the `katex` package are present it *additionally* runs the
+  real parser through `tools/check_doc_math.mjs`, which is stronger because it
+  rejects expressions no structural rule anticipated. That cannot be a hard
+  requirement of `cargo test` — a Rust crate should not need npm to run its
+  suite — so it degrades to a printed skip, and the `doc-math` CI job installs
+  the dependency so the strong check is mandatory on every push.
+
+  Both halves are needed, and the reason is concrete: injecting `$x \, y$` or
+  `$\{ x \}$` fails only the structural test, because KaTeX parses both
+  perfectly — they are the silent class, where the page renders cleanly with
+  the spacing or the grouping quietly gone. Injecting a bare `&` or a
+  text-mode `_` fails both. A third test checks the checker: that it finds the
+  crate's several hundred spans rather than passing vacuously, that each rule
+  fires on the construct it exists for, and that the *correct* forms
+  (`\\\\` row breaks, `\thinspace`, `\lbrace`, `\\&`, `\\_`) are not flagged.
+
 - **Chase-II soft-decision BCH decoding** (`BchCode::decode_chase2`,
   `Chase2Report`): corrects error patterns beyond the algebraic limit $t$ by
   using the demodulator's reliabilities, which the hard decoder throws away.

@@ -34,7 +34,9 @@
 
      `tools/check_doc_math.mjs` extracts every math span from the crate's
      doc comments, applies CommonMark's escape rule, and parses the result
-     with KaTeX. Eyeballing does not work, for two reasons: `throwOnError:
+     with KaTeX. `tests/doc_math.rs` runs the same check from `cargo test`:
+     its structural rules need no dependencies and always run, and it invokes
+     the KaTeX parse above as well whenever the npm package is installed. Eyeballing does not work, for two reasons: `throwOnError:
      false` below means a malformed expression shows up as red raw source on
      the page instead of failing loudly, and a row break that lost a
      backslash renders cleanly with every row collapsed into one. The CI job
