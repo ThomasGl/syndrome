@@ -398,11 +398,11 @@ loop {
 
 ## 4. Test Suite
 
-### 4.1 Component coverage (468 tests total on x86-64; 466 on AArch64)
+### 4.1 Component coverage (473 tests total on x86-64; 471 on AArch64)
 
 | Category | Count | Location |
 |---|---|---|
-| Unit tests | 255 (x86-64) / 253 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
+| Unit tests | 259 (x86-64) / 257 (AArch64) — architecture-specific SIMD equivalence tests only compile for their target | embedded in `src/*.rs` |
 | 5G NR LDPC integration (encode→decode round-trips, BG1/BG2) | 7 | `tests/ldpc_integration.rs` |
 | LDPC offset-β validation (BLER sweep with confidence intervals) | 4 (+2 study runs, `#[ignore]`d) | `tests/ldpc_offset_beta_sweep.rs` |
 | int8 LDPC kernel equivalence (scalar vs AVX2, bit-for-bit) | 8 | `tests/ldpc_int8_kernel_equivalence.rs` |
@@ -414,7 +414,7 @@ loop {
 | Robustness (hostile/degenerate inputs, no panics) | 38 | `tests/robustness.rs` |
 | SPSC memory-ordering model check (loom, exhaustive) | 5 — not counted above; needs `--cfg loom` | `tests/loom_spsc.rs` |
 | Miri over the non-SIMD `unsafe` (SPSC ring, LDPC frame pool) | 14 of the unit tests above, re-run under `cargo miri` | `spsc_queue`, `ldpc_pipeline` |
-| Doctests | 130 | `///` examples in all public API |
+| Doctests | 131 | `///` examples in all public API |
 
 Two suites deserve a note. The **reference-vector suite** pins each codec to
 *external* ground truth — CRC polynomials against the reveng catalogue,

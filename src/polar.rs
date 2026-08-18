@@ -1065,6 +1065,26 @@ fn scl_decode_recursive_reference(
 /// dec.decode_sc(&llr, &mut out).unwrap();
 /// assert_eq!(out, info);
 /// ```
+/// What [`PolarDecoder::decode_scl_adaptive`] did.
+///
+/// The list size and attempt count are the point: they are how a caller sees
+/// the cost it actually paid, which is the whole reason to prefer adaptive
+/// decoding over a fixed large list. Averaging `list_size_used` over a frame
+/// stream gives the real complexity of the link, and it drops sharply as the
+/// channel improves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveDecodeReport {
+    /// List size whose result was returned. Between 1 and the decoder's
+    /// configured maximum.
+    pub list_size_used: usize,
+    /// Whether the returned bits satisfy the CRC. `false` means every rung of
+    /// the ladder failed and the bits are the best-metric path from the
+    /// largest attempt.
+    pub crc_ok: bool,
+    /// How many decodes ran, i.e. how many rungs of the ladder were climbed.
+    pub attempts: usize,
+}
+
 pub struct PolarDecoder {
     n: usize,
     k: usize,
@@ -1227,9 +1247,35 @@ impl PolarDecoder {
             ));
         }
 
-        // For list_size=1, fall back to the efficient SC path.
-        if self.list_size == 1 {
-            return self.decode_sc(llr, out);
+        self.decode_scl_at(llr, out, self.list_size).map(|_| ())
+    }
+
+    /// [`Self::decode_scl`] at an explicit list size, reporting whether the
+    /// path it selected satisfies the CRC.
+    ///
+    /// Both facts are what [`Self::decode_scl_adaptive`] needs and neither is
+    /// available through the public entry point: the list size because
+    /// escalation means running the same decode at several, and the CRC
+    /// verdict because "no path passed, here is the best-metric one anyway" is
+    /// exactly the outcome that has to trigger the next attempt. Without a CRC
+    /// configured the verdict is always `false` — there is no success signal,
+    /// which is why adaptive decoding requires one.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::decode_scl`].
+    fn decode_scl_at(
+        &self,
+        llr: &[f32],
+        out: &mut [u8],
+        list_size: usize,
+    ) -> Result<bool, FecError> {
+        // At L = 1 the list machinery degenerates to plain successive
+        // cancellation, and `decode_sc` is the same algorithm without the
+        // arena — so run that and CRC-check its output directly.
+        if list_size == 1 {
+            self.decode_sc(llr, out)?;
+            return Ok(self.crc.as_ref().is_some_and(|c| c.check(out)));
         }
 
         let levels = self.n.trailing_zeros() as usize;
@@ -1237,7 +1283,7 @@ impl PolarDecoder {
         // Build the fork arena once for this call: one live path (the
         // root), backed by allocation-free ping-pong buffers for every
         // subsequent fork (see `SclArena`'s doc comment).
-        let mut arena = SclArena::new(self.n, llr, &level_offsets, self.list_size);
+        let mut arena = SclArena::new(self.n, llr, &level_offsets, list_size);
 
         // Walk the decode tree once, forking/pruning the whole path list at
         // each information-bit leaf (see `scl_decode_recursive`'s doc for why
@@ -1248,15 +1294,16 @@ impl PolarDecoder {
             0,
             self.n,
             0,
-            self.list_size,
+            list_size,
             &level_offsets,
             &mut arena,
         );
 
         let paths = arena.active();
         // Select the best CRC-passing path, or the best path if none pass.
-        let best = if let Some(ref crc_eng) = self.crc {
-            // Collect info bits for each path and CRC-check.
+        // `paths` is ordered by path metric, so `find` returns the most likely
+        // survivor that also satisfies the CRC.
+        let (best, crc_ok) = if let Some(ref crc_eng) = self.crc {
             let crc_pass = paths.iter().find(|p| {
                 let mut info = Vec::with_capacity(self.k);
                 for i in 0..self.n {
@@ -1266,9 +1313,12 @@ impl PolarDecoder {
                 }
                 crc_eng.check(&info)
             });
-            crc_pass.unwrap_or(&paths[0])
+            match crc_pass {
+                Some(p) => (p, true),
+                None => (&paths[0], false),
+            }
         } else {
-            &paths[0]
+            (&paths[0], false)
         };
 
         // Extract info bits from the best path.
@@ -1280,7 +1330,120 @@ impl PolarDecoder {
             }
         }
 
-        Ok(())
+        Ok(crc_ok)
+    }
+
+    /// CRC-aided successive-cancellation list decode that escalates the list
+    /// size only as far as it has to.
+    ///
+    /// # What it does
+    ///
+    /// Decodes at $L = 1$ first. If the CRC passes, that is the answer and
+    /// the decode cost was plain successive cancellation. If it fails, decode
+    /// again at $L = 2$, then 4, and so on, stopping at the first list size
+    /// whose selected path satisfies the CRC or at the list size the decoder was
+    /// built with, whichever comes first.
+    ///
+    /// # Why this is nearly free
+    ///
+    /// The error-rate performance is that of the *largest* list, because the
+    /// ladder only stops early when the CRC — an independent check the
+    /// decoder cannot fool by guessing — has confirmed the result. The cost is
+    /// the interesting part. Escalating all the way runs
+    /// $1 + 2 + \dots + L < 2L$ list-units of work, so the worst case is under
+    /// twice a single full-size decode; and the worst case is rare by
+    /// construction, because it only happens on blocks the channel damaged
+    /// badly. At a working SNR most blocks pass at $L = 1$, so the *average*
+    /// cost falls toward plain SC while the error rate stays at $L$. That
+    /// asymmetry — pay for the large list only on the blocks that need it — is
+    /// why 5G NR receivers do this rather than running a fixed large list.
+    ///
+    /// # Requires a CRC
+    ///
+    /// Without one there is no signal that a decode succeeded, so there is
+    /// nothing to escalate on: every attempt would look identical to the
+    /// last. Construct the decoder with a `crc_kind`.
+    ///
+    /// # Arguments
+    ///
+    /// * `llr` - Channel LLRs, length $N$.
+    /// * `out` - Decoded information bits, length $K$.
+    ///
+    /// # Returns
+    ///
+    /// An [`AdaptiveDecodeReport`] describing which list size produced the
+    /// bits in `out`, whether they satisfy the CRC, and how many decodes ran.
+    /// A report with `crc_ok == false` means every list size up to the
+    /// configured maximum failed; `out` then holds the best-metric path from
+    /// the largest attempt, which is exactly what [`Self::decode_scl`] would
+    /// have returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FecError::InvalidParam`] if the decoder was built without a
+    /// CRC. Otherwise the same conditions as [`Self::decode_scl`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::AwgnChannel;
+    /// use syndrome::crc::{Crc24, CrcKind};
+    /// use syndrome::polar::{PolarDecoder, PolarEncoder};
+    ///
+    /// // The CRC is carried inside K, so the payload is K minus its length.
+    /// let (n, k) = (256usize, 128usize);
+    /// let enc = PolarEncoder::new(n, k).unwrap();
+    /// let dec = PolarDecoder::new(n, k, 8, Some(CrcKind::Crc11)).unwrap();
+    /// let crc = Crc24::new(CrcKind::Crc11);
+    ///
+    /// let mut info: Vec<u8> = (0..k - 11).map(|i| (i % 2) as u8).collect();
+    /// crc.attach(&mut info);
+    /// assert_eq!(info.len(), k);
+    ///
+    /// let mut codeword = vec![0u8; n];
+    /// enc.encode(&info, &mut codeword).unwrap();
+    ///
+    /// // A clean channel: the CRC passes at the first rung of the ladder, so
+    /// // the whole decode costs one plain SC pass.
+    /// let channel = AwgnChannel::new(10.0, k as f32 / n as f32, 1);
+    /// let llr = channel.transmit_noiseless(&codeword);
+    /// let mut out = vec![0u8; k];
+    /// let report = dec.decode_scl_adaptive(&llr, &mut out).unwrap();
+    /// assert_eq!(out, info);
+    /// assert!(report.crc_ok);
+    /// assert_eq!(report.list_size_used, 1);
+    /// assert_eq!(report.attempts, 1);
+    /// ```
+    pub fn decode_scl_adaptive(
+        &self,
+        llr: &[f32],
+        out: &mut [u8],
+    ) -> Result<AdaptiveDecodeReport, FecError> {
+        if self.crc.is_none() {
+            return Err(FecError::InvalidParam(
+                "decode_scl_adaptive needs a CRC: without one there is no signal \
+                 that a decode succeeded, so there is nothing to escalate on",
+            ));
+        }
+
+        let mut attempts = 0usize;
+        let mut list_size = 1usize;
+        loop {
+            attempts += 1;
+            let crc_ok = self.decode_scl_at(llr, out, list_size)?;
+            if crc_ok || list_size >= self.list_size {
+                return Ok(AdaptiveDecodeReport {
+                    list_size_used: list_size,
+                    crc_ok,
+                    attempts,
+                });
+            }
+            // Double, but never overshoot the configured maximum: the last
+            // rung must be exactly `self.list_size`, or a decoder configured
+            // with a non-power-of-two list would never actually use the size
+            // it was built for.
+            list_size = (list_size * 2).min(self.list_size);
+        }
     }
 
     /// Reference (pre-optimization) CA-SCL decode: identical to
@@ -1623,6 +1786,204 @@ mod tests {
                 out, info,
                 "CA-SCL random round-trip failed at trial={trial}"
             );
+        }
+    }
+
+    /// Adaptive decoding must not lose a single block that the fixed
+    /// full-size list would have recovered.
+    ///
+    /// This is the assertion the whole idea rests on. Stopping early is only
+    /// legitimate because the CRC is an independent check: when it passes at
+    /// $L = 1$, the answer is the same one $L = 8$ would have produced, so
+    /// there is nothing to gain by continuing. If the ladder ever returned a
+    /// CRC-passing result that differed from the fixed decoder's, the saving
+    /// would be coming out of the error rate.
+    ///
+    /// Run over a noisy channel, at an SNR chosen so a meaningful fraction of
+    /// blocks *fail* at $L = 1$ and force escalation — otherwise every rung
+    /// above the first is untested and the comparison is vacuous. The test
+    /// asserts that too, rather than hoping.
+    #[test]
+    fn adaptive_scl_recovers_every_block_the_fixed_list_does() {
+        let n = 256usize;
+        let crc_len = 11usize;
+        let k = 128usize;
+        let enc = PolarEncoder::new(n, k).unwrap();
+        let dec = PolarDecoder::new(n, k, 8, Some(CrcKind::Crc11)).unwrap();
+        let crc_eng = Crc24::new(CrcKind::Crc11);
+        let mut rng = Xorshift64::new(0xADAF_7E51_u64);
+
+        let mut escalated = 0usize;
+        let mut escalated_and_passed = 0usize;
+        let mut fixed_ok = 0usize;
+        let mut adaptive_ok = 0usize;
+        const TRIALS: usize = 120;
+
+        for trial in 0..TRIALS {
+            let mut info = random_bits(&mut rng, k - crc_len);
+            crc_eng.attach(&mut info);
+            let mut cw = vec![0u8; n];
+            enc.encode(&info, &mut cw).unwrap();
+
+            let mut ch = AwgnChannel::new(1.5, k as f32 / n as f32, 0xA1_0000 ^ trial as u64);
+            let llr = ch.transmit(&cw);
+
+            let mut fixed_out = vec![0u8; k];
+            dec.decode_scl(&llr, &mut fixed_out).unwrap();
+            let mut adaptive_out = vec![0u8; k];
+            let report = dec.decode_scl_adaptive(&llr, &mut adaptive_out).unwrap();
+
+            if report.attempts > 1 {
+                escalated += 1;
+                if report.crc_ok {
+                    escalated_and_passed += 1;
+                }
+            }
+            if fixed_out == info {
+                fixed_ok += 1;
+            }
+            if adaptive_out == info {
+                adaptive_ok += 1;
+            }
+
+            // Where the ladder stopped early, the CRC vouched for the result,
+            // and it must be the same result the fixed decoder reached.
+            if report.crc_ok {
+                assert_eq!(
+                    adaptive_out, fixed_out,
+                    "trial {trial}: adaptive stopped at L={} with a CRC-passing path that \\
+                     differs from the fixed L=8 decode",
+                    report.list_size_used
+                );
+            }
+        }
+
+        assert!(
+            escalated > 0,
+            "no block needed escalation, so every rung above L=1 is untested — \\
+             lower the SNR"
+        );
+        assert!(
+            escalated < TRIALS,
+            "every block escalated, so the early-exit path is untested — raise the SNR"
+        );
+        // The L = 1 rung reports its verdict from `decode_sc` plus a direct
+        // CRC check; every rung above it reports from the list search's own
+        // path selection. Without a block that passes *above* L = 1, that
+        // second path is never observed returning success, and a decoder that
+        // always reported failure there would look identical from outside —
+        // it would simply climb to the top rung and still be correct.
+        assert!(
+            escalated_and_passed > 0,
+            "no block passed the CRC above L=1, so the list search's success \
+             report is untested"
+        );
+        assert!(
+            adaptive_ok >= fixed_ok,
+            "adaptive recovered {adaptive_ok}/{TRIALS} against the fixed list's \\
+             {fixed_ok}/{TRIALS}; stopping early must not cost blocks"
+        );
+    }
+
+    /// A clean channel must stop at the first rung on every block, which is
+    /// where the complexity saving comes from.
+    ///
+    /// The claim behind adaptive decoding is not that it is occasionally
+    /// cheaper but that it is *usually* cheaper, collapsing to plain
+    /// successive cancellation whenever the channel is good. A ladder that
+    /// climbed even at high SNR would cost nearly twice a fixed decode
+    /// instead.
+    #[test]
+    fn adaptive_scl_costs_one_pass_on_a_good_channel() {
+        let n = 256usize;
+        let k = 128usize;
+        let enc = PolarEncoder::new(n, k).unwrap();
+        let dec = PolarDecoder::new(n, k, 8, Some(CrcKind::Crc11)).unwrap();
+        let crc_eng = Crc24::new(CrcKind::Crc11);
+        let mut rng = Xorshift64::new(0x600D_C0DE_u64);
+
+        let mut total_list_units = 0usize;
+        const TRIALS: usize = 40;
+        for trial in 0..TRIALS {
+            let mut info = random_bits(&mut rng, k - 11);
+            crc_eng.attach(&mut info);
+            let mut cw = vec![0u8; n];
+            enc.encode(&info, &mut cw).unwrap();
+            let mut ch = AwgnChannel::new(6.0, k as f32 / n as f32, 0x600D_0000 ^ trial as u64);
+            let llr = ch.transmit(&cw);
+
+            let mut out = vec![0u8; k];
+            let report = dec.decode_scl_adaptive(&llr, &mut out).unwrap();
+            assert_eq!(
+                out, info,
+                "trial {trial}: clean channel must decode exactly"
+            );
+            assert!(report.crc_ok);
+            total_list_units += report.list_size_used;
+        }
+
+        // A fixed L=8 decoder would spend 8 units on every block.
+        assert_eq!(
+            total_list_units,
+            TRIALS,
+            "expected one list-unit per block at 6 dB; spent {total_list_units} \\
+             across {TRIALS} blocks against a fixed decoder's {}",
+            TRIALS * 8
+        );
+    }
+
+    /// Without a CRC there is no success signal, so the entry point must
+    /// refuse rather than silently escalate to the maximum on every block.
+    #[test]
+    fn adaptive_scl_requires_a_crc() {
+        let dec = PolarDecoder::new(128, 64, 8, None).unwrap();
+        let llr = vec![1.0f32; 128];
+        let mut out = vec![0u8; 64];
+        assert!(matches!(
+            dec.decode_scl_adaptive(&llr, &mut out),
+            Err(FecError::InvalidParam(_))
+        ));
+    }
+
+    /// The ladder's last rung must be exactly the configured list size, even
+    /// when that size is not a power of two.
+    ///
+    /// Doubling from 1 gives 1, 2, 4, 8, ...; a decoder built with L = 5 would
+    /// otherwise jump from 4 to 8 and never decode at the size it was
+    /// configured for — or, with a naive bound, stop at 4 and quietly be a
+    /// weaker decoder than the caller asked for.
+    #[test]
+    fn adaptive_scl_ladder_ends_at_the_configured_list_size() {
+        let n = 256usize;
+        let k = 128usize;
+        let enc = PolarEncoder::new(n, k).unwrap();
+        let crc_eng = Crc24::new(CrcKind::Crc11);
+
+        for list_size in [1usize, 2, 3, 5, 8] {
+            let dec = PolarDecoder::new(n, k, list_size, Some(CrcKind::Crc11)).unwrap();
+            let mut info = random_bits(&mut Xorshift64::new(0x5153_u64), k - 11);
+            crc_eng.attach(&mut info);
+            let mut cw = vec![0u8; n];
+            enc.encode(&info, &mut cw).unwrap();
+
+            // Deep in the waterfall, so the ladder is driven to its top rung.
+            let mut ch = AwgnChannel::new(-3.0, k as f32 / n as f32, 0xBAD_5EED);
+            let llr = ch.transmit(&cw);
+            let mut out = vec![0u8; k];
+            let report = dec.decode_scl_adaptive(&llr, &mut out).unwrap();
+
+            assert!(
+                report.list_size_used <= list_size,
+                "L={list_size}: ladder overshot to {}",
+                report.list_size_used
+            );
+            if !report.crc_ok {
+                assert_eq!(
+                    report.list_size_used, list_size,
+                    "L={list_size}: a failing decode must have been tried at the \\
+                     configured maximum, not stopped below it"
+                );
+            }
         }
     }
 

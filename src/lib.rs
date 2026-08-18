@@ -72,7 +72,7 @@ pub use golay::GolayCode;
 pub use hamming::{Hamming74, decode_hamming_7_4, encode_hamming_7_4};
 pub use harq::HarqBuffer;
 pub use ldpc_pipeline::{LdpcFrame, LdpcPipeline};
-pub use polar::{PolarDecoder, PolarEncoder};
+pub use polar::{AdaptiveDecodeReport, PolarDecoder, PolarEncoder};
 pub use qc_ldpc::{BaseGraph, LdpcWorkspace, QcLdpcDecoder, QcLdpcEncoder};
 pub use quantize::{QuantParams, dequantize_llr, quantize_llr, quantize_llr_i16};
 pub use rate_matching::{rate_dematch_llr, rate_match};

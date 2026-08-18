@@ -71,6 +71,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse: it reaches KaTeX as a control space and silently collapses a `cases`
   or `bmatrix` block to a single row.
 
+- **Adaptive CA-SCL list size** (`PolarDecoder::decode_scl_adaptive`,
+  `AdaptiveDecodeReport`): decodes at $L = 1$ first, and escalates to 2, 4, …
+  up to the configured list size only when the CRC rejects the result.
+
+  The error-rate performance is that of the *largest* list, because the ladder
+  stops early only when the CRC — a check the decoder cannot satisfy by
+  guessing — has confirmed the answer. The cost is where it pays: escalating
+  all the way runs $1 + 2 + \dots + L < 2L$ list-units, so the worst case is
+  under twice a single full-size decode, and that case only arises on blocks
+  the channel damaged badly. At a working SNR most blocks pass at $L = 1$, so
+  the average cost falls toward plain successive cancellation while the error
+  rate stays at $L$. Measured here at 6 dB on $N = 256$, $K = 128$: one
+  list-unit per block against a fixed $L = 8$ decoder's eight.
+
+  Requires a CRC, and says so with an error rather than silently escalating to
+  the maximum on every block — without one there is no signal that a decode
+  succeeded, so there is nothing to escalate on.
+
+  `AdaptiveDecodeReport` returns the list size that produced the bits, the CRC
+  verdict and the attempt count, because the cost actually paid is the whole
+  reason to prefer this over a fixed large list and a caller should be able to
+  see it.
+
 - **Mutation audit with `cargo-mutants`** (`mutants.toml`, plus the tests it
   demanded): 185 mutants across `bits`, `quantize`, `harq`, `segmentation` and
   `spsc_queue`. Six survived, every one a real gap, and all six are now closed.
