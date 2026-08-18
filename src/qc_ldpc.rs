@@ -45,6 +45,27 @@
 //! same two passes across the `z_idx in 0..Z` axis, which is independent
 //! per lane.
 //!
+//! # Where the time goes, and where it does not
+//!
+//! A layer streams three arrays. `q_row` and the extrinsic buffer are walked
+//! sequentially — the extrinsic offset is $(\text{layer\\_begin} +
+//! \text{edge}) \cdot Z$, so consecutive edges are consecutive memory — and
+//! the hardware prefetcher handles a forward stride unaided. The posterior is
+//! the exception: each edge reads $\mathrm{LLR}[c \cdot Z \mathinner{..}]$ for
+//! a column block $c$ taken from the base graph's edge list, which is a
+//! scatter no prefetcher can learn. At BG1 with $Z = 384$ that array is
+//! 104 KiB — inside L2, outside a 32 KiB L1 — so the natural conclusion is
+//! that the kernel is waiting on L2.
+//!
+//! It is not. Issuing a software prefetch for the next edge's column block
+//! measures at parity: 219.9 against 220.2 Melem/s, medians of nine
+//! interleaved runs of `ldpc_bench_export`, which is inside the run-to-run
+//! spread of either. The reason is that one edge's Q-build is roughly $Z/8$
+//! vector iterations of work, and the out-of-order window covers an L2 hit
+//! several times over before the next edge's loads retire. The loads are not
+//! on the critical path at production lifting sizes, so there is nothing for
+//! a prefetch to hide.
+//!
 //! # Lifting size sets (3GPP Table 5.3.2-1)
 //!
 //! | iLS | Lifting sizes Z                           |

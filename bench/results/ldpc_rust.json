@@ -1,6 +1,6 @@
 [
-  {"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":1236899.0,"mib_per_s":0,"melem_per_s":211.11,"n_variable_nodes":26112,"n_iters":10},
-  {"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":4043203.0,"mib_per_s":0,"melem_per_s":64.58,"n_variable_nodes":26112,"n_iters":10},
-  {"lang":"rust","impl":"loms_i8_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":304992.0,"mib_per_s":0,"melem_per_s":856.15,"n_variable_nodes":26112,"n_iters":10},
-  {"lang":"rust","impl":"loms_i8_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":4047169.0,"mib_per_s":0,"melem_per_s":64.52,"n_variable_nodes":26112,"n_iters":10}
+  {"lang":"rust","impl":"loms_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":1197748.0,"mib_per_s":0,"melem_per_s":218.01,"n_variable_nodes":26112,"n_iters":10},
+  {"lang":"rust","impl":"loms_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":3988017.0,"mib_per_s":0,"melem_per_s":65.48,"n_variable_nodes":26112,"n_iters":10},
+  {"lang":"rust","impl":"loms_i8_runtime_simd","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":307945.0,"mib_per_s":0,"melem_per_s":847.94,"n_variable_nodes":26112,"n_iters":10},
+  {"lang":"rust","impl":"loms_i8_scalar","shard_len":0,"data_shards":0,"parity_shards":0,"payload_bytes":26112,"ns_per_iter":3949112.0,"mib_per_s":0,"melem_per_s":66.12,"n_variable_nodes":26112,"n_iters":10}
 ]
