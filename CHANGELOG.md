@@ -5,10 +5,10 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] — 2026-08-18
 
-> **Compatibility: this cycle is a minor bump, not a patch.** Two changes break
-> against 0.4.0:
+> **Compatibility: this release is a minor bump, not a patch.** Two changes
+> break against 0.4.0:
 >
 > * **Reed-Solomon parity bytes change.** The generator matrix is now Cauchy,
 >   because the previous one could not recover every erasure pattern within the
