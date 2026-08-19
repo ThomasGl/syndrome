@@ -163,6 +163,121 @@ jobs:
       # src/float_ext.rs's test, as a plain `cargo test` (not requiring the
       # `no_std` feature at all -- see that test's doc comment for why).
 
+  # capi/ is a standalone package (own Cargo.toml/Cargo.lock, `path = ".."`
+  # dependency on the parent crate, not a workspace member -- see
+  # capi/src/lib.rs's module doc for why it cannot be a feature of the
+  # parent crate itself), so a plain `cargo test`/`clippy` run at the repo
+  # root never touches it. It needs its own job.
+  capi:
+    name: capi (C ABI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Test (Rust-side FFI tests)
+        working-directory: capi
+        run: cargo test
+
+      - name: Clippy
+        working-directory: capi
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build the real .so/.a
+        working-directory: capi
+        run: cargo build --release
+
+      # The strongest check this job does: an actual C program, compiled
+      # and linked against the built shared library by a real C compiler,
+      # not just Rust-side FFI tests exercising the same functions from
+      # inside the same binary.
+      - name: Compile and link a real C program against libsyndrome_capi.so
+        run: |
+          cat > /tmp/capi_check.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          typedef struct SyndromeLdpcEncoder SyndromeLdpcEncoder;
+          typedef struct SyndromeLdpcDecoder SyndromeLdpcDecoder;
+          extern int32_t syndrome_ldpc_encoder_create(int32_t, size_t, SyndromeLdpcEncoder **);
+          extern void syndrome_ldpc_encoder_destroy(SyndromeLdpcEncoder *);
+          extern size_t syndrome_ldpc_encoder_info_bit_count(const SyndromeLdpcEncoder *);
+          extern size_t syndrome_ldpc_encoder_codeword_bit_count(const SyndromeLdpcEncoder *);
+          extern int32_t syndrome_ldpc_encode_5g(const SyndromeLdpcEncoder *, const uint8_t *, size_t, size_t, uint8_t *, size_t);
+          extern int32_t syndrome_ldpc_decoder_create(int32_t, size_t, float, SyndromeLdpcDecoder **);
+          extern void syndrome_ldpc_decoder_destroy(SyndromeLdpcDecoder *);
+          extern size_t syndrome_ldpc_decoder_required_edge_buffer(const SyndromeLdpcDecoder *);
+          extern size_t syndrome_ldpc_decoder_required_layer_buffer(const SyndromeLdpcDecoder *);
+          extern int32_t syndrome_ldpc_decode_5g(SyndromeLdpcDecoder *, float *, size_t, size_t, float *, size_t, float *, size_t, uint8_t *, size_t, size_t, size_t *);
+          int main(void) {
+            SyndromeLdpcEncoder *enc = NULL;
+            if (syndrome_ldpc_encoder_create(0, 4, &enc) != 0 || !enc) return 1;
+            SyndromeLdpcDecoder *dec = NULL;
+            if (syndrome_ldpc_decoder_create(0, 4, 0.5f, &dec) != 0 || !dec) return 1;
+            size_t k = syndrome_ldpc_encoder_info_bit_count(enc);
+            size_t n = syndrome_ldpc_encoder_codeword_bit_count(enc);
+            uint8_t *info = malloc(k), *codeword = malloc(n), *hard = malloc(n);
+            for (size_t i = 0; i < k; i++) info[i] = (i % 3 == 0);
+            if (syndrome_ldpc_encode_5g(enc, info, k, 0, codeword, n) != 0) return 1;
+            float *llr = malloc(n * sizeof(float));
+            for (size_t i = 0; i < n; i++) llr[i] = codeword[i] ? -5.0f : 5.0f;
+            size_t el = syndrome_ldpc_decoder_required_edge_buffer(dec);
+            size_t ll = syndrome_ldpc_decoder_required_layer_buffer(dec);
+            float *edge_r = calloc(el, sizeof(float)), *layer = calloc(ll, sizeof(float));
+            size_t iters = 0;
+            if (syndrome_ldpc_decode_5g(dec, llr, n, 0, edge_r, el, layer, ll, hard, n, 10, &iters) != 0) return 1;
+            for (size_t i = 0; i < k; i++) if (hard[i] != info[i]) { fprintf(stderr, "mismatch at %zu\n", i); return 1; }
+            printf("capi C round trip OK: k=%zu n=%zu iters=%zu\n", k, n, iters);
+            syndrome_ldpc_encoder_destroy(enc);
+            syndrome_ldpc_decoder_destroy(dec);
+            return 0;
+          }
+          EOF
+          cc /tmp/capi_check.c -o /tmp/capi_check \
+            -L capi/target/release -lsyndrome_capi \
+            -Wl,-rpath,"$GITHUB_WORKSPACE/capi/target/release"
+          /tmp/capi_check
+
+  # embedded-demo/ is likewise a standalone package (see its README for
+  # why), and is not merely checked here -- it is actually cross-compiled
+  # AND run under QEMU, so a change that silently breaks execution (like
+  # the undersized heap the first version of this demo shipped with) fails
+  # this job instead of only ever being caught by whoever happens to run it
+  # by hand.
+  embedded-demo:
+    name: embedded-demo (Cortex-M4F, run under QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain, thumbv7em target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Install qemu-system-arm
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+
+      - name: Build the firmware
+        working-directory: embedded-demo
+        run: cargo build --release
+
+      - name: Run under QEMU and check for a real PASS
+        working-directory: embedded-demo
+        run: |
+          set -o pipefail
+          timeout 30 qemu-system-arm \
+            -M netduinoplus2 \
+            -semihosting-config enable=on,target=native \
+            -nographic \
+            -kernel target/thumbv7em-none-eabihf/release/syndrome-embedded-demo \
+            | tee /tmp/qemu-output.log
+          grep -q "RESULT: PASS" /tmp/qemu-output.log
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

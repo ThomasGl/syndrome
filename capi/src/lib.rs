@@ -1,28 +1,43 @@
-//! C ABI for the 5G NR QC-LDPC encoder/decoder.
+//! C ABI for `syndrome`'s 5G NR QC-LDPC encoder/decoder.
 //!
 //! Lets C, C++, or any language with a C FFI (Python `ctypes`/`cffi`, a
 //! CMake project via `corrosion`, GNU Radio's `gr-fec` OOT module pattern)
-//! call this crate's flagship codec without linking Rust. Every function
+//! call `syndrome`'s flagship codec without linking Rust. Every function
 //! here is a thin wrapper: it converts raw pointers to the same flat slices
-//! [`crate::qc_ldpc`] already takes, calls straight through, and converts
-//! [`crate::error::FecError`] into an [`SyndromeStatus`] code. No new
-//! algorithm lives in this file.
+//! [`syndrome::qc_ldpc`] already takes, calls straight through, and converts
+//! [`syndrome::FecError`] into an [`SyndromeStatus`] code. No new algorithm
+//! lives in this crate.
+//!
+//! # Why this is its own package, not a feature of `syndrome` itself
+//!
+//! It used to be: a `capi` feature gating `src/capi.rs`, with `[lib]
+//! crate-type = ["rlib", "staticlib", "cdylib"]` declared unconditionally in
+//! `syndrome`'s own Cargo.toml. That broke the moment `syndrome` also grew a
+//! `no_std` feature: declaring `staticlib`/`cdylib` makes rustc require the
+//! crate be self-sufficient for *every* build of the lib target -- a global
+//! allocator, a panic handler -- regardless of which Cargo features are
+//! active, which a `#![no_std]` *library* crate (one that expects its
+//! eventual consumer, not itself, to supply those) cannot satisfy. Splitting
+//! the C ABI into this separate package, depending on `syndrome` as an
+//! ordinary path dependency, is the same fix `embedded-demo/` already uses
+//! for the same underlying reason: a final linked artifact's requirements
+//! don't belong on the library crate other things build on top of.
 //!
 //! # Scope
 //!
 //! Covers 5G NR QC-LDPC encode/decode ([`QcLdpcEncoder::encode_5g`],
-//! [`QcLdpcDecoder::decode_5g`]) only — the crate's most complete, most
+//! [`QcLdpcDecoder::decode_5g`]) only — `syndrome`'s most complete, most
 //! heavily tested path, and the one every piece of prior-art research
 //! (GNU Radio's `gr-dvbs2rx`, `daniestevez/ldpc-toolbox`'s C-callable
-//! staticlib) actually integrates through. The other 8 codecs in this
-//! crate have no C entry point yet; extending this module to them is
+//! staticlib) actually integrates through. The other 8 codecs in
+//! `syndrome` have no C entry point yet; extending this crate to them is
 //! straightforward (the pattern below is the same for each) but not done.
 //!
 //! # Buffer ownership
 //!
 //! Every buffer (LLR, scratch, hard-decision output, info bits, codeword)
 //! is caller-allocated and caller-owned, exactly like the underlying Rust
-//! API — this module performs no heap allocation beyond the decoder/encoder
+//! API — this crate performs no heap allocation beyond the decoder/encoder
 //! handle itself. Use the `*_required_*` size-query functions to size
 //! buffers correctly; passing an undersized buffer returns
 //! [`SyndromeStatus::BufferTooSmall`] rather than reading or writing out of
@@ -38,23 +53,19 @@
 //!
 //! # Building the C-callable artifact
 //!
-//! This module only compiles with `--features capi`. The crate additionally
-//! declares `staticlib`/`cdylib` crate-types unconditionally (see `[lib]` in
-//! `Cargo.toml`), so a C project links against
-//! `target/release/libsyndrome.{a,so}` after building with:
-//!
 //! ```text
-//! cargo build --release --features capi
+//! cd capi && cargo build --release
 //! ```
 //!
-//! A minimal C header matching this module is not generated automatically
-//! (no `cbindgen` dependency has been added — see `Cargo.toml`'s
+//! links a C project against `target/release/libsyndrome_capi.{a,so}`.
+//!
+//! A minimal C header matching this crate is not generated automatically
+//! (no `cbindgen` dependency has been added — see the parent crate's
 //! keep-dependencies-light policy); the function signatures below are the
 //! source of truth until one is.
 
-use crate::error::FecError;
-use crate::qc_ldpc::{BaseGraph, QcLdpcDecoder, QcLdpcEncoder};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use syndrome::{BaseGraph, FecError, QcLdpcDecoder, QcLdpcEncoder};
 
 /// Status code returned by every function in this module. Mirrors
 /// [`FecError`]'s variants plus two FFI-specific ones.
@@ -69,7 +80,7 @@ pub enum SyndromeStatus {
     /// See [`FecError::CrcMismatch`]. Never returned by the functions in
     /// this module today (5G LDPC encode/decode does not check a CRC
     /// itself), reserved for when this module's scope grows to
-    /// [`crate::transport_block`].
+    /// [`syndrome::transport_block`].
     CrcMismatch = -2,
     /// See [`FecError::DecoderNotConverged`].
     DecoderNotConverged = -3,

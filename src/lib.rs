@@ -21,7 +21,7 @@
 //! # `no_std`
 //!
 //! The `no_std` feature (off by default) builds the core FEC algorithms —
-//! everything except `affinity`, `capi`, `channel_sim`/`montecarlo`, and
+//! everything except `affinity`, `channel_sim`/`montecarlo`, and
 //! `ldpc_pipeline`'s threaded worker pool — against `core` + `alloc` instead
 //! of `std`. See that feature's doc comment in `Cargo.toml` for exactly
 //! what is and is not covered, and why.
@@ -46,13 +46,6 @@ pub mod bch;
 pub mod bg_tables;
 pub mod bits;
 pub mod bluetooth;
-// `capi`'s panic guard needs `std::panic::catch_unwind`, so it additionally
-// requires `no_std` to be off -- not just documented in the `no_std`
-// feature's Cargo.toml comment, but actually enforced here, so enabling
-// both features together fails to compile capi.rs instead of silently
-// trying to build std-only code under no_std.
-#[cfg(all(feature = "capi", not(feature = "no_std")))]
-pub mod capi;
 #[cfg(not(feature = "no_std"))]
 pub mod channel_sim;
 pub mod crc;

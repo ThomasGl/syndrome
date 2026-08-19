@@ -26,13 +26,13 @@ categories = ["algorithms", "encoding"]
 # names generic enough to collide with other crates. Only the `syndrome` demo
 # binary (src/main.rs) should be installable. `bench/` goes with them because
 # `bench/run_all.sh` drives those exporters — shipping one without the other
-# would leave a harness that cannot run. `embedded-demo/` is its own
-# `publish = false` package (a bare-metal firmware demo with its own
-# Cargo.toml/Cargo.lock, deliberately not a workspace member -- see its
-# README) with dependencies (cortex-m-rt, embedded-alloc, ...) that make no
-# sense pulled into this library's own graph; publishing it alongside
-# `syndrome` would also make `cargo install syndrome` try to install its
-# bare-metal binary.
+# would leave a harness that cannot run. `embedded-demo/` and `capi/` are
+# each their own `publish = false` package (own Cargo.toml/Cargo.lock,
+# deliberately not workspace members -- see their READMEs / capi/src/lib.rs's
+# module doc) with dependencies (cortex-m-rt, embedded-alloc, ... for the
+# former) or a `[lib] crate-type` (for the latter) that make no sense pulled
+# into this library's own graph; publishing either alongside `syndrome`
+# would also make `cargo install syndrome` try to install their binaries.
 exclude = [
     "src/bin/",
     "bench/",
@@ -41,6 +41,7 @@ exclude = [
     "proptest-regressions/",
     "CLAUDE.md",
     "embedded-demo/",
+    "capi/",
 ]
 
 # rustdoc renders `$...$` in doc comments as literal text — it has no math
@@ -59,17 +60,6 @@ exclude = [
 [package.metadata.docs.rs]
 rustdoc-args = ["--html-in-header", "katex-header.html"]
 all-features = true
-
-# Declared unconditionally (Cargo has no per-feature crate-type) so a C/C++
-# consumer can link `target/{debug,release}/libsyndrome.{a,so}` after
-# `cargo build --features capi` -- see `src/capi.rs`'s module doc for what
-# that surface covers. `staticlib`/`cdylib` cost an extra link step on every
-# build (this crate or a downstream Rust dependent), not extra compilation;
-# `rlib` stays first so a plain `cargo build`/`cargo test` (no `--features
-# capi`) still produces it as the primary artifact, exactly as before this
-# was added.
-[lib]
-crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 core_affinity = { version = "0.6", optional = true }
@@ -107,13 +97,6 @@ serde_json = "1.0"
 # added later, introducing a feature for it is backward-compatible.
 affinity = ["core_affinity"]
 
-# Compiles src/capi.rs, the C ABI for the 5G NR QC-LDPC encoder/decoder --
-# see that module's doc for scope and the `[lib] crate-type` note above for
-# why this is a feature rather than always-on (no meaningful Rust caller
-# exists for `extern "C"` symbols; a pure-Rust consumer should never pay to
-# have them exported).
-capi = []
-
 # #![no_std] + alloc build of the core FEC algorithms (LDPC, Viterbi, Turbo,
 # Polar, Reed-Solomon, BCH, Golay, Hamming, CRC, Wi-Fi/Bluetooth profiles,
 # the transport-block chain's sequential path, and the lock-free SPSC ring).
@@ -121,13 +104,17 @@ capi = []
 # ever add capability, never take any away from an existing consumer.
 #
 # NOT covered, deliberately excluded from the no_std build rather than
-# half-ported: `affinity` (an OS thread-affinity API), `capi` (its panic
-# guard needs `std::panic::catch_unwind`, which needs unwinding support an
-# embedded target may not even build with), `channel_sim`/`montecarlo`
-# (Monte Carlo / BER simulation utilities for testing this crate against
-# itself on a host machine -- nothing an embedded target decoding real
-# frames would call), and `ldpc_pipeline`'s threaded worker pool (needs
-# `std::thread`; `transport_block::DlSchDecoder::with_pipeline` opts into it
+# half-ported: `affinity` (an OS thread-affinity API), the C ABI (now its
+# own package, `capi/` -- see that package's `src/lib.rs` module doc for why
+# it can never be a feature of this crate itself: declaring `[lib]
+# crate-type = ["staticlib", "cdylib"]` here would require a global
+# allocator + panic handler for every build of the lib target, which a
+# `#![no_std]` library crate cannot supply for its eventual consumer),
+# `channel_sim`/`montecarlo` (Monte Carlo / BER simulation utilities for
+# testing this crate against itself on a host machine -- nothing an
+# embedded target decoding real frames would call), and `ldpc_pipeline`'s
+# threaded worker pool (needs `std::thread`;
+# `transport_block::DlSchDecoder::with_pipeline` opts into it
 # and is excluded along with it -- the sequential decode path stays
 # available). Still allocates (`Vec`-based scratch, built once at
 # construction on the hot-path types, exactly as the std build does) --

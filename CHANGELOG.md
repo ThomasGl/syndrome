@@ -5,6 +5,86 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`no_std` feature: a real `#![no_std]` + `alloc` build of the core FEC
+  algorithms** — QC-LDPC, Viterbi, Turbo, Polar, Reed-Solomon, BCH, Golay,
+  Hamming, CRC, the Wi-Fi/Bluetooth profiles, the transport-block chain's
+  sequential decode path, and the lock-free SPSC ring, against `core` +
+  `alloc` instead of `std`. Off by default; the default build is unchanged
+  std. Verified by cross-compiling to `thumbv7em-none-eabihf` (a real
+  Cortex-M4F target) and to the native host triple (the x86-64 AVX2 SIMD
+  path only compiles on the latter), and by actually running the result:
+  `embedded-demo/` is a standalone bare-metal firmware package that
+  encodes, quantizes, and decodes a real BG2 (Z=128) codeword under
+  `#![no_std] #![no_main]`, boots under QEMU's `netduinoplus2` (Cortex-M4F)
+  machine model, and reports a real PASS over ARM semihosting. Not
+  covered, deliberately: `affinity` (an OS thread-affinity API), the C ABI
+  (needs `std::panic::catch_unwind`), `channel_sim`/`montecarlo`
+  (host-side simulation utilities), and `LdpcPipeline`'s threaded worker
+  pool (needs `std::thread` — `DlSchDecoder::with_pipeline` is excluded
+  along with it; the sequential decode path stays available). See
+  `[features] no_std` in Cargo.toml for the full scope note.
+- **`GilbertElliottChannel`** (`channel_sim` module) — a two-state
+  Markov burst-error channel (Gilbert 1960, Elliott 1963), for testing
+  decoders against clustered rather than independent errors.
+  `transmit_hard` returns the bit-flipped codeword directly;
+  `transmit`/`transmit_with_states` return genie-aided soft LLRs computed
+  from the known per-bit crossover probability, documented as an
+  optimistic bound for the same reason `RayleighBlockChannel`'s
+  perfect-CSI assumption is.
+- **A C ABI for the 5G NR QC-LDPC encode/decode path**, in a new standalone
+  package, `capi/` (not part of the published `syndrome` crate — see
+  below). Opaque create/destroy handles, size-query functions, and
+  `encode_5g`/`decode_5g` wrappers; every function runs inside
+  `catch_unwind` and returns an `i32` status code rather than using
+  `Result`/`panic!` across the FFI boundary. Verified with a real C
+  program compiled and linked against the built shared library, not only
+  Rust-side FFI tests.
+
+### Fixed
+
+- **Viterbi decode silently corrupted for constraint lengths 10–16** —
+  advertised as supported since `MAX_CONSTRAINT_LENGTH` was introduced, but
+  never exercised past `k=9` by the existing property test.
+  `TrellisTable::next_state` and the shared traceback buffer stored state
+  indices as `u8`; `n_states = 2^(k-1)` exceeds 255 once `k ≥ 10`, so every
+  next-state above 255 wrapped. Widened to `u16` across every scalar/AVX2/
+  NEON call site. Purely an internal-representation fix — no public
+  signature changes.
+- **`serde_json` was a mandatory dependency nothing in `src/` uses** — only
+  the 3 `src/bin/` JSON exporters (already excluded from the published
+  tarball) need it. Moved to an optional dependency behind a new
+  `bench-export` feature.
+- The README's "Standards" line claimed DVB-S2 and CCSDS support that does
+  not exist (`golay.rs`/`bch.rs` mention them only as historical context
+  for generic code families they share parameters with — no dedicated
+  module, no conformance test). Claim removed.
+- The "6G Research" badge sat at equal visual weight to the real, tested
+  5G NR/Wi-Fi 7 standards badges; `sixg.rs` is link-adaptation parameter
+  tables over the existing 5G LDPC/Polar kernels, not a distinct FEC
+  algorithm, and no 6G FEC standard is ratified yet. Badge removed; the
+  same qualifier added inline wherever 6G is listed next to real standards.
+
+### Changed
+
+- Reworded "in safe Rust" (README, `Cargo.toml` description) to name the
+  real number instead: "safe-by-default ... Miri-verified unsafe confined
+  to the SIMD and lock-free cores" (~101 unsafe sites, all SIMD dispatch or
+  the two Miri-checked lock-free structures).
+- The C ABI moved from an in-crate `capi` feature (`src/capi.rs`,
+  `[lib] crate-type = ["rlib", "staticlib", "cdylib"]` declared
+  unconditionally in this crate's own `Cargo.toml`) to the standalone
+  `capi/` package described above. Declaring `staticlib`/`cdylib` on the
+  library crate itself required a global allocator and panic handler for
+  *every* build of the lib target regardless of which Cargo feature was
+  active — incompatible with the `no_std` feature above the moment both
+  existed in the same tree. This was never published in a released
+  version, so nothing downstream breaks; `cargo build --features capi`
+  is now `cd capi && cargo build --release`.
+
 ## [0.5.1] — 2026-08-18
 
 ### Fixed
