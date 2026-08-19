@@ -26,7 +26,13 @@ categories = ["algorithms", "encoding"]
 # names generic enough to collide with other crates. Only the `syndrome` demo
 # binary (src/main.rs) should be installable. `bench/` goes with them because
 # `bench/run_all.sh` drives those exporters — shipping one without the other
-# would leave a harness that cannot run.
+# would leave a harness that cannot run. `embedded-demo/` is its own
+# `publish = false` package (a bare-metal firmware demo with its own
+# Cargo.toml/Cargo.lock, deliberately not a workspace member -- see its
+# README) with dependencies (cortex-m-rt, embedded-alloc, ...) that make no
+# sense pulled into this library's own graph; publishing it alongside
+# `syndrome` would also make `cargo install syndrome` try to install its
+# bare-metal binary.
 exclude = [
     "src/bin/",
     "bench/",
@@ -34,6 +40,7 @@ exclude = [
     ".github/",
     "proptest-regressions/",
     "CLAUDE.md",
+    "embedded-demo/",
 ]
 
 # rustdoc renders `$...$` in doc comments as literal text — it has no math

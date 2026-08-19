@@ -178,8 +178,9 @@ syndrome/
 │   └── run_all.sh          — Orchestration + byte-identical checksum gate
 ├── data/
 │   └── bg_tables.json      — BG1/BG2 extracted from 3GPP TS 38.212
-└── tools/
-    └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+├── tools/
+│   └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+└── embedded-demo/          — Bare-metal no_std firmware demo, own package (see §5.6)
 ```
 
 ---
@@ -846,6 +847,50 @@ The waterfall region (0.5 → 1.5 dB) represents **~6 dB coding gain** over unco
 ```
 push + pop: ~1.1 ns  (AtomicUsize head/tail, no syscall)
 ```
+
+### 5.6 no_std embedded firmware footprint
+
+The `no_std` feature (off by default; see `[features]` in Cargo.toml for
+exact scope) builds the core algorithms against `core`+`alloc` instead of
+`std`. `embedded-demo/` proves that with a real firmware image, not just a
+`cargo check`: a bare-metal Cortex-M4F binary (`thumbv7em-none-eabihf`)
+encoding, quantizing, and decoding one BG2 (Z=128) codeword through the
+fixed-point LOMS kernel — and it has actually been **run**, under QEMU's
+`netduinoplus2` (Cortex-M4F) machine model over ARM semihosting, not just
+linked. Real output, 2026-08-19:
+
+```
+syndrome-embedded-demo: bg=BG2 z=128 k=1280 n=6656 iterations_used=1
+RESULT: PASS -- decoded info bits matched the encoded input exactly
+```
+
+QEMU exits 0 — the firmware's own semihosting exit call, not a timeout.
+Size, measured the same day with `llvm-size` on that build's `--release`
+output (`opt-level = "z"`, LTO, one codegen unit):
+
+```
+.text:  35,288 bytes (~34.5 KiB)  -- LDPC encoder/decoder + cortex-m-rt + panic/semihosting handlers + allocator
+.data:       0 bytes              -- no initialized-nonzero globals
+.bss:  131,108 bytes (~128.0 KiB) -- almost entirely a 128 KiB static heap, bisected against real QEMU runs, not guessed
+```
+
+That heap size is itself a real-execution finding, not a static guess: the
+first version of this demo shipped with a 64 KiB heap chosen without
+measurement, and the first time it actually ran, it hit a real failed
+allocation partway through decode. Bisecting against real QEMU runs found
+64 KiB fails, 96 KiB is the smallest size that completes and reports PASS,
+and 128 KiB (what ships) is that measured floor plus headroom.
+
+What this still does **not** include: hardware timing. QEMU's Cortex-M core
+runs under dynamic binary translation, not a cycle-accurate model of any
+specific silicon, and this build's `netduinoplus2` machine model doesn't
+implement the DWT cycle counter at all — every reading came back exactly
+zero, a real QEMU gap rather than a bug here, and reporting "0 cycles"
+would be a worse lie than reporting nothing. So no throughput or latency
+number is claimed. See `embedded-demo/README.md` for the full scope note,
+the exact QEMU command (including how to get `qemu-system-arm` running
+with no root/sudo, via `apt-get download` plus manual extraction — exactly
+how the run above was produced), and how to reproduce these numbers.
 
 To reproduce all benchmarks:
 ```bash
