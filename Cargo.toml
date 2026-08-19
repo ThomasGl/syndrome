@@ -50,6 +50,17 @@ exclude = [
 rustdoc-args = ["--html-in-header", "katex-header.html"]
 all-features = true
 
+# Declared unconditionally (Cargo has no per-feature crate-type) so a C/C++
+# consumer can link `target/{debug,release}/libsyndrome.{a,so}` after
+# `cargo build --features capi` -- see `src/capi.rs`'s module doc for what
+# that surface covers. `staticlib`/`cdylib` cost an extra link step on every
+# build (this crate or a downstream Rust dependent), not extra compilation;
+# `rlib` stays first so a plain `cargo build`/`cargo test` (no `--features
+# capi`) still produces it as the primary artifact, exactly as before this
+# was added.
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 core_affinity = { version = "0.6", optional = true }
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -58,9 +69,8 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_json = "1.0"
 
 [features]
-# Enable thread-affinity helpers. This is the crate's only feature: it is the
-# only one that gates real code (`#[cfg(feature = "affinity")]` in src/affinity.rs),
-# and it exists because it pulls an optional dependency.
+# Enable thread-affinity helpers (`#[cfg(feature = "affinity")]` in
+# src/affinity.rs); exists because it pulls an optional dependency.
 #
 # There are deliberately NO `simd`/`simd_avx2`/`simd_neon` features. SIMD is not
 # opt-in: the AVX2 kernels dispatch at runtime via `is_x86_feature_detected!` and
@@ -72,6 +82,13 @@ serde_json = "1.0"
 # 0.1.0 rather than after. If a genuine compile-time SIMD or `#![no_std]` switch is
 # added later, introducing a feature for it is backward-compatible.
 affinity = ["core_affinity"]
+
+# Compiles src/capi.rs, the C ABI for the 5G NR QC-LDPC encoder/decoder --
+# see that module's doc for scope and the `[lib] crate-type` note above for
+# why this is a feature rather than always-on (no meaningful Rust caller
+# exists for `extern "C"` symbols; a pure-Rust consumer should never pay to
+# have them exported).
+capi = []
 
 [dev-dependencies]
 proptest = "1.4"

@@ -30,6 +30,8 @@ pub mod bch;
 pub mod bg_tables;
 pub mod bits;
 pub mod bluetooth;
+#[cfg(feature = "capi")]
+pub mod capi;
 pub mod channel_sim;
 pub mod crc;
 pub mod error;
