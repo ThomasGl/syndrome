@@ -59,6 +59,7 @@
 //! assert!(crc.check(&bits));
 //! ```
 
+use crate::alloc_prelude::*;
 /// Identifies which CRC polynomial to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrcKind {

@@ -17,6 +17,18 @@
 //!
 //! Designed for zero-allocation hot paths, AVX2 (x86-64) and NEON (AArch64)
 //! SIMD acceleration, and lock-free SPSC pipeline concurrency.
+//!
+//! # `no_std`
+//!
+//! The `no_std` feature (off by default) builds the core FEC algorithms —
+//! everything except `affinity`, `capi`, `channel_sim`/`montecarlo`, and
+//! `ldpc_pipeline`'s threaded worker pool — against `core` + `alloc` instead
+//! of `std`. See that feature's doc comment in `Cargo.toml` for exactly
+//! what is and is not covered, and why.
+#![cfg_attr(feature = "no_std", no_std)]
+
+#[cfg(feature = "no_std")]
+extern crate alloc;
 
 /// This crate's version, captured at compile time from `Cargo.toml`.
 ///
@@ -25,18 +37,25 @@
 /// their own version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub(crate) mod alloc_prelude;
+pub(crate) mod float_ext;
+
+#[cfg(not(feature = "no_std"))]
 pub mod affinity;
 pub mod bch;
 pub mod bg_tables;
 pub mod bits;
 pub mod bluetooth;
+#[cfg(not(feature = "no_std"))]
 pub mod channel_sim;
 pub mod crc;
 pub mod error;
 pub mod golay;
 pub mod hamming;
 pub mod harq;
+#[cfg(not(feature = "no_std"))]
 pub mod ldpc_pipeline;
+#[cfg(not(feature = "no_std"))]
 pub mod montecarlo;
 pub mod polar;
 pub mod qc_ldpc;
@@ -62,6 +81,7 @@ pub(crate) mod simd_avx2;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod simd_neon;
 
+#[cfg(not(feature = "no_std"))]
 pub use affinity::pin_to_core;
 pub use bch::{BchCode, Chase2Report};
 pub use bg_tables::*;
@@ -71,6 +91,7 @@ pub use error::FecError;
 pub use golay::GolayCode;
 pub use hamming::{Hamming74, decode_hamming_7_4, encode_hamming_7_4};
 pub use harq::HarqBuffer;
+#[cfg(not(feature = "no_std"))]
 pub use ldpc_pipeline::{LdpcFrame, LdpcPipeline};
 pub use polar::{AdaptiveDecodeReport, PolarDecoder, PolarEncoder};
 pub use qc_ldpc::{BaseGraph, LdpcWorkspace, QcLdpcDecoder, QcLdpcEncoder};

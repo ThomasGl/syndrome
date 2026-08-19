@@ -84,15 +84,26 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run Clippy with every feature enabled
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # NOT --all-features: `no_std` and `--all-targets` (tests) do not mix
+      # (test code throughout the crate uses Vec/Box implicitly via std's
+      # prelude and was never ported -- no `#[cfg(test)]` code ships in the
+      # `no_std` build, so it never needed to be). `affinity`+`bench-export`
+      # are the two features real Rust callers can combine with tests.
+      - name: Run Clippy with std-compatible features enabled
+        run: cargo clippy --all-targets --features affinity,bench-export -- -D warnings
+
+      # `no_std`'s own check (lib only, matches what it can actually build)
+      # lives in the `no-std` job below, cross-compiled to a real embedded
+      # target rather than just checked on the runner's host triple.
 
   # Every feature flag must build on its own. Enabling only the umbrella
   # `simd` feature once silently pulled in a nightly-only `portable_simd`
   # path that no default-feature job ever compiled, so the advertised
   # feature was broken on stable without CI noticing. Check each in turn.
-  # (`affinity` is now the crate's only feature — see [features] in Cargo.toml
-  # for why the inert SIMD/cortex-m flags were removed.)
+  # `no_std` is deliberately NOT in this matrix: unlike the others it changes
+  # `--all-targets` results (tests don't build under it -- see the `no-std`
+  # job below, which checks what it actually promises: the library only,
+  # cross-compiled to a real embedded target).
   features:
     name: Feature Matrix
     runs-on: ubuntu-latest
@@ -101,6 +112,7 @@ jobs:
       matrix:
         feature:
           - affinity
+          - bench-export
     steps:
       - uses: actions/checkout@v4
 
@@ -113,8 +125,43 @@ jobs:
       - name: Check --no-default-features
         run: cargo check --no-default-features
 
-      - name: Check --all-features
-        run: cargo check --all-targets --all-features
+      # NOT --all-features (see `no_std`'s comment above this matrix).
+      - name: Check --all-targets with every std-compatible feature enabled
+        run: cargo check --all-targets --features affinity,bench-export
+
+  # #![no_std]+alloc build of the core algorithms (see the `no_std` feature's
+  # doc comment in Cargo.toml for exact scope). Cross-compiled to a real
+  # Cortex-M4F target rather than merely checked on the runner's host triple
+  # -- `is_x86_feature_detected!`/`std::arch` mistakes and similar would not
+  # show up checking against a std-having host at all, since those symbols
+  # would just resolve normally there.
+  no-std:
+    name: no_std (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain with clippy, thumbv7em target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: thumbv7em-none-eabihf
+
+      - name: Check --lib
+        run: cargo check --no-default-features --features no_std --target thumbv7em-none-eabihf --lib
+
+      - name: Clippy --lib
+        run: cargo clippy --no-default-features --features no_std --target thumbv7em-none-eabihf --lib -- -D warnings
+
+      # Also check the native host triple: thumbv7em never compiles
+      # simd_avx2.rs (target_arch != "x86_64") at all, so it alone can't
+      # catch a `std::arch`/`is_x86_feature_detected!` mistake there.
+      - name: Check --lib on host (exercises the x86-64 SIMD path too)
+        run: cargo check --no-default-features --features no_std --lib
+
+      # `libm`'s output is checked against `std`'s directly in
+      # src/float_ext.rs's test, as a plain `cargo test` (not requiring the
+      # `no_std` feature at all -- see that test's doc comment for why).
 
   fmt:
     name: Rustfmt

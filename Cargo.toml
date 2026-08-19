@@ -9,9 +9,12 @@ authors = ["Thomas Glezer <thomas.glezer@hotmail.com>"]
 readme = "README.md"
 repository = "https://github.com/ThomasGl/syndrome"
 keywords = ["fec", "ldpc", "5g", "reed-solomon", "simd"]
-# "no-std" deliberately NOT claimed: the crate currently requires std (threads,
-# Vec-based construction). Add the category if and when a real #![no_std] core
-# build exists.
+# "no-std" deliberately NOT claimed as a *category*, even though the `no_std`
+# feature below now gives a real #![no_std]+alloc build: crates.io categories
+# apply unconditionally to the whole crate regardless of which feature a
+# given consumer enables, and the default build (no_std feature off) still
+# requires std. Revisit if the crate ever makes no_std the unconditional
+# default rather than an opt-in feature.
 categories = ["algorithms", "encoding"]
 
 # The published tarball is the library, its examples, and its tests. The
@@ -52,7 +55,17 @@ all-features = true
 
 [dependencies]
 core_affinity = { version = "0.6", optional = true }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+# Optional: only `src/bin/{ber_sim,ldpc_pipeline_bench,ldpc_convergence_export}.rs`
+# use it (excluded from the published tarball, see `exclude` above), and it
+# needs std -- a mandatory dependency here would also have blocked the
+# `no_std` feature below. `cargo build --bins` needs `--features
+# bench-export` to build those three exporters.
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
+# Pure-Rust libm, used only behind the `no_std` feature: core has no
+# `sqrt`/`round`/`powf`/`exp`/`ln_1p` etc. (they need a math library, which
+# `std` gets from the platform's libm and `core` deliberately does not
+# assume). See src/float_ext.rs.
+libm = { version = "0.2", optional = true }
 
 [build-dependencies]
 serde_json = "1.0"
@@ -73,10 +86,68 @@ serde_json = "1.0"
 # added later, introducing a feature for it is backward-compatible.
 affinity = ["core_affinity"]
 
+# #![no_std] + alloc build of the core FEC algorithms (LDPC, Viterbi, Turbo,
+# Polar, Reed-Solomon, BCH, Golay, Hamming, CRC, Wi-Fi/Bluetooth profiles,
+# the transport-block chain's sequential path, and the lock-free SPSC ring).
+# Off by default -- the default build is unchanged std -- so this can only
+# ever add capability, never take any away from an existing consumer.
+#
+# NOT covered, deliberately excluded from the no_std build rather than
+# half-ported: `affinity` (an OS thread-affinity API), `capi` (its panic
+# guard needs `std::panic::catch_unwind`, which needs unwinding support an
+# embedded target may not even build with), `channel_sim`/`montecarlo`
+# (Monte Carlo / BER simulation utilities for testing this crate against
+# itself on a host machine -- nothing an embedded target decoding real
+# frames would call), and `ldpc_pipeline`'s threaded worker pool (needs
+# `std::thread`; `transport_block::DlSchDecoder::with_pipeline` opts into it
+# and is excluded along with it -- the sequential decode path stays
+# available). Still allocates (`Vec`-based scratch, built once at
+# construction on the hot-path types, exactly as the std build does) --
+# this is not an allocation-free/bare-metal build; it targets a
+# microcontroller with a working heap allocator (`#[global_allocator]`),
+# which is the realistic embedded target for this crate's memory footprint
+# (an f32 LDPC decode scratch buffer is hundreds of KiB at 5G's largest
+# lifting size; the smallest QC-LDPC configurations are tens of KiB).
+#
+# Verified by cross-compiling the library (not running it -- no test
+# hardware) for thumbv7em-none-eabihf, a real Cortex-M4F target.
+no_std = ["dep:libm"]
+
+# Enables `serde_json` for the 3 src/bin/ exporters that emit JSON. Not
+# needed by the library itself, and not needed by `bench/run_all.sh` (its two
+# `cargo run` targets, bench_export/ldpc_bench_export, don't use JSON).
+bench-export = ["dep:serde_json"]
+
+# Explicit [[bin]] entries (Cargo auto-discovers src/bin/*.rs otherwise) only
+# for the 3 exporters that need `serde_json`: `required-features` makes Cargo
+# skip building/testing them unless `--features bench-export` is passed,
+# instead of failing to compile every plain `cargo build --bins`/`cargo test`.
+# The other 5 src/bin/ binaries stay auto-discovered.
+[[bin]]
+name = "ber_sim"
+required-features = ["bench-export"]
+
+[[bin]]
+name = "ldpc_pipeline_bench"
+required-features = ["bench-export"]
+
+[[bin]]
+name = "ldpc_convergence_export"
+required-features = ["bench-export"]
+
 [dev-dependencies]
 proptest = "1.4"
 once_cell = "1.20"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Unconditional (not the optional `no_std`-gated one): `cargo test --features
+# no_std` does not build -- test code throughout the crate uses Vec/Box
+# implicitly via std's prelude and was never ported (no `#[cfg(test)]` code
+# ships in the `no_std` build, so it never needed to be), so that is not a
+# meaningful combination to run. This dev-dependency exists so
+# `src/float_ext.rs`'s test can call `libm::` directly and check its output
+# against `std`'s, in a plain `cargo test --all` run, without needing the
+# `no_std` feature (or its 334 cascading test-code errors) at all.
+libm = "0.2"
 
 # loom is only ever compiled under `--cfg loom`, which nothing but the model
 # check sets — so it is absent from an ordinary build, from `cargo test`, and

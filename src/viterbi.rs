@@ -127,7 +127,7 @@
 //!   channel it does not describe and "minimum Hamming distance" stops
 //!   coinciding with "most likely". The soft path's correlation metric is
 //!   the ML metric for BPSK over AWGN, which is where the LLRs from
-//!   [`crate::channel_sim::AwgnChannel`] come from. Hard decisions on a
+//!   `crate::channel_sim::AwgnChannel` (not linked: absent under the `no_std` feature) come from. Hard decisions on a
 //!   soft channel discard information and cost roughly 2 dB; that is a
 //!   property of quantizing the input, not a defect in the search.
 //!
@@ -155,6 +155,7 @@
 //! assert_eq!(decoded, info);
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 
 /// Largest constraint length accepted by [`ViterbiDecoder::new`]/
@@ -921,7 +922,7 @@ pub struct ViterbiDecoder {
     /// `RefCell` because `decode_hard`/`decode_soft` take `&self` (preserving
     /// their public signature); borrowing is uncontended (single-threaded,
     /// non-reentrant use per call).
-    scratch: std::cell::RefCell<ViterbiScratch>,
+    scratch: core::cell::RefCell<ViterbiScratch>,
 }
 
 /// Maximum number of WAVA "laps" (full passes around the circular block,
@@ -966,7 +967,7 @@ impl ViterbiDecoder {
         Self::check_k(k)?;
         let (g0, g1) = default_generators(k);
         let trellis = TrellisTable::build(k, g0, g1);
-        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
+        let scratch = core::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
             trellis,
@@ -1001,7 +1002,7 @@ impl ViterbiDecoder {
     pub fn with_generators(k: usize, g0: u32, g1: u32) -> Result<Self, FecError> {
         Self::check_k(k)?;
         let trellis = TrellisTable::build(k, g0, g1);
-        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
+        let scratch = core::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
             trellis,
@@ -1169,7 +1170,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_hard(&self, coded: &[u8]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_hard_avx2(coded);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1231,7 +1232,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_hard`](Self::decode_hard) after checking
-    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `n_states == 64` and `crate::simd_avx2::avx2_available()`; exposed as
     /// `pub(crate)` for the equivalence tests, which perform the same check.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn decode_hard_avx2(&self, coded: &[u8]) -> Vec<u8> {
@@ -1363,7 +1364,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_soft(&self, llr: &[f32]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_soft_avx2(llr);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1425,7 +1426,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_soft`](Self::decode_soft) after checking
-    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `n_states == 64` and `crate::simd_avx2::avx2_available()`; exposed as
     /// `pub(crate)` for the equivalence tests, which perform the same check.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn decode_soft_avx2(&self, llr: &[f32]) -> Vec<u8> {
@@ -1584,7 +1585,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_hard_tail_biting(&self, coded: &[u8]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_hard_tail_biting_avx2(coded);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1669,7 +1670,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)
-    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// after checking `n_states == 64` and `crate::simd_avx2::avx2_available()`;
     /// exposed as `pub(crate)` for the equivalence tests, which perform the
     /// same check.
     #[cfg(target_arch = "x86_64")]
@@ -1819,7 +1820,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_soft_tail_biting(&self, llr: &[f32]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_soft_tail_biting_avx2(llr);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1899,7 +1900,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_soft_tail_biting`](Self::decode_soft_tail_biting)
-    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// after checking `n_states == 64` and `crate::simd_avx2::avx2_available()`;
     /// exposed as `pub(crate)` for the equivalence tests, which perform the
     /// same check.
     #[cfg(target_arch = "x86_64")]
@@ -2253,7 +2254,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_soft_avx2_matches_scalar_on_random_noisy_llrs() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2288,7 +2289,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_hard_avx2_matches_scalar_on_random_bit_flips() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2568,7 +2569,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_hard_tail_biting_avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2597,7 +2598,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_soft_tail_biting_avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }

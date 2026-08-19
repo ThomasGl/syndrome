@@ -9,7 +9,7 @@ use core::fmt;
 /// Errors returned by the 5G NR FEC processing chain.
 ///
 /// This is the single error type returned by every fallible public API in
-/// `syndrome`. It implements [`std::error::Error`], so it composes with
+/// `syndrome`. It implements [`core::error::Error`], so it composes with
 /// `anyhow`/`Box<dyn Error>` via `?`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FecError {
@@ -40,4 +40,7 @@ impl fmt::Display for FecError {
     }
 }
 
-impl std::error::Error for FecError {}
+// `core::error::Error` (stable since 1.81) rather than `std::error::Error`:
+// the latter is just a re-export of the former, so this is identical under
+// `std` and additionally compiles under the `no_std` feature.
+impl core::error::Error for FecError {}

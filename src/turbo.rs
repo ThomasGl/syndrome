@@ -59,7 +59,7 @@
 //!
 //! # LLR sign convention
 //!
-//! Matches [`crate::channel_sim::AwgnChannel`] and [`crate::qc_ldpc`]: a
+//! Matches `crate::channel_sim::AwgnChannel` (not linked: absent under the `no_std` feature) and [`crate::qc_ldpc`]: a
 //! **positive** LLR favours bit `0`, a **negative** LLR favours bit `1`.
 //!
 //! # Decoder
@@ -119,7 +119,9 @@
 //! `TurboDecoder::decode_with_backend`'s implementation for exactly where
 //! `extrinsic1`/`extrinsic2_nat` are computed and crossed through `self.pi`.
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
+use crate::float_ext::FloatExt;
 
 /// Which BCJR combining rule a [`TurboDecoder`] uses.
 ///
@@ -147,8 +149,7 @@ use crate::error::FecError;
 /// $\max$ commutes with that, so the hard decisions are unchanged. Exact
 /// log-MAP is **not** invariant, because $\ln(1 + e^{-|a-b|})$ is not
 /// homogeneous. `LogMap` therefore requires *genuine* LLRs —
-/// $2r/\sigma^2$ for BPSK over AWGN, which is what
-/// [`crate::channel_sim::AwgnChannel`] produces — and gives *worse* results
+/// $2r/\sigma^2$ for BPSK over AWGN, which is what `crate::channel_sim::AwgnChannel` (not linked: absent under the `no_std` feature) produces — and gives *worse* results
 /// than max-log if handed arbitrarily scaled soft values such as raw
 /// correlations or a fixed $\pm 1$ mapping. Feeding it inputs that are too
 /// large makes the correction term vanish (it degenerates to max-log);
@@ -188,8 +189,9 @@ const EXTRINSIC_SCALE_LOG_MAP: f32 = 1.0;
 ///
 /// With `EXACT == false` this is plain $\max(a, b)$ (max-log-MAP). With
 /// `EXACT == true` it adds the Jacobian correction
-/// $\ln(1 + e^{-|a-b|})$, computed with [`f32::ln_1p`] so that the
-/// small-argument case keeps its precision instead of losing it to
+/// $\ln(1 + e^{-|a-b|})$, computed with `ln_1p` (`f32::ln_1p` under `std`,
+/// `libm::log1pf` under the `no_std` feature, via `crate::float_ext`) so
+/// that the small-argument case keeps its precision instead of losing it to
 /// `(1.0 + x).ln()` cancellation.
 ///
 /// `EXACT` is a const parameter rather than a runtime flag so each kernel
@@ -204,7 +206,7 @@ const EXTRINSIC_SCALE_LOG_MAP: f32 = 1.0;
 fn max_star<const EXACT: bool>(a: f32, b: f32) -> f32 {
     let m = if a > b { a } else { b };
     if EXACT {
-        m + (-(a - b).abs()).exp().ln_1p()
+        m + (-(a - b).abs()).exp_ext().ln_1p_ext()
     } else {
         m
     }
@@ -939,7 +941,7 @@ fn siso_max_log_map(
             #[cfg(target_arch = "x86_64")]
             {
                 assert!(
-                    is_x86_feature_detected!("avx2"),
+                    crate::simd_avx2::avx2_available(),
                     "SisoBackend::Avx2 forced but this CPU has no AVX2 support"
                 );
                 // SAFETY: AVX2 support asserted immediately above.
@@ -968,7 +970,7 @@ fn siso_max_log_map(
         SisoBackend::Auto => {
             #[cfg(target_arch = "x86_64")]
             {
-                if is_x86_feature_detected!("avx2") {
+                if crate::simd_avx2::avx2_available() {
                     // SAFETY: AVX2 support checked immediately above.
                     unsafe {
                         avx2_kernel::siso_max_log_map_avx2(
@@ -1185,7 +1187,7 @@ fn siso_scalar<const EXACT: bool>(
 #[cfg(target_arch = "x86_64")]
 mod avx2_kernel {
     use super::{NEG_INF, NORM_PERIOD, RSC_TRELLIS};
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     /// Fixed lookup tables for the AVX2 recursions, derived once (at compile
     /// time) from [`RSC_TRELLIS`] so there is a single source of truth for
@@ -1313,7 +1315,7 @@ mod avx2_kernel {
     /// # Safety
     ///
     /// Caller must verify AVX2 support at runtime (e.g. via
-    /// `is_x86_feature_detected!("avx2")`) before calling this function.
+    /// `crate::simd_avx2::avx2_available()`) before calling this function.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn siso_max_log_map_avx2(
         k: usize,
@@ -2000,7 +2002,7 @@ mod tests {
         };
         // Skip on an x86_64 host without AVX2: forcing that backend asserts.
         #[cfg(target_arch = "x86_64")]
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             return;
         }
 
@@ -2175,7 +2177,7 @@ mod tests {
     fn avx2_available() -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            is_x86_feature_detected!("avx2")
+            crate::simd_avx2::avx2_available()
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
