@@ -179,8 +179,9 @@ syndrome/
 │   └── run_all.sh          — Orchestration + byte-identical checksum gate
 ├── data/
 │   └── bg_tables.json      — BG1/BG2 extracted from 3GPP TS 38.212
-└── tools/
-    └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+├── tools/
+│   └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+└── embedded-demo/          — Bare-metal no_std firmware demo, own package (see §5.6)
 ```
 
 ---
@@ -847,6 +848,30 @@ The waterfall region (0.5 → 1.5 dB) represents **~6 dB coding gain** over unco
 ```
 push + pop: ~1.1 ns  (AtomicUsize head/tail, no syscall)
 ```
+
+### 5.6 no_std embedded firmware footprint
+
+The `no_std` feature (off by default; see `[features]` in Cargo.toml for
+exact scope) builds the core algorithms against `core`+`alloc` instead of
+`std`. `embedded-demo/` proves that with a real firmware image, not just a
+`cargo check`: a bare-metal Cortex-M4F binary (`thumbv7em-none-eabihf`)
+encoding, quantizing, and decoding one BG2 (Z=128) codeword through the
+fixed-point LOMS kernel. Measured 2026-08-19 with `llvm-size` on that
+build's `--release` output (`opt-level = "z"`, LTO, one codegen unit):
+
+```
+.text: 17,312 bytes (~16.9 KiB)  -- code: LDPC encoder/decoder + cortex-m-rt + panic handler + allocator
+.data:      0 bytes              -- no initialized-nonzero globals
+.bss:  65,564 bytes (~64.0 KiB)  -- almost entirely a deliberately round 64 KiB static heap, not a measured minimum
+```
+
+What this does **not** include: execution or timing. No hardware or
+cycle-accurate simulator was available to run it, and this crate publishes
+no benchmark number it did not actually measure — so none is claimed for
+throughput or latency on embedded hardware. See `embedded-demo/README.md`
+for the full scope note, including why the heap size is a round choice
+rather than a profiled minimum, and how to reproduce the size numbers
+above.
 
 To reproduce all benchmarks:
 ```bash

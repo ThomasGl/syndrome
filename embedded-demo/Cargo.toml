@@ -1,0 +1,30 @@
+[package]
+name = "syndrome-embedded-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Bare-metal Cortex-M firmware demo: syndrome's no_std QC-LDPC path, cross-compiled and linked for real."
+
+# A standalone package on purpose, not an `examples/*.rs` file in the main
+# `syndrome` crate: `#![no_std] #![no_main]` firmware needs cortex-m-rt,
+# panic-halt, and embedded-alloc, none of which the library itself should
+# ever depend on (they only make sense linked into a final firmware image,
+# never into a `syndrome`-as-a-library build). A normal `cargo build
+# --all-targets`/`cargo test --all` in the parent crate never touches this
+# directory (it is its own package, excluded from the parent's
+# `[dependencies]` graph and from `syndrome`'s published tarball -- see
+# `exclude` in the parent Cargo.toml).
+[dependencies]
+syndrome = { path = "..", default-features = false, features = ["no_std"] }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "1"
+embedded-alloc = "0.6"
+
+[profile.release]
+# Firmware, not a host binary: optimize for size (the usual embedded
+# default) and strip debug info the flash image doesn't need.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
