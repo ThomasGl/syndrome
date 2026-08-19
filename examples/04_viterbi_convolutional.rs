@@ -6,8 +6,10 @@
 //! also encodes *how confident* the receiver is. Feeding that confidence
 //! into the trellis search (max-log-MAP branch metric) recovers more errors
 //! at the exact same channel SNR. Industry context: this rate-1/2 K=7 code
-//! (generators 0o133/0o171) is the classic NASA/3GPP convolutional code used
-//! for LTE PDCCH and countless satellite links before turbo/LDPC took over.
+//! (generators 0o133/0o171) is the classic CCSDS/NASA/3GPP convolutional
+//! code used for LTE PDCCH and countless satellite links (it is CCSDS
+//! 131.0-B-3's baseline convolutional code — see
+//! `08_ccsds_convolutional.rs`) before turbo/LDPC took over.
 //!
 //! Run with: `cargo run --example 04_viterbi_convolutional`
 

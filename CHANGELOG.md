@@ -43,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Result`/`panic!` across the FFI boundary. Verified with a real C
   program compiled and linked against the built shared library, not only
   Rust-side FFI tests.
+- **CCSDS 131.0-B-3 documented as what it already conformed to.**
+  `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` was already selecting
+  the exact generator polynomials CCSDS 131.0-B-3 §3 specifies for its
+  rate-1/2 convolutional code family (`k=7`, generators `0o133`/`0o171`,
+  is the historical "Voyager code" and the baseline every CCSDS mission
+  profile in this family starts from) — the crate's own docs credited
+  "NASA/3GPP" for `k=7` and omitted CCSDS entirely, an incomplete rather
+  than a false attribution, now corrected. New example,
+  `examples/08_ccsds_convolutional.rs`, demonstrates the whole K=3/5/7/9
+  family. Documented equally clearly: this covers the inner convolutional
+  code only — CCSDS's outer Reed-Solomon(255,223) layer, interleaving,
+  frame sync, and derandomization are not implemented, and
+  `syndrome::reed_solomon`'s Cauchy-matrix construction is a different
+  mathematical object from CCSDS's evaluation-based RS(255,223), so it
+  cannot stand in for that layer.
 
 ### Fixed
 

@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-486%20passing-brightgreen)](tests/)
-[![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
+[![Examples](https://img.shields.io/badge/examples-8%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
 
@@ -37,12 +37,12 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 
 | What | Detail |
 |---|---|
-| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G) — link-adaptation profiles over the existing 5G NR LDPC/Polar kernels, not a distinct FEC spec (no 6G FEC standard is ratified yet) |
+| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, CCSDS 131.0-B-3 (K=3/5/7/9 convolutional inner code only — the outer RS(255,223) layer is not implemented), IMT-2030 (6G) — link-adaptation profiles over the existing 5G NR LDPC/Polar kernels, not a distinct FEC spec (no 6G FEC standard is ratified yet) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); GFNI-accelerated GF(256) multiply for RS where available, AVX2 VPSHUFB nibble-table fallback elsewhere; NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
 | **Tests** | 486 across unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test), integration (5G NR + Wi-Fi), LDPC offset-β validation, media reconstruction, reference vectors, robustness, and doctests — run `cargo test --all` for the current per-category split (it shifts release to release) |
-| **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
+| **Examples** | 8 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~162/90 Gbit/s encode/decode (GFNI, AVX2 VPSHUFB fallback), LDPC: ~219 Melem/s · all numbers from running code |
 
@@ -167,7 +167,7 @@ syndrome/
 │   ├── affinity.rs         — Thread-to-core pinning (optional `affinity` feature)
 │   ├── simd_avx2.rs        — AVX2 inner-loop kernels (x86_64, runtime-detected)
 │   └── simd_neon.rs        — NEON inner-loop kernels (aarch64, compile-gated)
-├── examples/               — 7 runnable teaching examples (see §2)
+├── examples/               — 8 runnable teaching examples (see §2)
 ├── tests/
 │   ├── ldpc_integration.rs     — Encode→decode round-trips + 1-bit error correction
 │   └── media_reconstruction.rs — Audio/video AWGN simulation + perfect reconstruction
@@ -1191,7 +1191,8 @@ BCJR, QPP interleaver) · extended binary Golay(24,12,8) · Hamming(7,4) ·
 CRC-24A/B/C, CRC-16/11/6
 
 **Standards:** 3GPP TS 38.212 (5G NR) · 3GPP TS 36.212 (LTE) · IEEE
-802.11ax/be (Wi-Fi 6/7) · IMT-2030 (6G research profiles over the 5G kernels)
+802.11ax/be (Wi-Fi 6/7) · CCSDS 131.0-B-3 (convolutional inner code only) ·
+IMT-2030 (6G research profiles over the 5G kernels)
 
 **Engineering:** Rust · SIMD (AVX2, VPSHUFB, NEON) · zero-allocation hot
 paths · lock-free SPSC ring buffer · thread affinity · rate matching ·

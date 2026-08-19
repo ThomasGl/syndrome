@@ -1,9 +1,13 @@
-//! Viterbi convolutional decoder — rate-1/2, K=7 (3GPP/NASA standard).
+//! Viterbi convolutional decoder — rate-1/2, K=7 (CCSDS/NASA/3GPP standard).
 //!
 //! Implements the classic Viterbi algorithm with Add-Compare-Select (ACS) trellis
 //! search for binary convolutional codes of rate 1/2.  The standard K=7 code
-//! (generators $G_0 = 0o133$, $G_1 = 0o171$) is used by many 3GPP profiles
-//! (LTE PDCCH tail-biting variant, Turbo component encoder, etc.).
+//! (generators $G_0 = 0o133$, $G_1 = 0o171$) is the baseline convolutional
+//! code of CCSDS 131.0-B-3 ("TM Synchronization and Channel Coding") — the
+//! same code NASA/JPL flew on Voyager and Cassini, and the code many 3GPP
+//! profiles also use (LTE PDCCH tail-biting variant, Turbo component
+//! encoder, etc.). See "CCSDS conformance" below for exactly what that
+//! does and does not cover.
 //!
 //! # Algorithm
 //!
@@ -143,6 +147,34 @@
 //!   practice and is why WAVA is used in preference to the exhaustive
 //!   search, but it is a gap.
 //!
+//! # CCSDS conformance
+//!
+//! `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` (see the
+//! `default_generators` polynomial table further down this file) selects
+//! exactly the connection
+//! polynomials CCSDS 131.0-B-3 §3 ("Convolutional Coding") specifies for
+//! its rate-1/2 convolutional code family — most notably `k = 7`
+//! (`G1 = 0o171`, `G2 = 0o133`), the historical "Voyager code" and the
+//! baseline every CCSDS mission profile built on this family starts from.
+//! That is a citable fact about the generator polynomials matching the
+//! published standard, not a claim this has been checked bit-for-bit
+//! against real CCSDS reference vectors or flight hardware — no such
+//! vectors were available to test against here.
+//!
+//! What this does **not** cover: CCSDS 131.0-B-3 concatenates this
+//! convolutional code with an *outer* Reed-Solomon (255,223) code and a
+//! specific interleaving depth, and additionally specifies frame
+//! synchronization markers and a pseudo-randomization (scrambling)
+//! sequence applied to the channel symbols. None of that is implemented
+//! here or anywhere else in this crate — [`crate::reed_solomon`] is a
+//! Cauchy-matrix erasure code, a different mathematical construction from
+//! CCSDS's evaluation-based RS(255,223) (see that module's docs), so it
+//! cannot stand in for the outer code without a genuinely new decoder
+//! built for CCSDS's exact construction. A caller wanting real CCSDS
+//! 131.0-B-3 interoperability needs that RS layer, the interleaver, frame
+//! sync, and derandomization from elsewhere; this crate provides a
+//! conformant inner convolutional code only.
+//!
 //! # Examples
 //!
 //! ```
@@ -164,7 +196,7 @@ use crate::error::FecError;
 /// The trellis has $2^{K-1}$ states, so construction cost and per-step ACS
 /// work both grow exponentially in $K$. `K = 16` already means $2^{15} =
 /// 32768$ states — far beyond any practical Viterbi decoder (real-world
-/// codes stop at $K=9$; $K=7$ is the 3GPP/NASA standard) — so it is used
+/// codes stop at $K=9$; $K=7$ is the CCSDS/NASA/3GPP standard) — so it is used
 /// as a hard ceiling: values above it are almost certainly a corrupted
 /// parameter, not a legitimate request, and left unchecked they are either
 /// an outright panic (`k >= 64`, left-shift-by->=bit-width in
@@ -720,7 +752,7 @@ mod neon_acs {
 /// |---|-----------|-----------|----------|
 /// | 3 | 7 | 5 | CCSDS R=1/2 K=3 |
 /// | 5 | 23 | 35 | CCSDS R=1/2 K=5 |
-/// | 7 | 133 | 171 | NASA/3GPP R=1/2 K=7 |
+/// | 7 | 133 | 171 | CCSDS/NASA/3GPP R=1/2 K=7 (the CCSDS 131.0-B-3 baseline) |
 /// | 9 | 561 | 753 | CCSDS R=1/2 K=9 |
 fn default_generators(k: usize) -> (u32, u32) {
     match k {
