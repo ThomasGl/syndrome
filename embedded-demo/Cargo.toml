@@ -18,8 +18,17 @@ description = "Bare-metal Cortex-M firmware demo: syndrome's no_std QC-LDPC path
 syndrome = { path = "..", default-features = false, features = ["no_std"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
-panic-halt = "1"
 embedded-alloc = "0.6"
+# ARM semihosting: lets the firmware print to the host's stdout and request
+# a clean QEMU exit with a real exit code, when run under an emulator that
+# implements it (QEMU does; real hardware without a debug probe attached
+# does not -- see README.md's "Running under QEMU" section for the
+# distinction and why this is not a hardware timing measurement).
+cortex-m-semihosting = "0.5"
+# Reports a panic message over semihosting instead of just halting -- more
+# useful under QEMU, where a debugger is not typically attached to read the
+# halted CPU's fault state back out.
+panic-semihosting = "0.6"
 
 [profile.release]
 # Firmware, not a host binary: optimize for size (the usual embedded
