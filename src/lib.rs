@@ -46,6 +46,7 @@ pub mod bch;
 pub mod bg_tables;
 pub mod bits;
 pub mod bluetooth;
+pub mod ccsds_rs;
 #[cfg(not(feature = "no_std"))]
 pub mod channel_sim;
 pub mod crc;
@@ -86,6 +87,7 @@ pub use affinity::pin_to_core;
 pub use bch::{BchCode, Chase2Report};
 pub use bg_tables::*;
 pub use bits::{bits_to_bytes, bytes_to_bits, hard_decision};
+pub use ccsds_rs::CcsdsReedSolomon;
 pub use crc::{Crc24, CrcKind};
 pub use error::FecError;
 pub use golay::GolayCode;

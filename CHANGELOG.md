@@ -43,21 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Result`/`panic!` across the FFI boundary. Verified with a real C
   program compiled and linked against the built shared library, not only
   Rust-side FFI tests.
-- **CCSDS 131.0-B-3 documented as what it already conformed to.**
-  `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` was already selecting
-  the exact generator polynomials CCSDS 131.0-B-3 §3 specifies for its
-  rate-1/2 convolutional code family (`k=7`, generators `0o133`/`0o171`,
-  is the historical "Voyager code" and the baseline every CCSDS mission
-  profile in this family starts from) — the crate's own docs credited
-  "NASA/3GPP" for `k=7` and omitted CCSDS entirely, an incomplete rather
-  than a false attribution, now corrected. New example,
-  `examples/08_ccsds_convolutional.rs`, demonstrates the whole K=3/5/7/9
-  family. Documented equally clearly: this covers the inner convolutional
-  code only — CCSDS's outer Reed-Solomon(255,223) layer, interleaving,
-  frame sync, and derandomization are not implemented, and
-  `syndrome::reed_solomon`'s Cauchy-matrix construction is a different
-  mathematical object from CCSDS's evaluation-based RS(255,223), so it
-  cannot stand in for that layer.
+- **CCSDS 131.0-B-3 conformance: inner code documented, outer code
+  implemented.** `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` was
+  already selecting the exact generator polynomials CCSDS 131.0-B-3 §3
+  specifies for its rate-1/2 convolutional code family (`k=7`, generators
+  `0o133`/`0o171`, is the historical "Voyager code" and the baseline every
+  CCSDS mission profile in this family starts from) — the crate's own
+  docs credited "NASA/3GPP" for `k=7` and omitted CCSDS entirely, an
+  incomplete rather than a false attribution, now corrected
+  (`examples/08_ccsds_convolutional.rs` demonstrates the whole K=3/5/7/9
+  family). A new module, `ccsds_rs` (`CcsdsReedSolomon`), implements
+  CCSDS's *outer* code: an evaluation-based RS(255,223) over `GF(2^8)`
+  (first consecutive root 112, primitive-element step 11, field
+  polynomial `1 + x + x^2 + x^7 + x^8`) via syndromes / Berlekamp-Massey /
+  Chien search / Forney, with every interleaving depth the standard
+  permits (1/2/3/4/5/8) — a genuinely different mathematical construction
+  from `syndrome::reed_solomon`'s Cauchy-matrix erasure code, so it could
+  not reuse that module. Verified against an independent third-party
+  CCSDS RS(255,223) implementation's own known-answer test vector (223
+  sequential data bytes and their real 32-byte parity), not merely
+  re-derived from the standard's stated formula and trusted on faith.
+  `examples/08b_ccsds_reed_solomon.rs` demonstrates every interleaving
+  depth end to end. Still not implemented anywhere in this crate: CCSDS
+  131.0-B-3's frame synchronization markers and pseudo-randomization
+  (scrambling) sequence.
 
 ### Fixed
 
@@ -82,6 +91,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables over the existing 5G LDPC/Polar kernels, not a distinct FEC
   algorithm, and no 6G FEC standard is ratified yet. Badge removed; the
   same qualifier added inline wherever 6G is listed next to real standards.
+- **The Polar SCL decoder's module docs claimed `O(L · N log N)` time, but
+  the actual implementation was `Ω(L · N²)`** — every path fork
+  deep-copied its entire `O(N)`-sized LLR/beta/decoded history, for
+  `O(list_size * k_info)` such forks. Fixed via a lazy-copy, per-recursion-
+  level array scheme (Tal & Vardy 2015, arXiv:1206.0050, "List Decoding of
+  Polar Codes") implemented with `Rc<[T]>`/`Rc::make_mut` rather than that
+  paper's own hand-rolled reference-counted array banks: forking a path
+  now clones `O(log N)` `Rc` pointers instead of copying `O(N)` data, and
+  a path pays for an actual `O(level size)` data copy only at the moment
+  it writes to a level another path still shares. Also removes the
+  decoder's separate `decoded` (u-domain) array entirely: since the polar
+  transform is self-inverse over `GF(2)`, the info bits are recovered from
+  the selected path's beta with one transform call after decoding
+  finishes, rather than tracked through the whole fork history as a third
+  `O(N)` structure. Verified bit-identical against both of this module's
+  prior implementations (the original `Vec<ScPath>` + `path.clone()`
+  version and the allocation-free-but-`O(N)`-copy-per-fork arena version,
+  both retained under `#[cfg(test)]`) across randomized noisy frames at
+  multiple `(N, K, list_size)` configurations, and mutation-tested by
+  deliberately dropping the per-node beta-preservation copy and confirming
+  five independent tests fail with the expected symptom.
 
 ### Changed
 

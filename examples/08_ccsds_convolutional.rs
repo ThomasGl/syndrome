@@ -10,16 +10,18 @@
 //! CCSDS reference vectors or flight hardware -- no such vectors were
 //! available to test against when this crate was built.
 //!
-//! What this does **not** cover, and this example does not attempt: CCSDS
-//! 131.0-B-3 concatenates this inner convolutional code with an *outer*
-//! Reed-Solomon (255,223) code, a specific interleaving depth, frame
-//! synchronization markers, and a pseudo-randomization sequence. None of
-//! that is implemented anywhere in this crate -- `syndrome::reed_solomon`
-//! is a Cauchy-matrix erasure code, a different mathematical construction
-//! from CCSDS's evaluation-based RS(255,223) (see that module's docs), so
-//! it cannot stand in for the outer code. A real CCSDS 131.0-B-3 downlink
-//! needs all of that from elsewhere; this crate provides a conformant
-//! inner convolutional code only.
+//! This example covers the inner convolutional code only -- CCSDS
+//! 131.0-B-3 also concatenates it with an *outer* Reed-Solomon (255,223)
+//! code at a specific interleaving depth, which this crate implements
+//! separately as `syndrome::ccsds_rs::CcsdsReedSolomon` (see
+//! `08b_ccsds_reed_solomon.rs` for that half of the chain, and note it is
+//! a genuinely different construction from `syndrome::reed_solomon`'s
+//! Cauchy-matrix erasure code -- see both modules' docs). What neither
+//! example nor this crate covers: CCSDS 131.0-B-3's frame synchronization
+//! markers and pseudo-randomization (scrambling) sequence are not
+//! implemented anywhere here. A real CCSDS 131.0-B-3 downlink needs that
+//! framing and derandomization from elsewhere; this crate provides
+//! conformant inner and outer channel codes.
 //!
 //! Run with: `cargo run --example 08_ccsds_convolutional`
 
@@ -33,7 +35,10 @@ fn main() {
     // standard also specifies.
     const CCSDS_CONSTRAINT_LENGTHS: [usize; 4] = [3, 5, 7, 9];
 
-    println!("CCSDS 131.0-B-3 rate-1/2 convolutional code family (inner code only):\n");
+    println!(
+        "CCSDS 131.0-B-3 rate-1/2 convolutional code family (inner code -- \
+         see 08b_ccsds_reed_solomon.rs for the outer code):\n"
+    );
 
     for &k in &CCSDS_CONSTRAINT_LENGTHS {
         let dec =

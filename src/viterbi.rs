@@ -161,19 +161,19 @@
 //! against real CCSDS reference vectors or flight hardware — no such
 //! vectors were available to test against here.
 //!
-//! What this does **not** cover: CCSDS 131.0-B-3 concatenates this
-//! convolutional code with an *outer* Reed-Solomon (255,223) code and a
-//! specific interleaving depth, and additionally specifies frame
-//! synchronization markers and a pseudo-randomization (scrambling)
-//! sequence applied to the channel symbols. None of that is implemented
-//! here or anywhere else in this crate — [`crate::reed_solomon`] is a
-//! Cauchy-matrix erasure code, a different mathematical construction from
-//! CCSDS's evaluation-based RS(255,223) (see that module's docs), so it
-//! cannot stand in for the outer code without a genuinely new decoder
-//! built for CCSDS's exact construction. A caller wanting real CCSDS
-//! 131.0-B-3 interoperability needs that RS layer, the interleaver, frame
-//! sync, and derandomization from elsewhere; this crate provides a
-//! conformant inner convolutional code only.
+//! CCSDS 131.0-B-3 concatenates this convolutional code with an *outer*
+//! Reed-Solomon (255,223) code at a specific interleaving depth. That outer
+//! code is a real, evaluation-based RS construction — a different
+//! mathematical object from [`crate::reed_solomon`]'s Cauchy-matrix erasure
+//! code (see that module's docs), so it needed its own implementation:
+//! [`crate::ccsds_rs::CcsdsReedSolomon`], verified against an independent
+//! third-party known-answer test vector. What this crate does **not**
+//! cover: CCSDS 131.0-B-3 additionally specifies frame synchronization
+//! markers and a pseudo-randomization (scrambling) sequence applied to the
+//! channel symbols — neither is implemented here or anywhere else in this
+//! crate. A caller wanting full CCSDS 131.0-B-3 interoperability needs that
+//! framing and derandomization from elsewhere; this crate provides
+//! conformant inner (convolutional) and outer (Reed-Solomon) codes.
 //!
 //! # Examples
 //!
