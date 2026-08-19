@@ -137,8 +137,9 @@ capi = []
 # (an f32 LDPC decode scratch buffer is hundreds of KiB at 5G's largest
 # lifting size; the smallest QC-LDPC configurations are tens of KiB).
 #
-# Verified by cross-compiling the library (not running it -- no test
-# hardware) for thumbv7em-none-eabihf, a real Cortex-M4F target.
+# Verified by cross-compiling the library for thumbv7em-none-eabihf, a real
+# Cortex-M4F target, and -- via embedded-demo/, see that package's README --
+# actually running the result under QEMU's netduinoplus2 machine model.
 no_std = ["dep:libm"]
 
 # Enables `serde_json` for the 3 src/bin/ exporters that emit JSON. Not
