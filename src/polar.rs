@@ -79,8 +79,10 @@
 //! decode result with no relationship to the actual transmitted codeword --
 //! worse than an error, because it looks like a normal answer.
 
+use crate::alloc_prelude::*;
 use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
+use crate::float_ext::FloatExt;
 
 // ---------------------------------------------------------------------------
 // Frozen bit reliability sequence (TS 38.212 §5.3.1, Table 5.3.1.2-1)
@@ -215,7 +217,7 @@ fn frozen_mask(n_polar: usize, k_info: usize) -> Vec<bool> {
         let pw_weight = |idx: u32| -> f64 {
             (0..nbits)
                 .filter(|b| (idx >> b) & 1 == 1)
-                .map(|b| 2f64.powf(BETA * b as f64))
+                .map(|b| 2f64.powf_ext(BETA * b as f64))
                 .sum()
         };
         let mut order: Vec<u32> = (0..n_polar as u32).collect();
@@ -1095,7 +1097,7 @@ pub struct PolarDecoder {
     /// [`ScScratch`]'s doc comment). Behind a `RefCell` because `decode_sc`
     /// takes `&self` (preserving its public signature); borrowing is
     /// uncontended (single-threaded, non-reentrant use per call).
-    sc_scratch: std::cell::RefCell<ScScratch>,
+    sc_scratch: core::cell::RefCell<ScScratch>,
 }
 
 impl PolarDecoder {
@@ -1135,7 +1137,7 @@ impl PolarDecoder {
         let is_frozen = frozen_mask(n, k);
         let crc = crc_kind.map(Crc24::new);
         let levels = n.trailing_zeros() as usize;
-        let sc_scratch = std::cell::RefCell::new(ScScratch::new(n, levels));
+        let sc_scratch = core::cell::RefCell::new(ScScratch::new(n, levels));
         Ok(Self {
             n,
             k,

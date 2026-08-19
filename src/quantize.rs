@@ -28,7 +28,7 @@
 //! $E_b/N_0$ the fixed-point decoder needs to reach the same block error
 //! rate as the `f32` one. `tests/ldpc_int8_quantization_loss.rs` measures it
 //! on this crate's own decoders over the BPSK AWGN channel of
-//! [`crate::channel_sim`], with $s = 8$, $\beta = 0.5$ and 10 iterations:
+//! `crate::channel_sim` (not linked: absent under the `no_std` feature), with $s = 8$, $\beta = 0.5$ and 10 iterations:
 //!
 //! | Code | $E_b/N_0$ | Shift | 95% CI |
 //! |---|---|---|---|
@@ -132,6 +132,8 @@
 //! assert_eq!(q[3], 127);
 //! ```
 
+use crate::float_ext::FloatExt;
+
 /// Quantise f32 LLRs to i8 with saturation.
 ///
 /// $\hat{L}_i = \text{clamp}(\lfloor L_i \cdot \text{scale} \rceil, -127, 127)$
@@ -146,7 +148,7 @@
 pub fn quantize_llr(llr: &[f32], out: &mut [i8], scale: f32) {
     debug_assert_eq!(llr.len(), out.len());
     for (l, o) in llr.iter().zip(out.iter_mut()) {
-        let v = (l * scale).round() as i32;
+        let v = (l * scale).round_ext() as i32;
         *o = v.clamp(-127, 127) as i8;
     }
 }
@@ -298,7 +300,7 @@ impl QuantParams {
         if !scaled.is_finite() {
             return MSG_MAX;
         }
-        scaled.round().clamp(0.0, MSG_MAX as f32) as i8
+        scaled.round_ext().clamp(0.0, MSG_MAX as f32) as i8
     }
 }
 
@@ -333,7 +335,7 @@ pub fn quantize_llr_i16(llr: &[f32], out: &mut [i16], scale: f32) {
         *o = if v.is_nan() {
             0
         } else {
-            (v.round() as i32).clamp(-(MSG_MAX as i32), MSG_MAX as i32) as i16
+            (v.round_ext() as i32).clamp(-(MSG_MAX as i32), MSG_MAX as i32) as i16
         };
     }
 }

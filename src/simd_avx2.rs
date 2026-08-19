@@ -11,9 +11,55 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use std::arch::x86_64::*;
+use core::arch::x86_64::*;
 
 use crate::quantize::MSG_MAX;
+
+/// Whether AVX2 is available on this CPU at runtime.
+///
+/// `is_x86_feature_detected!` is a `std`-only macro — unlike
+/// `#[target_feature(enable = "...")]`/`#[cfg(target_feature = "...")]`
+/// (compile-time, `core`-available), *runtime* CPU feature detection needs
+/// OS-assisted state (whether the OS has enabled AVX's extended
+/// save/restore state, checked via `XGETBV` gated on an OS-visibility bit
+/// `std` tracks), which `core` has nowhere to source without an OS. Under
+/// the `no_std` feature there is no such source, so this always reports
+/// `false` there: every x86-64 AVX2 call site in this crate falls back to
+/// its scalar kernel. That is a real, honest capability gap for a `no_std`
+/// x86-64 build specifically (AArch64 NEON has no such gap — see
+/// [`crate::simd_neon`]'s module doc: NEON is architecturally mandatory,
+/// so no runtime check is needed there at all) — but the crate's actual
+/// `no_std` embedded targets are ARM/RISC-V microcontrollers, which never
+/// compile this module in the first place (`target_arch != "x86_64"`), so
+/// it is not a gap that affects them.
+#[inline]
+pub(crate) fn avx2_available() -> bool {
+    #[cfg(not(feature = "no_std"))]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(feature = "no_std")]
+    {
+        false
+    }
+}
+
+/// Whether GFNI (Galois Field New Instructions) is available on this CPU at
+/// runtime — same `std`-only runtime-detection story as
+/// [`avx2_available`], same `no_std` fallback (`false`; the GFNI-accelerated
+/// GF(256) multiply in [`crate::reed_solomon`] falls back to its AVX2
+/// nibble-table kernel or further to its scalar one).
+#[inline]
+pub(crate) fn gfni_available() -> bool {
+    #[cfg(not(feature = "no_std"))]
+    {
+        is_x86_feature_detected!("gfni")
+    }
+    #[cfg(feature = "no_std")]
+    {
+        false
+    }
+}
 
 /// Process passes 1 and 2 of one LOMS layer using AVX2 (8-wide f32 registers).
 ///

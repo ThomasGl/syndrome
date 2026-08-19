@@ -79,6 +79,7 @@
 //! | 6   | 13, 26, 52, 104, 208                     |
 //! | 7   | 15, 30, 60, 120, 240                     |
 
+use crate::alloc_prelude::*;
 use crate::bg_tables::{
     BG1_COLS, BG1_ENTRIES, BG1_ENTRY_COUNT, BG1_ROWS, BG2_COLS, BG2_ENTRIES, BG2_ENTRY_COUNT,
     BG2_ROWS,
@@ -493,7 +494,7 @@ pub struct QcLdpcDecoder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelChoice {
     /// Pick the fastest kernel available on the host CPU at runtime: AVX2 on
-    /// x86_64 when `is_x86_feature_detected!("avx2")`, NEON on aarch64, or
+    /// x86_64 when `crate::simd_avx2::avx2_available()`, NEON on aarch64, or
     /// the scalar fallback everywhere else.
     Auto,
     /// Always run the portable scalar kernel, regardless of what the host
@@ -663,7 +664,8 @@ impl QcLdpcDecoder {
     ///
     /// It is public because the decode and the initialisation are separable in
     /// one real configuration — a caller feeding code blocks through
-    /// [`crate::ldpc_pipeline::LdpcPipeline`] writes LLRs into a pool slot on
+    /// `crate::ldpc_pipeline::LdpcPipeline` (not linked: absent under the
+    /// `no_std` feature) writes LLRs into a pool slot on
     /// one thread and decodes them on another, so the prologue has to happen
     /// before submission rather than inside the decode call. Exposing it keeps
     /// that path and `decode_5g` on one definition of what the initialisation
@@ -1042,7 +1044,7 @@ impl QcLdpcDecoder {
         // `kernel` so `KernelChoice::Scalar` always resolves to `false`,
         // forcing every layer through the scalar fallback below.
         #[cfg(target_arch = "x86_64")]
-        let use_avx2 = matches!(kernel, KernelChoice::Auto) && is_x86_feature_detected!("avx2");
+        let use_avx2 = matches!(kernel, KernelChoice::Auto) && crate::simd_avx2::avx2_available();
 
         // NEON has no runtime feature probe (it's part of the aarch64
         // baseline ABI), so the only thing gating it is `kernel` itself.
@@ -1598,7 +1600,7 @@ impl QcLdpcDecoder {
         let sxor_buf = &mut sxor_buf.0;
 
         #[cfg(target_arch = "x86_64")]
-        let use_avx2 = matches!(kernel, KernelChoice::Auto) && is_x86_feature_detected!("avx2");
+        let use_avx2 = matches!(kernel, KernelChoice::Auto) && crate::simd_avx2::avx2_available();
 
         let mut iters_used = 0usize;
         for _ in 0..iterations {

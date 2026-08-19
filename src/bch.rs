@@ -124,6 +124,7 @@
 //! assert_eq!(&codeword[..bch.k()], &info_full[..]);
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 
 /// Block length $n$ for BCH codes over $GF(2^8)$.
@@ -1013,7 +1014,7 @@ impl BchCode {
     /// # Arguments
     ///
     /// * `llr` — Channel LLRs, length $n$. Positive means bit 0, matching
-    ///   [`crate::channel_sim`]. Must be finite.
+    ///   `crate::channel_sim` (not linked: absent under the `no_std` feature). Must be finite.
     /// * `codeword_out` — Corrected codeword, length $n$.
     /// * `p` — Number of least-reliable positions to search over. Capped at
     ///   16 to keep $2^p$ bounded.
