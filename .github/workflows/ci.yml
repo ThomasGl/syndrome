@@ -262,6 +262,26 @@ jobs:
       - name: Install qemu-system-arm
         run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
 
+      - name: Sanity-check memory.x's RAM claim against real hardware
+        working-directory: embedded-demo
+        # v0.6.0 shipped with memory.x claiming 176K of contiguous RAM --
+        # 48K more than the STM32F405 this demo targets actually has
+        # contiguous at 0x20000000 (the other 64K, "CCM", is a separate,
+        # non-contiguous region this linker script doesn't reach). QEMU 6.2
+        # silently tolerated the overrun; QEMU 8.2.2 (installed above)
+        # correctly rejects it with a boot-time HardFault. This check fails
+        # the build the moment memory.x's RAM claim exceeds the real,
+        # documented 128K limit, independent of whether the firmware
+        # happens to still fit -- a regression here should never depend on
+        # noticing a QEMU crash to be caught.
+        run: |
+          RAM_K=$(grep -oP 'RAM\s*:\s*ORIGIN\s*=\s*0x20000000,\s*LENGTH\s*=\s*\K[0-9]+' memory.x)
+          echo "memory.x declares RAM = ${RAM_K}K"
+          if [ "$RAM_K" -gt 128 ]; then
+            echo "::error::memory.x claims ${RAM_K}K of RAM at 0x20000000, but the real STM32F405 only has 128K contiguous there (see memory.x's own comment). This will link but can boot-fault under an accurate QEMU model or real hardware."
+            exit 1
+          fi
+
       - name: Build the firmware
         working-directory: embedded-demo
         run: cargo build --release

@@ -11,24 +11,51 @@ changes to the library.
 
 ## Local checks (must pass before a PR)
 
-CI runs exactly these; run them locally to get a green review:
+Run these locally before opening a PR — they cover the core lib/test/lint
+gate, but CI's real job list is larger than this (no_std on a real ARM
+target, the `capi`/`embedded-demo` standalone packages, MSRV, loom, Miri,
+the rustdoc-math checker, a security audit, and a fuzz smoke test — see
+`.github/workflows/ci.yml` for the full, current list rather than trusting
+a copy of it here, since a stale mirror of that list is worse than none):
 
 ```bash
 cargo build --release            # builds the library + binaries
-cargo test --all                 # unit + integration + media + reference-vector + robustness tests
-cargo test --doc                 # doctests (one per documented public API example)
+cargo test                       # unit + integration + tests/*.rs + doctests, ALL of them (no --lib/--doc split)
 cargo clippy --all-targets -- -D warnings   # zero-warning lint gate
 cargo fmt --all -- --check       # formatting gate
 ```
 
+Run `cargo test` as shown — plain, no `--lib`/`--doc`/`--test <name>`
+restriction. Splitting it into separate `--lib` and `--doc` invocations
+looks equivalent but silently skips every test in `tests/*.rs`, including
+`tests/doc_math.rs` (the rustdoc-LaTeX-escaping checker) — exactly the gap
+that let a rendering bug reach the published v0.6.0 on crates.io. See
+`scripts/pre-publish-check.sh`'s own comment for the full story.
+
 The exact test counts change as the library grows, so they aren't hardcoded
 here (a stale number in this file is worse than no number). The one place
 that's kept current at every commit is the `Tests` badge at the top of
-`README.md` — after running `cargo test --all` locally, the total in your
+`README.md` — after running `cargo test` locally, the total in your
 terminal output should match that badge. `README.md` §4 ("Test Suite") also
 breaks the total down by category (unit / integration / media / reference
 vectors / robustness / doctests) if you want to see where a new test should
 live.
+
+## Before a release
+
+PR-level checks above are necessary but not sufficient for cutting a
+release — run the full gate CI actually enforces, matching the real QEMU
+version CI uses for the `embedded-demo` check (a locally-installed QEMU can
+give a false pass; see the script for why):
+
+```bash
+bash scripts/pre-publish-check.sh
+```
+
+Push to `master`, wait for CI to report green on that exact commit, **then**
+`cargo publish` — never publish before CI confirms the pushed commit,
+since a published crate version is immutable and cannot be corrected, only
+superseded by a new one.
 
 ## Lint policy
 

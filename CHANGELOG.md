@@ -5,6 +5,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-08-20
+
+### Fixed
+
+- **A LaTeX-escaping bug in `ccsds_rs`'s module docs broke rustdoc's
+  CommonMark rendering** — `\{`/`\}` (used for literal set-notation braces,
+  `I ∈ {1, ..., 8}`) loses its backslash to CommonMark, the exact failure
+  mode `tests/doc_math.rs` exists to catch. It shipped in
+  v0.6.0 because that release's local verification ran `cargo test --lib`
+  and `cargo test --doc` separately instead of a plain `cargo test`, which
+  is the only invocation that also runs `tests/*.rs`; CI caught it on the
+  very next push, after v0.6.0 was already on crates.io. Fixed to
+  `\lbrace .. \rbrace` (the letter-only macro form this crate's own docs
+  already use elsewhere). Since crate versions are immutable, this patch
+  release is the only way to correct the already-published rendering.
+- **`embedded-demo`'s `memory.x` claimed 176 KiB of contiguous RAM at
+  `0x20000000`** — 48 KiB more than the STM32F405 this demo actually
+  targets under QEMU has contiguous there (112 KiB "SRAM1" + 16 KiB
+  "SRAM2"; the other 64 KiB, "CCM", sits at a separate, non-contiguous
+  address a single-region linker script can't reach). QEMU 6.2 (available
+  locally) silently tolerated the overrun; QEMU 8.2.2 (what this crate's
+  CI actually installs on `ubuntu-latest`) correctly rejects it with a
+  boot-time `HardFault` lockup, caught by CI on the same push as the above.
+  Reproduced exactly via a matching Ubuntu 24.04 / QEMU 8.2.2 Docker
+  container, fixed `memory.x` to the real 128 KiB, and re-bisected
+  `HEAP_SIZE` against the corrected boundary using that same QEMU version:
+  64 KiB still fails, 96 KiB is still the real floor, 104 KiB ships as
+  that floor plus real stack headroom (the old 128 KiB heap no longer even
+  *links* against the corrected region). `embedded-demo` is not part of
+  the published `syndrome` crate, so this half did not affect crates.io.
+
+### Added
+
+- **`scripts/pre-publish-check.sh`**, the exact gate that should have
+  caught both bugs above before they shipped: a plain `cargo test` (not a
+  hand-picked subset), clippy across feature configs, no_std native + real
+  ARM cross-compile, the `capi`/`embedded-demo` packages including a real
+  QEMU execution pinned to the same QEMU version CI uses (via a disposable
+  Docker container, since a locally-installed QEMU can give a false pass —
+  see the script's own comment), and a real packaged-tarball docs build.
+  `CONTRIBUTING.md`'s new "Before a release" section points here.
+- A CI check in the `embedded-demo` job that fails the build the moment
+  `memory.x`'s declared RAM exceeds the real, documented 128 KiB limit —
+  independent of whether the firmware happens to still fit, so a future
+  regression here does not depend on someone noticing a QEMU crash to be
+  caught.
+
 ## [0.6.0] — 2026-08-19
 
 ### Added
