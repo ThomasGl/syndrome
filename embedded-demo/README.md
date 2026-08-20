@@ -27,10 +27,12 @@ worse lie than publishing nothing, so no timing number is claimed. A real
 measurement needs actual hardware or a simulator that implements DWT,
 neither available in the environment this was built in (see below).
 `memory.x`'s FLASH/RAM layout is generic and illustrative, not a specific
-verified physical board (see that file); it happens to fit inside
-`netduinoplus2`'s real STM32F405 capacity, which is why it runs under QEMU
-unmodified, but adjust it to your actual board's datasheet before flashing
-this to real hardware.
+verified physical board (see that file); it is sized to the real
+STM32F405's 128 KiB of *contiguous* SRAM (not the oft-quoted 192 KiB total —
+the other 64 KiB, "CCM", sits at a separate, non-contiguous address this
+single-region linker script does not reach), which is why it runs under
+QEMU unmodified, but adjust it to your actual board's datasheet before
+flashing this to real hardware.
 
 ## What it does
 
@@ -68,7 +70,9 @@ qemu-system-arm \
   -kernel target/thumbv7em-none-eabihf/release/syndrome-embedded-demo
 ```
 
-Real output, from an actual run (2026-08-19, QEMU 6.2.0):
+Real output, from an actual run (2026-08-19, QEMU 8.2.2 — the version this
+crate's CI actually installs and runs against; also reproduced against QEMU
+6.2.0 for local-dev-loop parity):
 
 ```
 syndrome-embedded-demo: bg=BG2 z=128 k=1280 n=6656 iterations_used=1
@@ -82,6 +86,22 @@ semihosting call, not a timeout or a crash).
 of the machine models this exact QEMU build actually ships (`qemu-system-arm
 -machine help` to see the full list on yours); any Cortex-M4-with-FPU model
 QEMU supports should work equivalently.
+
+**QEMU versions can genuinely disagree here, so test against the version
+that matters.** This crate's CI once merged clean locally and then failed
+in GitHub Actions with a boot-time `HardFault` lockup: `memory.x` declared
+176 KiB of RAM (see "Measured size" below for why that number was wrong),
+which QEMU 6.2.0 silently tolerated but QEMU 8.2.2 correctly rejected. If
+you don't have the exact QEMU version your CI runs available locally, a
+disposable container gets an exact match without touching your host:
+
+```bash
+docker run --rm -v "$PWD":/demo ubuntu:24.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq qemu-system-arm
+  qemu-system-arm -M netduinoplus2 -semihosting-config enable=on,target=native \
+    -nographic -kernel /demo/target/thumbv7em-none-eabihf/release/syndrome-embedded-demo
+'
+```
 
 **No sudo/root in your environment either?** `qemu-system-arm` and its
 shared-library dependencies can be fetched and run from a normal user
@@ -115,20 +135,31 @@ above (`opt-level = "z"`, LTO on, one codegen unit — see this package's
 |---|---|---|
 | `.text` | 35,288 (~34.5 KiB) | Code: the QC-LDPC encoder/decoder, `cortex-m-rt`'s runtime, the panic and semihosting handlers, and the allocator — flashed to FLASH. |
 | `.data` | 0 | No initialized-nonzero globals. |
-| `.bss` | 131,108 (~128.0 KiB) | Zero-initialized RAM: almost entirely the 128 KiB static heap `main.rs` provisions (`HEAP_SIZE`) — see below for where that number comes from. |
+| `.bss` | 106,532 (~104.0 KiB) | Zero-initialized RAM: almost entirely the 104 KiB static heap `main.rs` provisions (`HEAP_SIZE`) — see below for where that number comes from. |
 
 **`HEAP_SIZE` is not a guess — it was bisected by actually running under
-QEMU.** The first version of this demo shipped with a 64 KiB heap, chosen
-without measurement; the first time it was actually run (see "Running
-under QEMU" above), it panicked on a real failed allocation partway through
-decode. Rebuilding and re-running at several sizes found: 64 KiB fails,
-96 KiB is the smallest size that runs to completion and reports PASS,
-128 KiB (what ships here) is that measured floor plus headroom, not the
-floor itself. A tighter number would need a peak-allocation profile (an
-allocator that reports high-water-mark usage, or real hardware) rather
-than a bisection against pass/fail — not attempted here, since 128 KiB
-already comfortably fits `netduinoplus2`'s (and most STM32F4-class chips')
-real SRAM.
+QEMU, twice.** The first version of this demo shipped with a 64 KiB heap,
+chosen without measurement; the first time it was actually run, it panicked
+on a real failed allocation partway through decode. Rebuilding and
+re-running at several sizes against a (then-undiscovered) incorrectly-sized
+176 KiB RAM region found: 64 KiB fails, 96 KiB is the smallest size that
+runs to completion, 128 KiB shipped as that floor plus headroom.
+
+That bisection turned out to be built on a wrong assumption: `memory.x`'s
+176 KiB RAM claim overran the STM32F405's real 128 KiB of contiguous SRAM
+by 48 KiB, which QEMU 6.2.0 didn't enforce but QEMU 8.2.2 (this crate's CI)
+correctly does — see "Running under QEMU" above. With `memory.x` corrected
+to the real 128 KiB, the old 128 KiB heap doesn't even *link* any more
+(`.bss` overflows the region by 36 bytes, caught at build time, not
+runtime). Re-bisected against the corrected region using QEMU 8.2.2: 64 KiB
+still fails, 96 KiB is still the measured floor (the algorithm's own peak
+usage didn't change, only the RAM budget available to hold it did), and
+104 KiB ships here as that floor plus roughly 24 KiB of headroom for the
+stack — a real number now, not sitting on the floor, but tighter than the
+old 128 KiB because there is far less RAM to spare. A tighter number still
+would need a peak-allocation profile (an allocator that reports
+high-water-mark usage, or real hardware) rather than a bisection against
+pass/fail.
 
 Re-run `llvm-size target/thumbv7em-none-eabihf/release/syndrome-embedded-demo`
 after any change to confirm these numbers rather than trusting this table —

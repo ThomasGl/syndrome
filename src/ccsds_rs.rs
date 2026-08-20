@@ -54,7 +54,7 @@
 //!
 //! # Interleaving
 //!
-//! CCSDS 131.0-B-3 permits interleaving depths $I \in \{1, 2, 3, 4, 5, 8\}$
+//! CCSDS 131.0-B-3 permits interleaving depths $I \in \lbrace 1, 2, 3, 4, 5, 8 \rbrace$
 //! ($I = 1$ meaning no interleaving): $I$ independent RS(255,223) codewords
 //! are encoded, then their bytes are interleaved byte-by-byte across the
 //! group (byte $j$ of interleaved block $b$ comes from RS codeword $b$'s

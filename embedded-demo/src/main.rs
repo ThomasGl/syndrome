@@ -18,12 +18,28 @@
 //! section for the exact command and its actual output. That is real
 //! execution of this real firmware image encoding, quantizing, and decoding
 //! a real codeword, not a host-side simulation of the algorithm standing in
-//! for one. That execution caught a real bug in this demo the first time it
-//! ran: 64 KiB of static heap (the original, unverified guess) was not
-//! enough and failed a real allocation; 96 KiB is the measured minimum that
-//! runs to completion, and `HEAP_SIZE` below ships with headroom above that
-//! floor rather than sitting exactly on it. See "Running under QEMU" for
-//! how to reproduce the bisection.
+//! for one. That execution has caught two real bugs in this demo so far,
+//! neither visible from a `cargo build` alone:
+//!
+//! - An undersized heap: 64 KiB of static heap (the original, unverified
+//!   guess) failed a real allocation partway through decode.
+//! - An **oversized RAM declaration**: `memory.x` originally claimed 176 KiB
+//!   of contiguous SRAM at `0x20000000`. The real STM32F405 this demo runs
+//!   against under QEMU has 192 KiB of SRAM total, but only 128 KiB of it
+//!   (112 KiB "SRAM1" + 16 KiB "SRAM2") is contiguous at that address; the
+//!   remaining 64 KiB ("CCM", core-coupled memory) lives at a separate,
+//!   non-contiguous address (`0x10000000`) and is not reachable through this
+//!   simple linker script at all. QEMU 6.2 did not enforce that boundary and
+//!   let the firmware run anyway; QEMU 8.2.2 (what this crate's CI actually
+//!   runs) does, and correctly reported a boot-time HardFault lockup instead
+//!   -- a real regression this demo's own CI job exists to catch, per its
+//!   own doc comment, and it did. `memory.x` now declares the real 128 KiB,
+//!   and `HEAP_SIZE` below was re-bisected against that corrected boundary
+//!   using the same QEMU version CI runs (reproduced locally via a matching
+//!   container, since the two QEMU versions disagree here): 64 KiB still
+//!   fails; 96 KiB is the measured minimum that runs to completion; 104 KiB
+//!   ships with real headroom for the stack, not sitting on the floor. See
+//!   "Running under QEMU" for how to reproduce this.
 //!
 //! What it is **not**: a hardware timing measurement. This firmware also
 //! tried reporting a DWT cycle-counter delta around each phase; every
@@ -37,10 +53,10 @@
 //! simulator that actually implements DWT) is still open work.
 //!
 //! `memory.x`'s FLASH/RAM layout is generic and illustrative (see that
-//! file) -- comfortably inside `netduinoplus2`'s real STM32F405 capacity,
-//! which is why it runs under QEMU without modification, but still not a
-//! specific verified board; adjust it before flashing anything built from
-//! this demo to real hardware.
+//! file) -- sized to the real STM32F405's 128 KiB of *contiguous* SRAM this
+//! demo actually needs (see above), but still not a specific verified
+//! board; adjust it before flashing anything built from this demo to real
+//! hardware.
 
 #![no_std]
 #![no_main]
@@ -58,12 +74,15 @@ use syndrome::quantize::{QuantParams, quantize_llr_i16};
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-/// Measured under QEMU (see the module doc): 64 KiB fails a real allocation
-/// partway through decode; 96 KiB is the smallest size that ran to
-/// completion in that bisection. 128 KiB ships here as that measured floor
-/// plus headroom, not the floor itself -- a peak-allocation profile on real
+/// Measured under QEMU 8.2.2 against the corrected 128 KiB RAM region (see
+/// the module doc): 64 KiB fails a real allocation partway through decode;
+/// 96 KiB is the smallest size that ran to completion in that bisection.
+/// 104 KiB ships here as that measured floor plus headroom for the stack
+/// (`.bss` alone, at this size, is 106,532 bytes -- confirmed via
+/// `llvm-size` -- leaving just under 24 KiB of the 128 KiB region for stack
+/// and the linker-reserved guard) -- a peak-allocation profile on real
 /// hardware would be needed to trust a number any tighter than this.
-const HEAP_SIZE: usize = 128 * 1024;
+const HEAP_SIZE: usize = 104 * 1024;
 
 #[entry]
 fn main() -> ! {

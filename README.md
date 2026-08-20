@@ -872,15 +872,27 @@ output (`opt-level = "z"`, LTO, one codegen unit):
 ```
 .text:  35,288 bytes (~34.5 KiB)  -- LDPC encoder/decoder + cortex-m-rt + panic/semihosting handlers + allocator
 .data:       0 bytes              -- no initialized-nonzero globals
-.bss:  131,108 bytes (~128.0 KiB) -- almost entirely a 128 KiB static heap, bisected against real QEMU runs, not guessed
+.bss:  106,532 bytes (~104.0 KiB) -- almost entirely a 104 KiB static heap, bisected against real QEMU runs, not guessed
 ```
 
-That heap size is itself a real-execution finding, not a static guess: the
-first version of this demo shipped with a 64 KiB heap chosen without
-measurement, and the first time it actually ran, it hit a real failed
-allocation partway through decode. Bisecting against real QEMU runs found
-64 KiB fails, 96 KiB is the smallest size that completes and reports PASS,
-and 128 KiB (what ships) is that measured floor plus headroom.
+That heap size is itself a real-execution finding, not a static guess — and
+it was bisected *twice*. The first version of this demo shipped with a
+64 KiB heap chosen without measurement, and the first time it actually ran,
+it hit a real failed allocation partway through decode; bisecting against
+real QEMU 6.2 runs found 64 KiB fails, 96 KiB is the smallest size that
+completes, and 128 KiB shipped as that floor plus headroom. That bisection
+was built on a wrong assumption, though: `embedded-demo/memory.x` claimed
+176 KiB of contiguous RAM, but the real STM32F405 this demo runs against
+only has 128 KiB contiguous at that address (the rest is non-contiguous
+core-coupled memory a single-region linker script can't reach) — QEMU 6.2
+didn't enforce that boundary, but QEMU 8.2.2 (what this crate's CI actually
+runs) correctly does, and caught it with a boot-time fault the first time
+this release's CI ran. Fixed by correcting `memory.x` to the real 128 KiB
+and re-bisecting the heap against it with the same QEMU version CI uses:
+64 KiB still fails, 96 KiB is still the real floor, 104 KiB ships as that
+floor plus the ~24 KiB of headroom the smaller RAM budget leaves for the
+stack. See `embedded-demo/README.md`'s "Measured size" section and
+`embedded-demo/src/main.rs`'s module doc for the full story.
 
 What this still does **not** include: hardware timing. QEMU's Cortex-M core
 runs under dynamic binary translation, not a cycle-accurate model of any
