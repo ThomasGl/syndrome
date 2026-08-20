@@ -8,7 +8,74 @@ is a portfolio/research project, not a production baseband replacement — see
 [Current Implementation Status](#current-implementation-status) below for what
 is actually implemented today.
 
-## 1. Mathematical Framework: 5G NR QC-LDPC Decoding
+## 1. End-to-End Signal Chain
+
+Before the math, the shape of the pipeline this crate actually occupies.
+"FEC" sits between two boundaries neither this crate nor most software FEC
+libraries cross: digital-to-analog modulation on the way out, and
+analog-to-digital demodulation on the way back. The diagram below is the
+one fully wired, real chain in this crate — `transport_block.rs`'s
+`DlSchEncoder`/`DlSchDecoder`, 3GPP TS 38.212 §5.1–§5.5 — with every box
+naming the module that actually implements it. Boxes with a double border
+mark the D/A and A/D boundary this crate does not cross.
+
+```mermaid
+flowchart LR
+    subgraph TX["Digital TX — this crate"]
+        direction TB
+        A["Information bits"] --> B["CRC-24A attach<br/>crc.rs"]
+        B --> C["Segment into code blocks<br/>+ CRC-24B per block<br/>segmentation.rs"]
+        C --> D["FEC encode<br/>QC-LDPC BG1/BG2, layered offset min-sum<br/>qc_ldpc.rs"]
+        D --> E["Rate matching<br/>puncture/select/interleave to E bits<br/>rate_matching.rs"]
+        E --> F["Concatenate code blocks -> G coded bits"]
+    end
+
+    F --> G{{"D/A: modulation<br/>NOT implemented in this crate"}}
+    G --> H(("Analog channel<br/>real RF, real world"))
+    H --> I{{"A/D: demodulation + LLR estimation<br/>NOT implemented in this crate"}}
+
+    F -. "for testing, without real RF" .-> J["channel_sim.rs<br/>AwgnChannel / RayleighBlockChannel / GilbertElliottChannel<br/>statistical bits-to-LLR model, no symbol mapping,<br/>genie-aided CSI in the fading/burst models"]
+
+    I --> K
+    J --> K["quantize.rs<br/>f32 LLR -> fixed-point i8<br/>for the AVX2/scalar min-sum kernel"]
+
+    subgraph RX["Digital RX — this crate"]
+        direction TB
+        K --> L["Rate de-match<br/>rate_matching.rs"]
+        L --> M["HARQ soft-combine across retransmissions<br/>harq.rs"]
+        M --> N["FEC decode<br/>QC-LDPC layered offset min-sum<br/>qc_ldpc.rs"]
+        N --> O["CRC-24B check per block,<br/>desegment, CRC-24A check"]
+        O --> P["Information bits out"]
+    end
+```
+
+Two things this diagram is deliberately explicit about, per this project's
+own documentation policy: `channel_sim.rs` is a *statistical stand-in*, not
+a demodulator — it maps coded bits directly to LLRs from a channel model's
+closed-form noise statistics, never touching a symbol constellation, and
+two of its three models (`RayleighBlockChannel`, `GilbertElliottChannel`)
+are explicitly documented as genie-aided (perfect channel-state
+information a real receiver does not have), so results through it are an
+optimistic bound, not a demodulator's real output. And the D/A/A/D
+boundary itself is not a simplification to be filled in later — modulation,
+RF, and real hardware I/O are out of this crate's scope entirely, the same
+way `frame sync` and derandomization were declined for the CCSDS work (see
+`ccsds_rs`'s module docs): this is an FEC library, not a physical-layer or
+SDR stack.
+
+QC-LDPC is the only codec wired into this specific chain. Every other FEC
+core this crate implements — Turbo (`turbo.rs`), Polar (`polar.rs`),
+Viterbi (`viterbi.rs`), Reed-Solomon erasure coding (`reed_solomon.rs`),
+CCSDS's evaluation-based RS(255,223) (`ccsds_rs.rs`), BCH (`bch.rs`), the
+extended Golay code (`golay.rs`), Hamming(7,4) (`hamming.rs`), 802.11 Wi-Fi
+LDPC (`wifi.rs`/`wifi_ldpc_tables.rs` + `wifi_rate_matching.rs`), and the
+Bluetooth FEC profiles (`bluetooth.rs`) — is independently usable, not
+wired into `transport_block.rs`. Each follows the identical shape (encode
+→ the same D/A/A/D boundary → decode), just with a different pair of boxes
+filling "FEC encode" / "FEC decode" and, where the standard specifies one,
+its own rate-matching or interleaving step in between.
+
+## 2. Mathematical Framework: 5G NR QC-LDPC Decoding
 
 5G NR discards legacy Reed-Solomon and convolutional codes for data channels,
 mandating Quasi-Cyclic Low-Density Parity-Check (QC-LDPC) codes for their
@@ -65,7 +132,7 @@ Rm,n(t) = ( product over n' in N(m), excluding n, of sign(Qm,n'(t)) )
 Ln(t) = Qm,n(t) + Rm,n(t)
 ```
 
-## 2. Multi-Architecture Hardware Strategy
+## 3. Multi-Architecture Hardware Strategy
 
 syndrome targets different vectorization pathways per platform tier:
 
@@ -92,7 +159,7 @@ list of what is implemented versus deferred.
 - **No pointer chasing.** All matrices are flat `[f32; N]` / `&[f32]` — no
   `Vec<Vec<T>>` or `Box<T>` on any computational hot path.
 
-## 3. High-Throughput Job Queue & Synchronization Runtime
+## 4. High-Throughput Job Queue & Synchronization Runtime
 
 To scale linearly with CPU physical cores, syndrome runs an asynchronous,
 lock-free task scheduler — the same shape as industrial C++ libraries like
@@ -114,7 +181,7 @@ deployments (gNodeB/RAN), context switches are unacceptable. The optional
 `affinity` feature (via the `core_affinity` crate) pins worker threads to
 distinct physical cores, keeping data local to one cache hierarchy.
 
-## 4. Benchmarking & Cross-Language Analytics
+## 5. Benchmarking & Cross-Language Analytics
 
 The project ships a reproducible benchmark suite measuring Reed-Solomon
 encode throughput in Rust, a byte-identical same-algorithm C++ port, and
