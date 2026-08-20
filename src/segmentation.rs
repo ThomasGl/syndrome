@@ -61,6 +61,7 @@
 //! subsequent arithmetic expression (`a + 24`, `b + c * 24`, …) far below
 //! `usize::MAX`, so no individual step needs a checked/overflowing variant.
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 use crate::qc_ldpc::BaseGraph;
 

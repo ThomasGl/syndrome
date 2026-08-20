@@ -1,9 +1,13 @@
-//! Viterbi convolutional decoder — rate-1/2, K=7 (3GPP/NASA standard).
+//! Viterbi convolutional decoder — rate-1/2, K=7 (CCSDS/NASA/3GPP standard).
 //!
 //! Implements the classic Viterbi algorithm with Add-Compare-Select (ACS) trellis
 //! search for binary convolutional codes of rate 1/2.  The standard K=7 code
-//! (generators $G_0 = 0o133$, $G_1 = 0o171$) is used by many 3GPP profiles
-//! (LTE PDCCH tail-biting variant, Turbo component encoder, etc.).
+//! (generators $G_0 = 0o133$, $G_1 = 0o171$) is the baseline convolutional
+//! code of CCSDS 131.0-B-3 ("TM Synchronization and Channel Coding") — the
+//! same code NASA/JPL flew on Voyager and Cassini, and the code many 3GPP
+//! profiles also use (LTE PDCCH tail-biting variant, Turbo component
+//! encoder, etc.). See "CCSDS conformance" below for exactly what that
+//! does and does not cover.
 //!
 //! # Algorithm
 //!
@@ -127,7 +131,7 @@
 //!   channel it does not describe and "minimum Hamming distance" stops
 //!   coinciding with "most likely". The soft path's correlation metric is
 //!   the ML metric for BPSK over AWGN, which is where the LLRs from
-//!   [`crate::channel_sim::AwgnChannel`] come from. Hard decisions on a
+//!   `crate::channel_sim::AwgnChannel` (not linked: absent under the `no_std` feature) come from. Hard decisions on a
 //!   soft channel discard information and cost roughly 2 dB; that is a
 //!   property of quantizing the input, not a defect in the search.
 //!
@@ -143,6 +147,34 @@
 //!   practice and is why WAVA is used in preference to the exhaustive
 //!   search, but it is a gap.
 //!
+//! # CCSDS conformance
+//!
+//! `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` (see the
+//! `default_generators` polynomial table further down this file) selects
+//! exactly the connection
+//! polynomials CCSDS 131.0-B-3 §3 ("Convolutional Coding") specifies for
+//! its rate-1/2 convolutional code family — most notably `k = 7`
+//! (`G1 = 0o171`, `G2 = 0o133`), the historical "Voyager code" and the
+//! baseline every CCSDS mission profile built on this family starts from.
+//! That is a citable fact about the generator polynomials matching the
+//! published standard, not a claim this has been checked bit-for-bit
+//! against real CCSDS reference vectors or flight hardware — no such
+//! vectors were available to test against here.
+//!
+//! CCSDS 131.0-B-3 concatenates this convolutional code with an *outer*
+//! Reed-Solomon (255,223) code at a specific interleaving depth. That outer
+//! code is a real, evaluation-based RS construction — a different
+//! mathematical object from [`crate::reed_solomon`]'s Cauchy-matrix erasure
+//! code (see that module's docs), so it needed its own implementation:
+//! [`crate::ccsds_rs::CcsdsReedSolomon`], verified against an independent
+//! third-party known-answer test vector. What this crate does **not**
+//! cover: CCSDS 131.0-B-3 additionally specifies frame synchronization
+//! markers and a pseudo-randomization (scrambling) sequence applied to the
+//! channel symbols — neither is implemented here or anywhere else in this
+//! crate. A caller wanting full CCSDS 131.0-B-3 interoperability needs that
+//! framing and derandomization from elsewhere; this crate provides
+//! conformant inner (convolutional) and outer (Reed-Solomon) codes.
+//!
 //! # Examples
 //!
 //! ```
@@ -155,6 +187,7 @@
 //! assert_eq!(decoded, info);
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 
 /// Largest constraint length accepted by [`ViterbiDecoder::new`]/
@@ -163,7 +196,7 @@ use crate::error::FecError;
 /// The trellis has $2^{K-1}$ states, so construction cost and per-step ACS
 /// work both grow exponentially in $K$. `K = 16` already means $2^{15} =
 /// 32768$ states — far beyond any practical Viterbi decoder (real-world
-/// codes stop at $K=9$; $K=7$ is the 3GPP/NASA standard) — so it is used
+/// codes stop at $K=9$; $K=7$ is the CCSDS/NASA/3GPP standard) — so it is used
 /// as a hard ceiling: values above it are almost certainly a corrupted
 /// parameter, not a legitimate request, and left unchecked they are either
 /// an outright panic (`k >= 64`, left-shift-by->=bit-width in
@@ -180,7 +213,7 @@ pub const MAX_CONSTRAINT_LENGTH: usize = 16;
 /// state and both output bits.  Indexed as `table[state * 2 + input_bit]`.
 struct TrellisTable {
     n_states: usize,
-    next_state: Vec<u8>,
+    next_state: Vec<u16>,
     out0: Vec<u8>,
     out1: Vec<u8>,
     /// Butterfly-reorganised branch tables used by the AVX2 ACS kernel.
@@ -286,7 +319,7 @@ impl TrellisTable {
         // n_states = 2^(K-1); state stores the last K-1 input bits.
         let n_states = if k >= 1 { 1usize << (k - 1) } else { 1 };
         let mask = if k < 32 { (1u32 << k) - 1 } else { u32::MAX };
-        let mut next_state = vec![0u8; n_states * 2];
+        let mut next_state = vec![0u16; n_states * 2];
         let mut out0 = vec![0u8; n_states * 2];
         let mut out1 = vec![0u8; n_states * 2];
 
@@ -295,7 +328,7 @@ impl TrellisTable {
                 // full shift register: new bit `b` enters the MSB.
                 let full = (((b << (k - 1)) | s) as u32) & mask;
                 // Next state drops the oldest bit (LSB of full after shift).
-                let ns = (full >> 1) as u8;
+                let ns = (full >> 1) as u16;
                 let o0 = ((full & g0).count_ones() & 1) as u8;
                 let o1 = ((full & g1).count_ones() & 1) as u8;
                 next_state[s * 2 + b] = ns;
@@ -410,7 +443,7 @@ mod avx2_acs {
     pub(super) unsafe fn acs_step_soft(
         cur_met: &[f32],
         nxt_met: &mut [f32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         sign0_even: &[f32],
         sign1_even: &[f32],
@@ -461,7 +494,7 @@ mod avx2_acs {
                     let mut tmp = [0i32; 8];
                     _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
                     for i in 0..8 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -482,7 +515,7 @@ mod avx2_acs {
     pub(super) unsafe fn acs_step_hard(
         cur_met: &[i32],
         nxt_met: &mut [i32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         r0: i32,
         r1: i32,
@@ -529,7 +562,7 @@ mod avx2_acs {
                     let mut tmp = [0i32; 8];
                     _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, pred_state);
                     for i in 0..8 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -577,7 +610,7 @@ mod neon_acs {
     pub(super) unsafe fn acs_step_soft(
         cur_met: &[f32],
         nxt_met: &mut [f32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         sign0_even: &[f32],
         sign1_even: &[f32],
@@ -632,7 +665,7 @@ mod neon_acs {
                     let mut tmp = [0i32; 4];
                     vst1q_s32(tmp.as_mut_ptr(), pred_state);
                     for i in 0..4 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -651,7 +684,7 @@ mod neon_acs {
     pub(super) unsafe fn acs_step_hard(
         cur_met: &[i32],
         nxt_met: &mut [i32],
-        traceback_row: &mut [u8],
+        traceback_row: &mut [u16],
         bfly: &ButterflyTables,
         r0: i32,
         r1: i32,
@@ -701,7 +734,7 @@ mod neon_acs {
                     let mut tmp = [0i32; 4];
                     vst1q_s32(tmp.as_mut_ptr(), pred_state);
                     for i in 0..4 {
-                        traceback_row[dest + i] = tmp[i] as u8;
+                        traceback_row[dest + i] = tmp[i] as u16;
                     }
                 }
             }
@@ -719,7 +752,7 @@ mod neon_acs {
 /// |---|-----------|-----------|----------|
 /// | 3 | 7 | 5 | CCSDS R=1/2 K=3 |
 /// | 5 | 23 | 35 | CCSDS R=1/2 K=5 |
-/// | 7 | 133 | 171 | NASA/3GPP R=1/2 K=7 |
+/// | 7 | 133 | 171 | CCSDS/NASA/3GPP R=1/2 K=7 (the CCSDS 131.0-B-3 baseline) |
 /// | 9 | 561 | 753 | CCSDS R=1/2 K=9 |
 fn default_generators(k: usize) -> (u32, u32) {
     match k {
@@ -764,7 +797,7 @@ fn acs_step_hard_scalar(
     trellis: &TrellisTable,
     cur_met: &[u32],
     nxt_met: &mut [u32],
-    traceback_row: &mut [u8],
+    traceback_row: &mut [u16],
     r0: u8,
     r1: u8,
 ) {
@@ -782,7 +815,7 @@ fn acs_step_hard_scalar(
             let new = cur_met[s].saturating_add(bm);
             if new < nxt_met[ns] {
                 nxt_met[ns] = new;
-                traceback_row[ns] = s as u8;
+                traceback_row[ns] = s as u16;
             }
         }
     }
@@ -798,7 +831,7 @@ fn acs_step_soft_scalar(
     trellis: &TrellisTable,
     cur_met: &[f32],
     nxt_met: &mut [f32],
-    traceback_row: &mut [u8],
+    traceback_row: &mut [u16],
     l0: f32,
     l1: f32,
 ) {
@@ -815,7 +848,7 @@ fn acs_step_soft_scalar(
             let new = cur_met[s] + bm;
             if new > nxt_met[ns] {
                 nxt_met[ns] = new;
-                traceback_row[ns] = s as u8;
+                traceback_row[ns] = s as u16;
             }
         }
     }
@@ -850,9 +883,11 @@ fn acs_step_soft_scalar(
 /// distance is unsigned/`u32` in the scalar kernel and `i32` in the AVX2
 /// kernel -- see [`ViterbiDecoder::decode_hard_avx2`]'s doc comment for why
 /// they differ; soft-decision max-log-MAP is `f32` in both). `traceback` is
-/// `u8` in all four paths and is safe to share: only one decode call runs
-/// at a time (no concurrent aliasing) and each call fully overwrites every
-/// position it later reads before reading it.
+/// `u16` in all four paths (state indices need up to 15 bits at
+/// `MAX_CONSTRAINT_LENGTH`, so `u8` is not wide enough) and is safe to
+/// share: only one decode call runs at a time (no concurrent aliasing) and
+/// each call fully overwrites every position it later reads before reading
+/// it.
 struct ViterbiScratch {
     cur_met_u32: Vec<u32>,
     nxt_met_u32: Vec<u32>,
@@ -870,7 +905,7 @@ struct ViterbiScratch {
     nxt_met_i32: Vec<i32>,
     cur_met_f32: Vec<f32>,
     nxt_met_f32: Vec<f32>,
-    traceback: Vec<u8>,
+    traceback: Vec<u16>,
 }
 
 impl ViterbiScratch {
@@ -893,7 +928,7 @@ impl ViterbiScratch {
     #[inline]
     fn ensure_traceback(&mut self, needed: usize) {
         if self.traceback.len() < needed {
-            self.traceback.resize(needed, 0u8);
+            self.traceback.resize(needed, 0u16);
         }
     }
 }
@@ -921,7 +956,7 @@ pub struct ViterbiDecoder {
     /// `RefCell` because `decode_hard`/`decode_soft` take `&self` (preserving
     /// their public signature); borrowing is uncontended (single-threaded,
     /// non-reentrant use per call).
-    scratch: std::cell::RefCell<ViterbiScratch>,
+    scratch: core::cell::RefCell<ViterbiScratch>,
 }
 
 /// Maximum number of WAVA "laps" (full passes around the circular block,
@@ -966,7 +1001,7 @@ impl ViterbiDecoder {
         Self::check_k(k)?;
         let (g0, g1) = default_generators(k);
         let trellis = TrellisTable::build(k, g0, g1);
-        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
+        let scratch = core::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
             trellis,
@@ -1001,7 +1036,7 @@ impl ViterbiDecoder {
     pub fn with_generators(k: usize, g0: u32, g1: u32) -> Result<Self, FecError> {
         Self::check_k(k)?;
         let trellis = TrellisTable::build(k, g0, g1);
-        let scratch = std::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
+        let scratch = core::cell::RefCell::new(ViterbiScratch::new(trellis.n_states));
         Ok(Self {
             constraint_length: k,
             trellis,
@@ -1169,7 +1204,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_hard(&self, coded: &[u8]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_hard_avx2(coded);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1231,7 +1266,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_hard`](Self::decode_hard) after checking
-    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `n_states == 64` and `crate::simd_avx2::avx2_available()`; exposed as
     /// `pub(crate)` for the equivalence tests, which perform the same check.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn decode_hard_avx2(&self, coded: &[u8]) -> Vec<u8> {
@@ -1363,7 +1398,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_soft(&self, llr: &[f32]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_soft_avx2(llr);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1425,7 +1460,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_soft`](Self::decode_soft) after checking
-    /// `n_states == 64` and `is_x86_feature_detected!("avx2")`; exposed as
+    /// `n_states == 64` and `crate::simd_avx2::avx2_available()`; exposed as
     /// `pub(crate)` for the equivalence tests, which perform the same check.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn decode_soft_avx2(&self, llr: &[f32]) -> Vec<u8> {
@@ -1584,7 +1619,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_hard_tail_biting(&self, coded: &[u8]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_hard_tail_biting_avx2(coded);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1669,7 +1704,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_hard_tail_biting`](Self::decode_hard_tail_biting)
-    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// after checking `n_states == 64` and `crate::simd_avx2::avx2_available()`;
     /// exposed as `pub(crate)` for the equivalence tests, which perform the
     /// same check.
     #[cfg(target_arch = "x86_64")]
@@ -1819,7 +1854,7 @@ impl ViterbiDecoder {
     /// ```
     pub fn decode_soft_tail_biting(&self, llr: &[f32]) -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
-        if self.trellis.n_states == 64 && is_x86_feature_detected!("avx2") {
+        if self.trellis.n_states == 64 && crate::simd_avx2::avx2_available() {
             return self.decode_soft_tail_biting_avx2(llr);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1899,7 +1934,7 @@ impl ViterbiDecoder {
     /// # Safety requirement (caller-enforced)
     ///
     /// Only called from [`decode_soft_tail_biting`](Self::decode_soft_tail_biting)
-    /// after checking `n_states == 64` and `is_x86_feature_detected!("avx2")`;
+    /// after checking `n_states == 64` and `crate::simd_avx2::avx2_available()`;
     /// exposed as `pub(crate)` for the equivalence tests, which perform the
     /// same check.
     #[cfg(target_arch = "x86_64")]
@@ -2075,7 +2110,7 @@ impl ViterbiDecoder {
     ///
     /// `t_max` trellis steps; `n_info` is how many decoded bits to keep
     /// (steps 0..n_info); tail steps (n_info..t_max) are discarded.
-    fn traceback_from_zero(&self, t_max: usize, n_info: usize, traceback: &[u8]) -> Vec<u8> {
+    fn traceback_from_zero(&self, t_max: usize, n_info: usize, traceback: &[u16]) -> Vec<u8> {
         let n_states = self.trellis.n_states;
         let mut decoded = vec![0u8; n_info];
         let mut s = 0usize; // zero-terminated: start traceback at state 0
@@ -2116,7 +2151,7 @@ impl ViterbiDecoder {
         &self,
         t_max: usize,
         start_state: usize,
-        traceback: &[u8],
+        traceback: &[u16],
     ) -> (Vec<u8>, usize) {
         let n_states = self.trellis.n_states;
         let mut decoded = vec![0u8; t_max];
@@ -2153,7 +2188,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn decode_empty_returns_empty(k in 1usize..10usize) {
+        fn decode_empty_returns_empty(k in 1usize..=MAX_CONSTRAINT_LENGTH) {
             let d = ViterbiDecoder::new(k).unwrap();
             let out = d.decode(&[]);
             prop_assert!(out.is_empty());
@@ -2169,6 +2204,23 @@ mod tests {
         assert_eq!(coded.len(), 2 * (info.len() + 6));
         let decoded = dec.decode_hard(&coded);
         assert_eq!(decoded, info, "hard decode must exactly recover info bits");
+    }
+
+    #[test]
+    fn encode_decode_hard_roundtrip_large_k() {
+        // n_states = 2^(k-1) exceeds u8::MAX (256) once k >= 10, which used
+        // to truncate `TrellisTable::next_state` and the traceback buffer
+        // to u8 and silently corrupt every next-state above 255. Covers the
+        // full advertised range up to MAX_CONSTRAINT_LENGTH so this gap
+        // (previously untested: the proptest above stopped at k=9) cannot
+        // regress silently again.
+        for k in 10..=MAX_CONSTRAINT_LENGTH {
+            let dec = ViterbiDecoder::new(k).unwrap();
+            let info: Vec<u8> = (0..40).map(|i| ((i * 7) % 3 == 0) as u8).collect();
+            let coded = dec.encode(&info);
+            let decoded = dec.decode_hard(&coded);
+            assert_eq!(decoded, info, "hard decode round-trip failed for k={k}");
+        }
     }
 
     #[test]
@@ -2253,7 +2305,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_soft_avx2_matches_scalar_on_random_noisy_llrs() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2288,7 +2340,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_hard_avx2_matches_scalar_on_random_bit_flips() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2568,7 +2620,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_hard_tail_biting_avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }
@@ -2597,7 +2649,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_soft_tail_biting_avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no AVX2");
             return;
         }

@@ -19,6 +19,7 @@
 //!   An exact zero (an erasure) decides 0, consistent with
 //!   `f32::is_sign_negative` being false for `+0.0`.
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 
 /// Unpack packed bytes into one-bit-per-byte form, MSB first, into a

@@ -56,6 +56,7 @@
 //! The bit interleaver (§5.4.2.2) writes columns into an $E/Q_m \times Q_m$
 //! matrix row-by-row and reads out column-by-column.
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 use crate::qc_ldpc::BaseGraph;
 

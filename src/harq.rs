@@ -31,6 +31,7 @@
 //! assert!(cb.iter().any(|&v| v != 0.0));
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 use crate::qc_ldpc::BaseGraph;
 use crate::rate_matching::RateMatchCache;

@@ -1,0 +1,18 @@
+[package]
+name = "syndrome-capi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "C ABI for syndrome's 5G NR QC-LDPC encoder/decoder."
+
+# A standalone package, not a feature of `syndrome` itself -- see
+# src/lib.rs's module doc for exactly why (the short version: `[lib]
+# crate-type = ["staticlib", "cdylib"]` cannot coexist with `syndrome`'s
+# `no_std` feature when declared on the library crate itself, since rustc
+# then requires a global allocator + panic handler for every build of that
+# lib target regardless of which feature is active).
+[dependencies]
+syndrome = { path = ".." }
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]

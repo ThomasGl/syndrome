@@ -6,12 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-486%20passing-brightgreen)](tests/)
-[![Examples](https://img.shields.io/badge/examples-7%20runnable-brightgreen)](examples/)
+[![Examples](https://img.shields.io/badge/examples-9%20runnable-brightgreen)](examples/)
 [![5G NR](https://img.shields.io/badge/5G%20NR-TS%2038.212-blue)](src/transport_block.rs)
 [![Wi-Fi 7](https://img.shields.io/badge/Wi--Fi%207-802.11be-blue)](src/wifi.rs)
-[![6G Research](https://img.shields.io/badge/6G-IMT--2030%20research-blueviolet)](src/sixg.rs)
 
-**A high-performance, multi-standard Forward Error Correction library in safe Rust — nine FEC cores spanning every wireless generation: Hamming and Golay (the classics), BCH and Reed-Solomon (storage and satellites), convolutional/Viterbi (2G), Turbo (3G/4G LTE), and QC-LDPC + Polar (5G NR TS 38.212, Wi-Fi 6/7, 6G research) — with AVX2/NEON SIMD, lock-free pipelining, runnable teaching examples, and end-to-end media reconstruction tests.**
+**A high-performance, multi-standard Forward Error Correction library in Rust — safe-by-default, with Miri-verified unsafe confined to the SIMD and lock-free cores — nine FEC cores spanning every wireless generation: Hamming and Golay (the classics), BCH and Reed-Solomon (storage and satellites), convolutional/Viterbi (2G), Turbo (3G/4G LTE), and QC-LDPC + Polar (5G NR TS 38.212, Wi-Fi 6/7, 6G research) — with AVX2/NEON SIMD, lock-free pipelining, runnable teaching examples, and end-to-end media reconstruction tests.**
 
 ![QC-LDPC layered offset min-sum decode converging on a real, noise-corrupted 802.11 Wi-Fi codeword](bench/dashboard/exports/ldpc_convergence.gif)
 
@@ -38,12 +37,12 @@ see [`bench/README.md`](bench/README.md#ldpc-convergence-gif) to regenerate.*
 
 | What | Detail |
 |---|---|
-| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, IMT-2030 (6G research) |
+| **Standards** | 3GPP TS 38.212 (5G NR), TS 36.212 (LTE Turbo), **802.11ax/be (Wi-Fi 6/7) — real LDPC encode/decode, all 12 Annex R/F matrices**, CCSDS 131.0-B-3 (K=3/5/7/9 convolutional inner code and outer RS(255,223) with interleaving depths 1/2/3/4/5/8 — frame sync markers and pseudo-randomization are not implemented), IMT-2030 (6G) — link-adaptation profiles over the existing 5G NR LDPC/Polar kernels, not a distinct FEC spec (no 6G FEC standard is ratified yet) |
 | **Algorithms** | 9 cores: Hamming, Golay, BCH, Reed-Solomon, Viterbi, Turbo, QC-LDPC LOMS, Polar SC/CA-SCL, CRC family |
 | **SIMD** | AVX2 kernels in LDPC, RS, Viterbi, and Turbo (x86-64, runtime-detected, scalar-equivalence-tested); GFNI-accelerated GF(256) multiply for RS where available, AVX2 VPSHUFB nibble-table fallback elsewhere; NEON (AArch64) |
 | **Concurrency** | Lock-free SPSC ring buffer, multi-worker LDPC pipeline, per-core affinity |
-| **Tests** | 425 total on x86-64 (423 on AArch64: 7 AVX2/GFNI tests drop out, 5 NEON-only ones appear) — 235 unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test) · 12 integration (5G NR + Wi-Fi) · 4 LDPC offset-β validation · 4 media reconstruction · 14 reference vectors · 38 robustness · 118 doctests |
-| **Examples** | 7 runnable, heavily-commented teaching examples (`cargo run --example …`) |
+| **Tests** | 486 across unit (incl. multi-threaded SPSC stress + exhaustive Hamming H-matrix proof + exhaustive GFNI bit-matrix proof + χ² channel-normality test), integration (5G NR + Wi-Fi), LDPC offset-β validation, media reconstruction, reference vectors, robustness, and doctests — run `cargo test --all` for the current per-category split (it shifts release to release) |
+| **Examples** | 9 runnable, heavily-commented teaching examples (`cargo run --example …`) |
 | **Allocations** | Zero heap allocation inside the decode hot-paths |
 | **Benchmarks** | RS: ~162/90 Gbit/s encode/decode (GFNI, AVX2 VPSHUFB fallback), LDPC: ~219 Melem/s · all numbers from running code |
 
@@ -90,7 +89,7 @@ decoders. When either standard ratifies a genuinely new code, it gets a row.
 
 ## Plain-English Summary *(for recruiters and non-specialists)*
 
-> **The one-sentence version:** this library implements the error-correction algorithms that live inside every 5G phone chip, Wi-Fi router, and satellite terminal — in safe Rust, matching hand-optimised C++ speed.
+> **The one-sentence version:** this library implements the error-correction algorithms that live inside every 5G phone chip, Wi-Fi router, and satellite terminal — in Rust, matching hand-optimised C++ speed.
 
 ### What problem does it solve?
 
@@ -151,6 +150,7 @@ syndrome/
 │   ├── polar.rs            — Polar codes: SC + CA-SCL decode, 3GPP reliability seq
 │   ├── reed_solomon.rs     — GF(256) Cauchy-matrix RS: erasure + errors-and-erasures decode
 │   ├── bch.rs              — Binary BCH(255,k,t≤10): Berlekamp–Massey + Chien search
+│   ├── ccsds_rs.rs         — CCSDS 131.0-B-3 outer RS(255,223): evaluation-based GF(256) code, interleaving depths 1/2/3/4/5/8
 │   ├── golay.rs            — Extended Golay(24,12,8): syndrome-table 3-error correction
 │   ├── hamming.rs          — Hamming(7,4) encode/decode
 │   │
@@ -168,7 +168,7 @@ syndrome/
 │   ├── affinity.rs         — Thread-to-core pinning (optional `affinity` feature)
 │   ├── simd_avx2.rs        — AVX2 inner-loop kernels (x86_64, runtime-detected)
 │   └── simd_neon.rs        — NEON inner-loop kernels (aarch64, compile-gated)
-├── examples/               — 7 runnable teaching examples (see §2)
+├── examples/               — 9 runnable teaching examples (see §2)
 ├── tests/
 │   ├── ldpc_integration.rs     — Encode→decode round-trips + 1-bit error correction
 │   └── media_reconstruction.rs — Audio/video AWGN simulation + perfect reconstruction
@@ -179,8 +179,9 @@ syndrome/
 │   └── run_all.sh          — Orchestration + byte-identical checksum gate
 ├── data/
 │   └── bg_tables.json      — BG1/BG2 extracted from 3GPP TS 38.212
-└── tools/
-    └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+├── tools/
+│   └── gen_bg_tables.py    — Parses the 3GPP DOCX spec (38212-gf0.zip)
+└── embedded-demo/          — Bare-metal no_std firmware demo, own package (see §5.6)
 ```
 
 ---
@@ -848,6 +849,50 @@ The waterfall region (0.5 → 1.5 dB) represents **~6 dB coding gain** over unco
 push + pop: ~1.1 ns  (AtomicUsize head/tail, no syscall)
 ```
 
+### 5.6 no_std embedded firmware footprint
+
+The `no_std` feature (off by default; see `[features]` in Cargo.toml for
+exact scope) builds the core algorithms against `core`+`alloc` instead of
+`std`. `embedded-demo/` proves that with a real firmware image, not just a
+`cargo check`: a bare-metal Cortex-M4F binary (`thumbv7em-none-eabihf`)
+encoding, quantizing, and decoding one BG2 (Z=128) codeword through the
+fixed-point LOMS kernel — and it has actually been **run**, under QEMU's
+`netduinoplus2` (Cortex-M4F) machine model over ARM semihosting, not just
+linked. Real output, 2026-08-19:
+
+```
+syndrome-embedded-demo: bg=BG2 z=128 k=1280 n=6656 iterations_used=1
+RESULT: PASS -- decoded info bits matched the encoded input exactly
+```
+
+QEMU exits 0 — the firmware's own semihosting exit call, not a timeout.
+Size, measured the same day with `llvm-size` on that build's `--release`
+output (`opt-level = "z"`, LTO, one codegen unit):
+
+```
+.text:  35,288 bytes (~34.5 KiB)  -- LDPC encoder/decoder + cortex-m-rt + panic/semihosting handlers + allocator
+.data:       0 bytes              -- no initialized-nonzero globals
+.bss:  131,108 bytes (~128.0 KiB) -- almost entirely a 128 KiB static heap, bisected against real QEMU runs, not guessed
+```
+
+That heap size is itself a real-execution finding, not a static guess: the
+first version of this demo shipped with a 64 KiB heap chosen without
+measurement, and the first time it actually ran, it hit a real failed
+allocation partway through decode. Bisecting against real QEMU runs found
+64 KiB fails, 96 KiB is the smallest size that completes and reports PASS,
+and 128 KiB (what ships) is that measured floor plus headroom.
+
+What this still does **not** include: hardware timing. QEMU's Cortex-M core
+runs under dynamic binary translation, not a cycle-accurate model of any
+specific silicon, and this build's `netduinoplus2` machine model doesn't
+implement the DWT cycle counter at all — every reading came back exactly
+zero, a real QEMU gap rather than a bug here, and reporting "0 cycles"
+would be a worse lie than reporting nothing. So no throughput or latency
+number is claimed. See `embedded-demo/README.md` for the full scope note,
+the exact QEMU command (including how to get `qemu-system-arm` running
+with no root/sudo, via `apt-get download` plus manual extraction — exactly
+how the run above was produced), and how to reproduce these numbers.
+
 To reproduce all benchmarks:
 ```bash
 cargo run --release --bin algo_bench_export  # all 9 cores → bench/results/algos.json
@@ -1121,7 +1166,7 @@ Blu-ray uses RS Product-Code (RS-PC) for burst error correction.  M-DISC archive
 
 | Project | Language | Domain | Notes |
 |---|---|---|---|
-| [AFF3CT](https://github.com/aff3ct/aff3ct) | C++17 | LDPC, Turbo, Polar, RS, BCH | Full FEC framework; AVX2/AVX-512; primary C++ reference (this library now covers the same core algorithm set in safe Rust). Paper: Cassagne et al., *SoftwareX* 2019. |
+| [AFF3CT](https://github.com/aff3ct/aff3ct) | C++17 | LDPC, Turbo, Polar, RS, BCH | Full FEC framework; AVX2/AVX-512; primary C++ reference (this library now covers the same core algorithm set in Rust). Paper: Cassagne et al., *SoftwareX* 2019. |
 | [OpenAirInterface](https://gitlab.eurecom.fr/oai/openairinterface5g) | C | 5G NR PHY L1 | Open-source gNB/UE; LDPC from 3GPP BG1/BG2. |
 | [srsRAN Project](https://github.com/srsran/srsRAN_Project) | C++17 | 5G NR PHY | Production-quality open-source gNB; LDPC with AVX2 paths. |
 | [rav1e](https://github.com/xiph/rav1e) | Rust | AV1 video codec | Demonstrates Rust competing with C++ on DSP kernels. |
@@ -1147,7 +1192,8 @@ BCJR, QPP interleaver) · extended binary Golay(24,12,8) · Hamming(7,4) ·
 CRC-24A/B/C, CRC-16/11/6
 
 **Standards:** 3GPP TS 38.212 (5G NR) · 3GPP TS 36.212 (LTE) · IEEE
-802.11ax/be (Wi-Fi 6/7) · DVB-S2 · CCSDS · IMT-2030 (6G research)
+802.11ax/be (Wi-Fi 6/7) · CCSDS 131.0-B-3 (convolutional inner code + outer
+RS(255,223)) · IMT-2030 (6G research profiles over the 5G kernels)
 
 **Engineering:** Rust · SIMD (AVX2, VPSHUFB, NEON) · zero-allocation hot
 paths · lock-free SPSC ring buffer · thread affinity · rate matching ·
@@ -1162,13 +1208,13 @@ cover whole processor families:
 | x86-64 AVX2 | AVX2 + VPSHUFB | Intel Core (Haswell 2013 →), Intel Xeon, AMD Ryzen / Threadripper / EPYC | Runtime-detected; proven bit-identical to scalar by seeded equivalence tests |
 | AArch64 NEON | ASIMD | Raspberry Pi 4/5, Apple Silicon (M1–M4), AWS Graviton, Ampere Altra, Qualcomm Snapdragon | Compiled path, wired into the LDPC, Reed–Solomon, Viterbi, and Turbo codecs; proven bit-identical to scalar by ARM-executed seeded equivalence tests |
 | Portable scalar | none | Everything else Rust targets | Reference implementation; every SIMD path is tested bit-identical against it |
-| Bare-metal ARM Cortex-M | Thumb-2, `no_std` | STM32, Nordic nRF52, Arduino boards | **Planned** — the crate currently requires `std` |
+| Bare-metal ARM Cortex-M | Thumb-2, `no_std` | STM32, Nordic nRF52, Arduino boards | `no_std` feature builds the core algorithms on `core`+`alloc`; `embedded-demo/` cross-compiles to `thumbv7em-none-eabihf` and has been run (not just linked) under QEMU's Cortex-M4F `netduinoplus2` model, decoding a real codeword (`RESULT: PASS`); not yet run on physical silicon |
 
 Questions this repository answers: *Is there a Rust library for 5G NR LDPC
 encoding and decoding? How do I implement TS 38.212 code block segmentation
 and rate matching? What is a Rust alternative to AFF3CT? How does a polar
 SCL decoder work? How do I do Reed-Solomon erasure coding in Rust with SIMD?
-How fast can safe Rust decode LDPC compared to C++?*
+How fast can Rust decode LDPC compared to C++?*
 
 ---
 

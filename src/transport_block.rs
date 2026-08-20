@@ -41,9 +41,11 @@
 //! TB bits (or error)
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::crc::{Crc24, CrcKind};
 use crate::error::FecError;
 use crate::harq::HarqBuffer;
+#[cfg(not(feature = "no_std"))]
 use crate::ldpc_pipeline::LdpcPipeline;
 use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
 use crate::rate_matching::RateMatchCache;
@@ -186,7 +188,7 @@ pub struct DlSchEncoder {
     /// takes `&self` (preserving its public signature), so the cache lives
     /// behind a `RefCell`; borrowing it is uncontended (single-threaded,
     /// non-reentrant use) and adds no heap allocation of its own.
-    rm_cache: std::cell::RefCell<RateMatchCache>,
+    rm_cache: core::cell::RefCell<RateMatchCache>,
 }
 
 impl DlSchEncoder {
@@ -248,7 +250,7 @@ impl DlSchEncoder {
             qm,
             e_per_cb,
             tb_size,
-            rm_cache: std::cell::RefCell::new(RateMatchCache::new()),
+            rm_cache: core::cell::RefCell::new(RateMatchCache::new()),
         })
     }
 
@@ -428,7 +430,12 @@ pub struct DlSchDecoder {
     all_info: Vec<u8>,
     /// Optional multi-worker LDPC pipeline, installed by
     /// [`DlSchDecoder::with_pipeline`]. `None` means every code block is
-    /// decoded on the calling thread, which is the default.
+    /// decoded on the calling thread, which is the default. Not present
+    /// under the `no_std` feature at all ([`LdpcPipeline`] needs
+    /// `std::thread`): [`Self::decode`] always takes the sequential path
+    /// there, and [`Self::with_pipeline`]/[`Self::worker_count`] do not
+    /// exist to call.
+    #[cfg(not(feature = "no_std"))]
     pipeline: Option<LdpcPipeline>,
 }
 
@@ -486,6 +493,80 @@ fn prepare_cb_llr(
     dest[two_z..two_z + valid_len].copy_from_slice(&harq.llr_buffer()[..valid_len]);
 
     decoder.init_5g_llr(dest, n_filler)
+}
+
+/// Decode every code block sequentially, one at a time on the calling
+/// thread.
+///
+/// [`DlSchDecoder::decode`]'s only path under the `no_std` feature (no
+/// [`crate::ldpc_pipeline::LdpcPipeline`] there — it needs `std::thread`),
+/// and the `std` build's fallback whenever a pipeline either was not
+/// installed or has nothing to parallelise ($C = 1$). A free function
+/// specifically so there is exactly one copy of this loop for both cases to
+/// share, for the same reason [`prepare_cb_llr`] above is one: two copies
+/// are two chances for them to drift.
+///
+/// Writes decoded results into `cb_crc_results`/`all_info` and folds each
+/// code block's iteration count into `max_iters`, exactly as the pipelined
+/// path's drain loop does — the two must produce identical output for
+/// [`tests::pipelined_decode_matches_sequential_decode`] to hold.
+///
+/// # Errors
+///
+/// Propagates [`FecError`] from [`prepare_cb_llr`] or from
+/// [`QcLdpcDecoder::decode_layered_offset_min_sum`].
+#[allow(clippy::too_many_arguments)]
+fn decode_sequential_cbs(
+    harq_bufs: &mut [HarqBuffer],
+    decoders: &[QcLdpcDecoder],
+    rx_llr: &[f32],
+    rv: usize,
+    qm: usize,
+    z: usize,
+    n_filler: usize,
+    e_per_cb: usize,
+    llr_cb: &mut [f32],
+    edge_r: &mut [f32],
+    layer_scratch: &mut [f32],
+    hard: &mut [u8],
+    iterations: usize,
+    k_prime: usize,
+    has_cb_crc: bool,
+    cb_crc: &Crc24,
+    all_info: &mut [u8],
+    payload_len: usize,
+    n_cb: usize,
+    cb_crc_results: &mut [bool],
+    max_iters: &mut usize,
+) -> Result<(), FecError> {
+    for ci in 0..n_cb {
+        let e_start = ci * e_per_cb;
+        prepare_cb_llr(
+            &mut harq_bufs[ci],
+            &decoders[ci],
+            &rx_llr[e_start..e_start + e_per_cb],
+            rv,
+            qm,
+            z,
+            n_filler,
+            llr_cb,
+        )?;
+
+        let cb_iters = decoders[ci].decode_layered_offset_min_sum(
+            llr_cb,
+            edge_r,
+            layer_scratch,
+            hard,
+            iterations,
+        )?;
+        *max_iters = (*max_iters).max(cb_iters);
+
+        let info_bits = &hard[..k_prime];
+        cb_crc_results[ci] = !has_cb_crc || cb_crc.check(info_bits);
+        all_info[ci * payload_len..(ci + 1) * payload_len]
+            .copy_from_slice(&info_bits[..payload_len]);
+    }
+    Ok(())
 }
 
 /// Number of payload bits each code block contributes to the reassembled
@@ -584,6 +665,7 @@ impl DlSchDecoder {
             layer_scratch,
             hard: vec![0u8; n],
             all_info: Vec::with_capacity(all_info_capacity),
+            #[cfg(not(feature = "no_std"))]
             pipeline: None,
         })
     }
@@ -643,6 +725,7 @@ impl DlSchDecoder {
     ///     .unwrap();
     /// assert!(dec.num_code_blocks() > 1);
     /// ```
+    #[cfg(not(feature = "no_std"))]
     pub fn with_pipeline(mut self, n_workers: usize) -> Result<Self, FecError> {
         if n_workers == 0 {
             return Err(FecError::InvalidParam("n_workers must be > 0"));
@@ -659,8 +742,9 @@ impl DlSchDecoder {
 
     /// Number of code blocks this transport block segments into.
     ///
-    /// Worth checking before [`DlSchDecoder::with_pipeline`]: at `1` there is
-    /// nothing for extra workers to do.
+    /// Worth checking before `DlSchDecoder::with_pipeline` (not linked: not
+    /// present under the `no_std` feature) — at `1` there is nothing for
+    /// extra workers to do.
     #[must_use]
     pub fn num_code_blocks(&self) -> usize {
         self.params.c
@@ -671,6 +755,7 @@ impl DlSchDecoder {
     ///
     /// [`LdpcPipeline`] clamps the requested worker count, so this can be
     /// lower than what was passed to [`DlSchDecoder::with_pipeline`].
+    #[cfg(not(feature = "no_std"))]
     #[must_use]
     pub fn worker_count(&self) -> usize {
         self.pipeline.as_ref().map_or(0, LdpcPipeline::worker_count)
@@ -794,6 +879,7 @@ impl DlSchDecoder {
             hard,
             all_info,
             cb_crc,
+            #[cfg(not(feature = "no_std"))]
             pipeline,
             ..
         } = self;
@@ -807,6 +893,32 @@ impl DlSchDecoder {
         // writes the same offsets in order.
         all_info.resize(n_cb * payload_len, 0);
 
+        #[cfg(feature = "no_std")]
+        decode_sequential_cbs(
+            harq_bufs,
+            decoders,
+            rx_llr,
+            rv,
+            qm,
+            z,
+            n_filler,
+            e_per_cb,
+            &mut llr_cb[..n],
+            edge_r,
+            layer_scratch,
+            hard,
+            iterations,
+            k_prime,
+            has_cb_crc,
+            cb_crc,
+            all_info,
+            payload_len,
+            n_cb,
+            &mut cb_crc_results,
+            &mut max_iters,
+        )?;
+
+        #[cfg(not(feature = "no_std"))]
         match pipeline {
             // ── Pipelined: code blocks decode concurrently on worker threads.
             Some(pipe) if n_cb > 1 => {
@@ -870,35 +982,35 @@ impl DlSchDecoder {
                 }
             }
 
-            // ── Sequential: one code block at a time on this thread.
+            // ── Sequential: one code block at a time on this thread. Shared
+            // with the `no_std` build's only path (see above) through the
+            // same free function -- exactly the "two copies, two chances to
+            // get it wrong" trap `prepare_cb_llr` was already extracted to
+            // avoid, now avoided the same way for this loop.
             _ => {
-                for ci in 0..n_cb {
-                    let e_start = ci * e_per_cb;
-                    prepare_cb_llr(
-                        &mut harq_bufs[ci],
-                        &decoders[ci],
-                        &rx_llr[e_start..e_start + e_per_cb],
-                        rv,
-                        qm,
-                        z,
-                        n_filler,
-                        &mut llr_cb[..n],
-                    )?;
-
-                    let cb_iters = decoders[ci].decode_layered_offset_min_sum(
-                        llr_cb,
-                        edge_r,
-                        layer_scratch,
-                        hard,
-                        iterations,
-                    )?;
-                    max_iters = max_iters.max(cb_iters);
-
-                    let info_bits = &hard[..k_prime];
-                    cb_crc_results[ci] = !has_cb_crc || cb_crc.check(info_bits);
-                    all_info[ci * payload_len..(ci + 1) * payload_len]
-                        .copy_from_slice(&info_bits[..payload_len]);
-                }
+                decode_sequential_cbs(
+                    harq_bufs,
+                    decoders,
+                    rx_llr,
+                    rv,
+                    qm,
+                    z,
+                    n_filler,
+                    e_per_cb,
+                    &mut llr_cb[..n],
+                    edge_r,
+                    layer_scratch,
+                    hard,
+                    iterations,
+                    k_prime,
+                    has_cb_crc,
+                    cb_crc,
+                    all_info,
+                    payload_len,
+                    n_cb,
+                    &mut cb_crc_results,
+                    &mut max_iters,
+                )?;
             }
         }
 

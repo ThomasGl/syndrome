@@ -5,6 +5,131 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`no_std` feature: a real `#![no_std]` + `alloc` build of the core FEC
+  algorithms** — QC-LDPC, Viterbi, Turbo, Polar, Reed-Solomon, BCH, Golay,
+  Hamming, CRC, the Wi-Fi/Bluetooth profiles, the transport-block chain's
+  sequential decode path, and the lock-free SPSC ring, against `core` +
+  `alloc` instead of `std`. Off by default; the default build is unchanged
+  std. Verified by cross-compiling to `thumbv7em-none-eabihf` (a real
+  Cortex-M4F target) and to the native host triple (the x86-64 AVX2 SIMD
+  path only compiles on the latter), and by actually running the result:
+  `embedded-demo/` is a standalone bare-metal firmware package that
+  encodes, quantizes, and decodes a real BG2 (Z=128) codeword under
+  `#![no_std] #![no_main]`, boots under QEMU's `netduinoplus2` (Cortex-M4F)
+  machine model, and reports a real PASS over ARM semihosting. Not
+  covered, deliberately: `affinity` (an OS thread-affinity API), the C ABI
+  (needs `std::panic::catch_unwind`), `channel_sim`/`montecarlo`
+  (host-side simulation utilities), and `LdpcPipeline`'s threaded worker
+  pool (needs `std::thread` — `DlSchDecoder::with_pipeline` is excluded
+  along with it; the sequential decode path stays available). See
+  `[features] no_std` in Cargo.toml for the full scope note.
+- **`GilbertElliottChannel`** (`channel_sim` module) — a two-state
+  Markov burst-error channel (Gilbert 1960, Elliott 1963), for testing
+  decoders against clustered rather than independent errors.
+  `transmit_hard` returns the bit-flipped codeword directly;
+  `transmit`/`transmit_with_states` return genie-aided soft LLRs computed
+  from the known per-bit crossover probability, documented as an
+  optimistic bound for the same reason `RayleighBlockChannel`'s
+  perfect-CSI assumption is.
+- **A C ABI for the 5G NR QC-LDPC encode/decode path**, in a new standalone
+  package, `capi/` (not part of the published `syndrome` crate — see
+  below). Opaque create/destroy handles, size-query functions, and
+  `encode_5g`/`decode_5g` wrappers; every function runs inside
+  `catch_unwind` and returns an `i32` status code rather than using
+  `Result`/`panic!` across the FFI boundary. Verified with a real C
+  program compiled and linked against the built shared library, not only
+  Rust-side FFI tests.
+- **CCSDS 131.0-B-3 conformance: inner code documented, outer code
+  implemented.** `ViterbiDecoder::new(k)` for `k` in `{3, 5, 7, 9}` was
+  already selecting the exact generator polynomials CCSDS 131.0-B-3 §3
+  specifies for its rate-1/2 convolutional code family (`k=7`, generators
+  `0o133`/`0o171`, is the historical "Voyager code" and the baseline every
+  CCSDS mission profile in this family starts from) — the crate's own
+  docs credited "NASA/3GPP" for `k=7` and omitted CCSDS entirely, an
+  incomplete rather than a false attribution, now corrected
+  (`examples/08_ccsds_convolutional.rs` demonstrates the whole K=3/5/7/9
+  family). A new module, `ccsds_rs` (`CcsdsReedSolomon`), implements
+  CCSDS's *outer* code: an evaluation-based RS(255,223) over `GF(2^8)`
+  (first consecutive root 112, primitive-element step 11, field
+  polynomial `1 + x + x^2 + x^7 + x^8`) via syndromes / Berlekamp-Massey /
+  Chien search / Forney, with every interleaving depth the standard
+  permits (1/2/3/4/5/8) — a genuinely different mathematical construction
+  from `syndrome::reed_solomon`'s Cauchy-matrix erasure code, so it could
+  not reuse that module. Verified against an independent third-party
+  CCSDS RS(255,223) implementation's own known-answer test vector (223
+  sequential data bytes and their real 32-byte parity), not merely
+  re-derived from the standard's stated formula and trusted on faith.
+  `examples/08b_ccsds_reed_solomon.rs` demonstrates every interleaving
+  depth end to end. Still not implemented anywhere in this crate: CCSDS
+  131.0-B-3's frame synchronization markers and pseudo-randomization
+  (scrambling) sequence.
+
+### Fixed
+
+- **Viterbi decode silently corrupted for constraint lengths 10–16** —
+  advertised as supported since `MAX_CONSTRAINT_LENGTH` was introduced, but
+  never exercised past `k=9` by the existing property test.
+  `TrellisTable::next_state` and the shared traceback buffer stored state
+  indices as `u8`; `n_states = 2^(k-1)` exceeds 255 once `k ≥ 10`, so every
+  next-state above 255 wrapped. Widened to `u16` across every scalar/AVX2/
+  NEON call site. Purely an internal-representation fix — no public
+  signature changes.
+- **`serde_json` was a mandatory dependency nothing in `src/` uses** — only
+  the 3 `src/bin/` JSON exporters (already excluded from the published
+  tarball) need it. Moved to an optional dependency behind a new
+  `bench-export` feature.
+- The README's "Standards" line claimed DVB-S2 and CCSDS support that does
+  not exist (`golay.rs`/`bch.rs` mention them only as historical context
+  for generic code families they share parameters with — no dedicated
+  module, no conformance test). Claim removed.
+- The "6G Research" badge sat at equal visual weight to the real, tested
+  5G NR/Wi-Fi 7 standards badges; `sixg.rs` is link-adaptation parameter
+  tables over the existing 5G LDPC/Polar kernels, not a distinct FEC
+  algorithm, and no 6G FEC standard is ratified yet. Badge removed; the
+  same qualifier added inline wherever 6G is listed next to real standards.
+- **The Polar SCL decoder's module docs claimed `O(L · N log N)` time, but
+  the actual implementation was `Ω(L · N²)`** — every path fork
+  deep-copied its entire `O(N)`-sized LLR/beta/decoded history, for
+  `O(list_size * k_info)` such forks. Fixed via a lazy-copy, per-recursion-
+  level array scheme (Tal & Vardy 2015, arXiv:1206.0050, "List Decoding of
+  Polar Codes") implemented with `Rc<[T]>`/`Rc::make_mut` rather than that
+  paper's own hand-rolled reference-counted array banks: forking a path
+  now clones `O(log N)` `Rc` pointers instead of copying `O(N)` data, and
+  a path pays for an actual `O(level size)` data copy only at the moment
+  it writes to a level another path still shares. Also removes the
+  decoder's separate `decoded` (u-domain) array entirely: since the polar
+  transform is self-inverse over `GF(2)`, the info bits are recovered from
+  the selected path's beta with one transform call after decoding
+  finishes, rather than tracked through the whole fork history as a third
+  `O(N)` structure. Verified bit-identical against both of this module's
+  prior implementations (the original `Vec<ScPath>` + `path.clone()`
+  version and the allocation-free-but-`O(N)`-copy-per-fork arena version,
+  both retained under `#[cfg(test)]`) across randomized noisy frames at
+  multiple `(N, K, list_size)` configurations, and mutation-tested by
+  deliberately dropping the per-node beta-preservation copy and confirming
+  five independent tests fail with the expected symptom.
+
+### Changed
+
+- Reworded "in safe Rust" (README, `Cargo.toml` description) to name the
+  real number instead: "safe-by-default ... Miri-verified unsafe confined
+  to the SIMD and lock-free cores" (~101 unsafe sites, all SIMD dispatch or
+  the two Miri-checked lock-free structures).
+- The C ABI moved from an in-crate `capi` feature (`src/capi.rs`,
+  `[lib] crate-type = ["rlib", "staticlib", "cdylib"]` declared
+  unconditionally in this crate's own `Cargo.toml`) to the standalone
+  `capi/` package described above. Declaring `staticlib`/`cdylib` on the
+  library crate itself required a global allocator and panic handler for
+  *every* build of the lib target regardless of which Cargo feature was
+  active — incompatible with the `no_std` feature above the moment both
+  existed in the same tree. This was never published in a released
+  version, so nothing downstream breaks; `cargo build --features capi`
+  is now `cd capi && cargo build --release`.
+
 ## [0.5.1] — 2026-08-18
 
 ### Fixed

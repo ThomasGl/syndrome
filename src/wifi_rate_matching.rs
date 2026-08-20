@@ -43,6 +43,7 @@
 //! * The rest of the 802.11 PHY chain (scrambling, interleaving, OFDM
 //!   subcarrier mapping) — out of scope for this FEC-only crate.
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 use crate::qc_ldpc::{QcLdpcDecoder, QcLdpcEncoder};
 

@@ -97,7 +97,8 @@
 //! cannot recover 18 of the 6,187 patterns inside its stated capability, and
 //! at $k = 20$, $m = 6$, 684 of 230,229.
 
-use std::cmp;
+use crate::alloc_prelude::*;
+use core::cmp;
 
 use crate::error::FecError;
 
@@ -618,11 +619,11 @@ impl ReedSolomon {
     fn encode_simd_dispatch(&self, data: &[&[u8]], parity_out: &mut [u8]) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            if crate::simd_avx2::gfni_available() && crate::simd_avx2::avx2_available() {
                 self.encode_with_gfni_inner(data, parity_out);
                 return true;
             }
-            if is_x86_feature_detected!("avx2") {
+            if crate::simd_avx2::avx2_available() {
                 self.encode_with_avx2_inner(data, parity_out);
                 return true;
             }
@@ -1420,8 +1421,8 @@ impl ReedSolomon {
         #[cfg(target_arch = "x86_64")]
         {
             if let Some(tables) = self.mul_tables.as_ref()
-                && is_x86_feature_detected!("gfni")
-                && is_x86_feature_detected!("avx2")
+                && crate::simd_avx2::gfni_available()
+                && crate::simd_avx2::avx2_available()
             {
                 let full_table = &tables[coef as usize];
                 // Always `Some` when `mul_tables` is (built together in
@@ -1434,7 +1435,7 @@ impl ReedSolomon {
                 return;
             }
             if let Some(tables) = self.mul_tables.as_ref()
-                && is_x86_feature_detected!("avx2")
+                && crate::simd_avx2::avx2_available()
             {
                 let full_table = &tables[coef as usize];
                 // Precomputed 16-byte lo/hi nibble tables (see
@@ -2770,7 +2771,7 @@ mod tests {
     #[ignore]
     #[cfg(target_arch = "x86_64")]
     fn bench_gfni_vs_avx2_nibble() {
-        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::gfni_available() || !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no GFNI/AVX2");
             return;
         }
@@ -2835,7 +2836,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn gfni_matrix_reproduces_every_coefficient_table() {
-        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::gfni_available() || !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no GFNI/AVX2");
             return;
         }
@@ -2873,7 +2874,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn encode_gfni_matches_scalar() {
-        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::gfni_available() || !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no GFNI/AVX2");
             return;
         }
@@ -2920,7 +2921,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn decode_gfni_matches_original_data() {
-        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+        if !crate::simd_avx2::gfni_available() || !crate::simd_avx2::avx2_available() {
             eprintln!("skipping: host has no GFNI/AVX2");
             return;
         }

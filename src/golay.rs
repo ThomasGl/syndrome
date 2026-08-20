@@ -116,6 +116,7 @@
 //! assert_eq!(decoded, info);
 //! ```
 
+use crate::alloc_prelude::*;
 use crate::error::FecError;
 
 /// Sentinel stored in `syndrome_table` for syndromes whose coset minimum

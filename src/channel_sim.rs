@@ -518,6 +518,299 @@ impl RayleighBlockChannel {
     }
 }
 
+/// Two-state (Gilbert-Elliott) burst-error channel.
+///
+/// AWGN and Rayleigh block fading both treat errors as effectively
+/// independent from symbol to symbol (fading only correlates amplitude
+/// within a block; the noise itself is still i.i.d.). Real wireless and
+/// storage channels often do not fail that way: interference, deep fades
+/// shorter than a fading block, and burst noise on a storage medium all
+/// produce errors that cluster in time, which is exactly the case the
+/// user's own question about non-white noise is asking about. A code
+/// evaluated only against i.i.d. errors can look far stronger than it will
+/// be against a channel whose errors arrive in bursts, because the same
+/// total number of errors concentrated into one burst is much harder for a
+/// block/convolutional code to correct than the same count spread evenly.
+///
+/// The model is Gilbert's two-state Markov chain (E. N. Gilbert, "Capacity
+/// of a Burst-Noise Channel," *Bell System Technical Journal* 39(5), 1960)
+/// with Elliott's per-state error probabilities (E. O. Elliott, "Estimates
+/// of error rates for codes on burst-noise channels," *Bell System
+/// Technical Journal* 42(5), 1963):
+///
+/// $$
+/// \text{Good} \xrightarrow{\thinspace p\thinspace} \text{Bad}, \qquad
+/// \text{Bad} \xrightarrow{\thinspace r\thinspace} \text{Good}
+/// $$
+///
+/// Each state is a binary symmetric channel (BSC) with its own crossover
+/// probability: $\varepsilon_G$ (typically small — the channel's quiet
+/// baseline) while in the Good state, $\varepsilon_B$ (typically large — an
+/// active burst) while in the Bad state. At every channel use: the current
+/// state's BSC decides whether this bit flips, then the chain transitions
+/// for the *next* use (so a transition never affects the bit that just
+/// causes it). Sojourn time in either state is geometrically distributed
+/// with mean $1/p$ (Good) or $1/r$ (Bad) steps — an elementary consequence
+/// of a two-state Markov chain, not something specific to this
+/// implementation — and the stationary probability of being in the Bad
+/// state is
+///
+/// $$\pi_B = \frac{p}{p + r}.$$
+///
+/// # Soft output and its honest limit
+///
+/// [`Self::transmit`] returns an LLR per bit computed from the *known*
+/// crossover probability of whichever state generated that bit:
+/// $\text{LLR}_i = (1 - 2 y_i) \cdot \ln\!\left(\frac{1 -
+/// \varepsilon_s}{\varepsilon_s}\right)$ where $y_i$ is the received bit and
+/// $\varepsilon_s$ is the current state's crossover probability — the
+/// standard optimal-decoding LLR for a BSC with known crossover, applied
+/// per-bit. This assumes the receiver is told which state produced each
+/// bit, which a real receiver is not: recovering the hidden state from the
+/// channel output is itself a filtering problem (see e.g. the
+/// forward-backward / Baum-Welch machinery for hidden Markov models),
+/// deliberately out of scope here. Results from [`Self::transmit`] are
+/// therefore a genie-aided, optimistic bound on what a real receiver
+/// achieves — exactly the same caveat [`RayleighBlockChannel`] documents
+/// for its perfect-CSI assumption, for the same reason: it isolates "how
+/// does the *code* behave against this error pattern" from "how well can a
+/// receiver estimate the channel," which is a different, harder question.
+/// [`Self::transmit_hard`] sidesteps the question entirely by returning the
+/// bit-flipped codeword directly, with no LLR/state-knowledge assumption at
+/// all — the channel's output as a hard-decision decoder would see it.
+///
+/// # Examples
+///
+/// ```
+/// use syndrome::channel_sim::GilbertElliottChannel;
+///
+/// // Mostly-quiet channel (eps_good=0.1%) with occasional bursts
+/// // (eps_bad=30%) that last ~10 bits on average (p_bg=0.1) and occur
+/// // roughly every ~1000 bits on average (p_gb=0.001).
+/// let mut ch = GilbertElliottChannel::new(0.001, 0.1, 0.001, 0.3, 42);
+/// let bits = vec![0u8; 5000];
+/// let llrs = ch.transmit(&bits);
+/// assert_eq!(llrs.len(), bits.len());
+/// ```
+pub struct GilbertElliottChannel {
+    /// Internal PRNG state (xorshift64; guaranteed non-zero).
+    state: u64,
+    /// Current hidden Markov state: `true` = Bad, `false` = Good.
+    in_bad: bool,
+    /// $p$ = P(Good → Bad) per channel use.
+    p_gb: f32,
+    /// $r$ = P(Bad → Good) per channel use.
+    p_bg: f32,
+    /// $\varepsilon_G$: BSC crossover probability while in the Good state.
+    eps_good: f32,
+    /// $\varepsilon_B$: BSC crossover probability while in the Bad state.
+    eps_bad: f32,
+}
+
+impl GilbertElliottChannel {
+    /// Construct a Gilbert-Elliott channel, starting in the Good state.
+    ///
+    /// Starting deterministically in Good (rather than drawing from the
+    /// stationary distribution) means a transmission much shorter than
+    /// $1/(p+r)$ bits is biased slightly toward Good relative to the
+    /// long-run steady state — an honest limit of a reproducible,
+    /// zero-warm-up simulation, exactly parallel to
+    /// [`RayleighBlockChannel`]'s documented perfect-CSI optimism.
+    ///
+    /// # Arguments
+    ///
+    /// * `p_gb` — $p$ = P(Good → Bad) per channel use, in $[0, 1]$.
+    /// * `p_bg` — $r$ = P(Bad → Good) per channel use, in $[0, 1]$.
+    /// * `eps_good` — Good-state BSC crossover probability, in $(0, 1)$
+    ///   (exclusive: exactly `0.0` or `1.0` gives [`Self::transmit`] an
+    ///   infinite-magnitude LLR).
+    /// * `eps_bad` — Bad-state BSC crossover probability, in $(0, 1)$
+    ///   (same restriction as `eps_good`).
+    /// * `seed` — PRNG seed, hashed exactly as [`AwgnChannel::new`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `p_gb`/`p_bg` are outside $[0, 1]$, or if `eps_good`/
+    /// `eps_bad` are outside the open interval $(0, 1)$.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::GilbertElliottChannel;
+    ///
+    /// let ch = GilbertElliottChannel::new(0.01, 0.2, 0.001, 0.25, 7);
+    /// assert!((ch.steady_state_bad_probability() - 0.01 / 0.21).abs() < 1e-6);
+    /// ```
+    pub fn new(p_gb: f32, p_bg: f32, eps_good: f32, eps_bad: f32, seed: u64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&p_gb),
+            "p_gb (Good -> Bad transition probability) must be in [0, 1], got {p_gb}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&p_bg),
+            "p_bg (Bad -> Good transition probability) must be in [0, 1], got {p_bg}"
+        );
+        assert!(
+            eps_good > 0.0 && eps_good < 1.0,
+            "eps_good (Good-state crossover probability) must be in (0, 1), got {eps_good}"
+        );
+        assert!(
+            eps_bad > 0.0 && eps_bad < 1.0,
+            "eps_bad (Bad-state crossover probability) must be in (0, 1), got {eps_bad}"
+        );
+        Self {
+            state: splitmix64(seed),
+            in_bad: false,
+            p_gb,
+            p_bg,
+            eps_good,
+            eps_bad,
+        }
+    }
+
+    /// The stationary probability of being in the Bad state, $\pi_B = p /
+    /// (p + r)$. Returns `0.0` in the degenerate case $p = r = 0$ (the chain
+    /// never transitions out of its Good starting state).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::GilbertElliottChannel;
+    ///
+    /// let ch = GilbertElliottChannel::new(0.1, 0.9, 0.01, 0.3, 1);
+    /// assert!((ch.steady_state_bad_probability() - 0.1).abs() < 1e-6);
+    /// ```
+    pub fn steady_state_bad_probability(&self) -> f32 {
+        let denom = self.p_gb + self.p_bg;
+        if denom == 0.0 { 0.0 } else { self.p_gb / denom }
+    }
+
+    /// Whether the channel is currently in the Bad state.
+    pub fn is_in_bad_state(&self) -> bool {
+        self.in_bad
+    }
+
+    /// This state's BSC crossover probability, then advance the Markov
+    /// chain by one step for the *next* channel use.
+    fn crossover_and_step(&mut self) -> f32 {
+        let eps = if self.in_bad {
+            self.eps_bad
+        } else {
+            self.eps_good
+        };
+        let p_transition = if self.in_bad { self.p_bg } else { self.p_gb };
+        if next_uniform(&mut self.state) < p_transition {
+            self.in_bad = !self.in_bad;
+        }
+        eps
+    }
+
+    /// Pass `coded_bits` through the channel and return the bit-flipped
+    /// output directly — no LLR, no state-knowledge assumption. What a
+    /// hard-decision decoder (e.g. [`crate::viterbi::ViterbiDecoder`]'s hard
+    /// path, or an errors-only Reed-Solomon/BCH decode) sees.
+    ///
+    /// # Arguments
+    ///
+    /// * `coded_bits` — slice of `0`/`1` encoded bits.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` the same length as `coded_bits`, with each bit flipped
+    /// independently according to whichever state was active for it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::GilbertElliottChannel;
+    ///
+    /// let mut ch = GilbertElliottChannel::new(0.01, 0.5, 0.001, 0.4, 3);
+    /// let bits = vec![0u8; 2000];
+    /// let received = ch.transmit_hard(&bits);
+    /// assert_eq!(received.len(), bits.len());
+    /// // Some bits flip (eps_bad=0.4 during bursts); not all survive.
+    /// assert!(received.iter().any(|&b| b == 1));
+    /// ```
+    pub fn transmit_hard(&mut self, coded_bits: &[u8]) -> Vec<u8> {
+        coded_bits
+            .iter()
+            .map(|&b| {
+                let eps = self.crossover_and_step();
+                let flip = (next_uniform(&mut self.state) < eps) as u8;
+                b ^ flip
+            })
+            .collect()
+    }
+
+    /// Pass `coded_bits` through the channel and return genie-aided soft
+    /// LLRs — see the struct doc's "Soft output and its honest limit"
+    /// section for what the genie assumption costs.
+    ///
+    /// # Arguments
+    ///
+    /// * `coded_bits` — slice of `0`/`1` encoded bits.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<f32>` of LLRs the same length as `coded_bits`. Positive
+    /// favours bit 0, matching [`AwgnChannel::transmit`]'s convention.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::GilbertElliottChannel;
+    ///
+    /// let mut ch = GilbertElliottChannel::new(0.0, 0.0, 0.001, 0.3, 5);
+    /// // p_gb=0: the chain never leaves Good, so this degenerates to a
+    /// // stationary BSC(0.001) -- LLRs should be strongly, uniformly
+    /// // positive for an all-zero input.
+    /// let llrs = ch.transmit(&vec![0u8; 200]);
+    /// let mean: f32 = llrs.iter().sum::<f32>() / llrs.len() as f32;
+    /// assert!(mean > 0.0);
+    /// ```
+    pub fn transmit(&mut self, coded_bits: &[u8]) -> Vec<f32> {
+        self.transmit_with_states(coded_bits).0
+    }
+
+    /// Same as [`Self::transmit`], but also returns which state produced
+    /// each bit (`true` = Bad). Useful for a receiver study comparing
+    /// against genie-aided knowledge, and for the tests below that check
+    /// burst statistics directly instead of inferring them from LLRs.
+    ///
+    /// # Arguments
+    ///
+    /// * `coded_bits` — slice of `0`/`1` encoded bits.
+    ///
+    /// # Returns
+    ///
+    /// `(llrs, was_bad)`, both the same length as `coded_bits`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use syndrome::channel_sim::GilbertElliottChannel;
+    ///
+    /// let mut ch = GilbertElliottChannel::new(0.05, 0.3, 0.01, 0.35, 9);
+    /// let (llrs, was_bad) = ch.transmit_with_states(&vec![0u8; 500]);
+    /// assert_eq!(llrs.len(), 500);
+    /// assert_eq!(was_bad.len(), 500);
+    /// ```
+    pub fn transmit_with_states(&mut self, coded_bits: &[u8]) -> (Vec<f32>, Vec<bool>) {
+        let mut llrs = Vec::with_capacity(coded_bits.len());
+        let mut was_bad = Vec::with_capacity(coded_bits.len());
+        for &b in coded_bits {
+            was_bad.push(self.in_bad);
+            let eps = self.crossover_and_step();
+            let flip = (next_uniform(&mut self.state) < eps) as u8;
+            let y = b ^ flip;
+            // Optimal BSC LLR given known crossover eps (see struct doc).
+            let confidence = ((1.0 - eps) / eps).ln();
+            llrs.push(if y == 0 { confidence } else { -confidence });
+        }
+        (llrs, was_bad)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,5 +1380,195 @@ mod tests {
                 "seeds {a} and {b} produced identical noise; the seed-remapping regression is back"
             );
         }
+    }
+
+    // =========================================================================
+    // GilbertElliottChannel
+    //
+    // Same discipline as the AWGN/Rayleigh sections above: plumbing tests
+    // first, then statistical validation that would catch a wrong Markov
+    // parameter or a wrong LLR formula even though every plumbing test still
+    // passes. The two statistical facts checked here (stationary
+    // probability p/(p+r), geometric sojourn-time mean 1/p) are elementary
+    // properties of a two-state Markov chain, not something this
+    // implementation invented -- see the struct doc's citations.
+    // =========================================================================
+
+    #[test]
+    fn steady_state_bad_probability_matches_formula() {
+        for &(p_gb, p_bg) in &[(0.1_f32, 0.9), (0.5, 0.5), (0.01, 0.2), (0.3, 0.05)] {
+            let ch = GilbertElliottChannel::new(p_gb, p_bg, 0.01, 0.3, 1);
+            let expected = p_gb / (p_gb + p_bg);
+            assert!(
+                (ch.steady_state_bad_probability() - expected).abs() < 1e-6,
+                "p_gb={p_gb} p_bg={p_bg}: got {}, expected {expected}",
+                ch.steady_state_bad_probability()
+            );
+        }
+    }
+
+    #[test]
+    fn steady_state_bad_probability_is_zero_when_chain_never_transitions() {
+        let ch = GilbertElliottChannel::new(0.0, 0.0, 0.01, 0.3, 1);
+        assert_eq!(ch.steady_state_bad_probability(), 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "p_gb")]
+    fn new_panics_on_p_gb_above_one() {
+        GilbertElliottChannel::new(1.5, 0.5, 0.01, 0.3, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "p_bg")]
+    fn new_panics_on_negative_p_bg() {
+        GilbertElliottChannel::new(0.1, -0.1, 0.01, 0.3, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "eps_good")]
+    fn new_panics_on_eps_good_zero() {
+        GilbertElliottChannel::new(0.1, 0.5, 0.0, 0.3, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "eps_good")]
+    fn new_panics_on_eps_good_one() {
+        GilbertElliottChannel::new(0.1, 0.5, 1.0, 0.3, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "eps_bad")]
+    fn new_panics_on_eps_bad_zero() {
+        GilbertElliottChannel::new(0.1, 0.5, 0.01, 0.0, 1);
+    }
+
+    #[test]
+    fn transmit_hard_and_soft_preserve_length() {
+        let bits: Vec<u8> = (0..777).map(|i| (i % 5 == 0) as u8).collect();
+        let mut ch_hard = GilbertElliottChannel::new(0.02, 0.3, 0.01, 0.35, 11);
+        assert_eq!(ch_hard.transmit_hard(&bits).len(), bits.len());
+        let mut ch_soft = GilbertElliottChannel::new(0.02, 0.3, 0.01, 0.35, 12);
+        assert_eq!(ch_soft.transmit(&bits).len(), bits.len());
+    }
+
+    #[test]
+    fn deterministic_output_same_seed_gilbert_elliott() {
+        let bits: Vec<u8> = (0..500).map(|i| (i % 3 == 0) as u8).collect();
+        let mut ch1 = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, 555);
+        let mut ch2 = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, 555);
+        assert_eq!(ch1.transmit_hard(&bits), ch2.transmit_hard(&bits));
+
+        let mut ch3 = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, 555);
+        let mut ch4 = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, 555);
+        assert_eq!(ch3.transmit(&bits), ch4.transmit(&bits));
+    }
+
+    #[test]
+    fn adjacent_seeds_are_not_identical_gilbert_elliott() {
+        let bits: Vec<u8> = (0..500).map(|i| (i % 3 == 0) as u8).collect();
+        for (a, b) in [(0u64, 1u64), (2, 3), (100, 101)] {
+            let out_a = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, a).transmit_hard(&bits);
+            let out_b = GilbertElliottChannel::new(0.03, 0.25, 0.02, 0.4, b).transmit_hard(&bits);
+            assert_ne!(
+                out_a, out_b,
+                "seeds {a} and {b} produced identical output; the seed-remapping regression is back"
+            );
+        }
+    }
+
+    /// A permanently-Good channel ($p = r = 0$) is exactly a stationary BSC:
+    /// this pins the LLR formula itself (magnitude and sign) against direct
+    /// computation, independent of any Markov-chain behaviour.
+    #[test]
+    fn llr_matches_bsc_formula_when_state_is_fixed() {
+        let eps = 0.1_f32;
+        let expected_confidence = ((1.0 - eps) / eps).ln();
+        let mut ch = GilbertElliottChannel::new(0.0, 0.0, eps, 0.4, 3);
+        let bits = vec![0u8; 2000];
+        let llrs = ch.transmit(&bits);
+        // Every LLR must be either +confidence (bit survived) or
+        // -confidence (bit flipped) -- never anything else, since eps_bad
+        // is unreachable with p_gb=0.
+        for &l in &llrs {
+            assert!(
+                (l - expected_confidence).abs() < 1e-4 || (l + expected_confidence).abs() < 1e-4,
+                "LLR {l} matches neither +{expected_confidence} nor -{expected_confidence}"
+            );
+        }
+        // With eps=0.1, most bits should survive (positive LLR dominates).
+        let positive = llrs.iter().filter(|&&l| l > 0.0).count();
+        assert!(
+            positive > llrs.len() / 2,
+            "expected a majority of positive LLRs at eps=0.1, got {positive}/{}",
+            llrs.len()
+        );
+    }
+
+    #[test]
+    fn empirical_bad_state_fraction_matches_steady_state() {
+        const N: usize = 500_000;
+        let p_gb = 0.05_f32;
+        let p_bg = 0.2_f32;
+        let mut ch = GilbertElliottChannel::new(p_gb, p_bg, 0.01, 0.35, 2024);
+        let bits = vec![0u8; N];
+        let (_llrs, was_bad) = ch.transmit_with_states(&bits);
+        let empirical = was_bad.iter().filter(|&&b| b).count() as f32 / N as f32;
+        let expected = ch.steady_state_bad_probability();
+        assert!(
+            (empirical - expected).abs() < 0.01,
+            "empirical Bad fraction {empirical}, expected {expected} (p_gb={p_gb}, p_bg={p_bg})"
+        );
+    }
+
+    /// Mean length of maximal `true` (Bad) runs and maximal `false` (Good)
+    /// runs in a boolean sequence. Boundary runs (touching either end of
+    /// the slice) are included; for the run counts used below this biases
+    /// the mean by a negligible O(1/num_runs) amount.
+    fn mean_run_lengths(states: &[bool]) -> (f64, f64) {
+        let (mut bad_total, mut bad_runs) = (0u64, 0u64);
+        let (mut good_total, mut good_runs) = (0u64, 0u64);
+        let mut i = 0;
+        while i < states.len() {
+            let cur = states[i];
+            let start = i;
+            while i < states.len() && states[i] == cur {
+                i += 1;
+            }
+            let len = (i - start) as u64;
+            if cur {
+                bad_total += len;
+                bad_runs += 1;
+            } else {
+                good_total += len;
+                good_runs += 1;
+            }
+        }
+        (
+            bad_total as f64 / bad_runs.max(1) as f64,
+            good_total as f64 / good_runs.max(1) as f64,
+        )
+    }
+
+    #[test]
+    fn empirical_sojourn_times_match_geometric_mean() {
+        const N: usize = 1_000_000;
+        let p_gb = 0.02_f32; // mean Good sojourn = 1/p_gb = 50
+        let p_bg = 0.1_f32; // mean Bad sojourn = 1/p_bg = 10
+        let mut ch = GilbertElliottChannel::new(p_gb, p_bg, 0.01, 0.35, 777);
+        let bits = vec![0u8; N];
+        let (_llrs, was_bad) = ch.transmit_with_states(&bits);
+        let (mean_bad, mean_good) = mean_run_lengths(&was_bad);
+
+        let expected_bad = 1.0 / p_bg as f64;
+        let expected_good = 1.0 / p_gb as f64;
+        assert!(
+            (mean_bad - expected_bad).abs() / expected_bad < 0.05,
+            "mean Bad sojourn {mean_bad}, expected {expected_bad}"
+        );
+        assert!(
+            (mean_good - expected_good).abs() / expected_good < 0.05,
+            "mean Good sojourn {mean_good}, expected {expected_good}"
+        );
     }
 }
